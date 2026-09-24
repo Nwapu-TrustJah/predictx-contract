@@ -1,6 +1,7 @@
 #![no_std]
 
 mod matches;
+mod payouts;
 mod staking;
 pub(crate) mod token_utils;
 
@@ -358,6 +359,19 @@ impl PredictionMarket {
 
     pub fn get_pool_info(env: Env, poll_id: u64) -> Result<PoolInfo, PredictXError> {
         staking::get_pool_info(&env, poll_id)
+    }
+
+    // ── Payouts ───────────────────────────────────────────────────────────────
+
+    /// Claim proportional winnings after a poll is resolved.
+    ///
+    /// Pays `stake / winning_pool * (total_pool - fee)` via token transfer.
+    pub fn claim_winnings(
+        env: Env,
+        user: Address,
+        poll_id: u64,
+    ) -> Result<i128, PredictXError> {
+        payouts::claim_winnings(&env, user, poll_id)
     }
 
     pub fn get_platform_stats(env: Env) -> PlatformStats {
