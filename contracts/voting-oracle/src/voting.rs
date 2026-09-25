@@ -1,4 +1,4 @@
-use crate::{storage, DataKey};
+use crate::{storage, DataKey, MAX_VOTERS};
 use predictx_shared::{
     PollStatus, PredictXError, VoteChoice, VoteTally, AUTO_RESOLVE_THRESHOLD_BPS, BPS_DENOMINATOR,
     VOTING_WINDOW_SECS,
@@ -41,8 +41,13 @@ pub fn cast_vote(
     }
 
     // Each address may vote at most once per poll.
-    if storage::has_voted(env, poll_id, &voter) {
+    let mut voters = storage::read_voters(env, poll_id);
+    if storage::has_voted(env, poll_id, &voter) || voters.contains(voter.clone()) {
         return Err(PredictXError::AlreadyVoted);
+    }
+
+    if voters.len() >= MAX_VOTERS {
+        return Err(PredictXError::MaxVotersReached);
     }
 
     // ── Effects ───────────────────────────────────────────────────────────────
@@ -68,6 +73,8 @@ pub fn cast_vote(
     tally.total_voters += 1;
 
     storage::write_tally(env, &tally);
+    voters.push_back(voter.clone());
+    storage::write_voters(env, poll_id, &voters);
     storage::write_voted(env, poll_id, &voter);
     Ok(tally)
 }
@@ -131,6 +138,38 @@ pub fn auto_resolve(env: &Env, poll_id: u64) -> Result<VoteChoice, PredictXError
     Ok(outcome)
 }
 
+/// Share of the decisive (Yes/No) votes held by the leading outcome.
+///
+/// Returns `(leading_is_yes, share_bps)`, where `share_bps` is rounded down
+/// to whole basis points out of [`BPS_DENOMINATOR`].
+///
+/// - `Unclear` votes are excluded from the denominator: they signal "cannot
+///   judge", not a preference.
+/// - A Yes/No tie resolves to Yes (`true`) at 5000 bps, so the result is
+///   deterministic.
+/// - A tally with no decisive votes (e.g. all `Unclear`) returns `(false, 0)`
+///   instead of dividing by zero.
+///
+/// Pure and side-effect free so the routing thresholds can be unit-tested
+/// against it directly.
+#[allow(dead_code)] // consumed by the upcoming threshold-routing issues
+pub(crate) fn consensus_bps(tally: &VoteTally) -> (bool, u32) {
+    let decisive = u64::from(tally.yes_votes) + u64::from(tally.no_votes);
+    if decisive == 0 {
+        return (false, 0);
+    }
+
+    let leading_is_yes = tally.yes_votes >= tally.no_votes;
+    let leading_votes = if leading_is_yes {
+        tally.yes_votes
+    } else {
+        tally.no_votes
+    };
+
+    let share_bps = (u64::from(leading_votes) * u64::from(BPS_DENOMINATOR) / decisive) as u32;
+    (leading_is_yes, share_bps)
+}
+
 // ── Tests ─────────────────────────────────────────────────────────────────────
 
 #[cfg(test)]
@@ -143,7 +182,7 @@ mod test {
         Address, Env,
     };
 
-    use crate::{VotingOracle, VotingOracleClient};
+    use crate::{VotingOracle, VotingOracleClient, MAX_VOTERS};
 
     fn setup() -> (Env, Address, VotingOracleClient<'static>) {
         let env = Env::default();
@@ -177,6 +216,51 @@ mod test {
         assert_eq!(tally.no_votes, 0);
         assert_eq!(tally.unclear_votes, 0);
         assert_eq!(tally.total_voters, 1);
+    }
+
+    #[test]
+    fn cast_vote_records_distinct_voters_in_persistent_roster() {
+        let (env, _admin, client) = setup();
+        let first = voter(&env);
+        let second = voter(&env);
+
+        client.cast_vote(&first, &1_u64, &VoteChoice::Yes);
+        client.cast_vote(&second, &1_u64, &VoteChoice::No);
+
+        let voters = client.get_voters(&1_u64);
+        assert_eq!(voters.len(), 2);
+        assert_eq!(voters.get(0).unwrap(), first);
+        assert_eq!(voters.get(1).unwrap(), second);
+    }
+
+    #[test]
+    fn duplicate_vote_does_not_duplicate_voter_roster_entry() {
+        let (env, _admin, client) = setup();
+        let voter = voter(&env);
+
+        client.cast_vote(&voter, &1_u64, &VoteChoice::Yes);
+        let err = client
+            .try_cast_vote(&voter, &1_u64, &VoteChoice::No)
+            .expect_err("duplicate vote must be rejected");
+
+        assert_eq!(err, Ok(PredictXError::AlreadyVoted));
+        assert_eq!(client.get_voters(&1_u64).len(), 1);
+    }
+
+    #[test]
+    fn cast_vote_rejects_voter_roster_over_cap() {
+        let (env, _admin, client) = setup();
+
+        for _ in 0..MAX_VOTERS {
+            client.cast_vote(&voter(&env), &1_u64, &VoteChoice::Yes);
+        }
+
+        let err = client
+            .try_cast_vote(&voter(&env), &1_u64, &VoteChoice::Yes)
+            .expect_err("voter roster cap must be enforced");
+
+        assert_eq!(err, Ok(PredictXError::MaxVotersReached));
+        assert_eq!(client.get_voters(&1_u64).len(), MAX_VOTERS);
     }
 
     #[test]
@@ -339,7 +423,7 @@ mod test {
     #[test]
     fn auto_resolve_rejects_consensus_below_threshold() {
         let (env, _admin, client) = setup();
-        cast_votes(&env, &client, 849, 151);
+        cast_votes(&env, &client, 54, 10);
         env.ledger().set_timestamp(1_000_000 + VOTING_WINDOW_SECS);
 
         let err = client
@@ -361,5 +445,44 @@ mod test {
 
         assert_eq!(err, Ok(PredictXError::VotingNotOpen));
         assert_eq!(client.get_poll_status(&1_u64), PollStatus::Voting);
+    }
+
+    // ── consensus_bps ─────────────────────────────────────────────────────────
+
+    fn tally(yes_votes: u32, no_votes: u32, unclear_votes: u32) -> predictx_shared::VoteTally {
+        predictx_shared::VoteTally {
+            poll_id: 1,
+            yes_votes,
+            no_votes,
+            unclear_votes,
+            total_voters: yes_votes + no_votes + unclear_votes,
+            voting_end_time: 0,
+            reward_pool: 0,
+        }
+    }
+
+    #[test]
+    fn consensus_bps_matches_spec_worked_example() {
+        assert_eq!(super::consensus_bps(&tally(45, 2, 0)), (true, 9_574));
+        assert_eq!(super::consensus_bps(&tally(2, 45, 0)), (false, 9_574));
+    }
+
+    #[test]
+    fn consensus_bps_ignores_unclear_votes() {
+        assert_eq!(
+            super::consensus_bps(&tally(45, 2, 30)),
+            super::consensus_bps(&tally(45, 2, 0))
+        );
+    }
+
+    #[test]
+    fn consensus_bps_all_unclear_returns_zero() {
+        assert_eq!(super::consensus_bps(&tally(0, 0, 7)), (false, 0));
+        assert_eq!(super::consensus_bps(&tally(0, 0, 0)), (false, 0));
+    }
+
+    #[test]
+    fn consensus_bps_tie_favours_yes() {
+        assert_eq!(super::consensus_bps(&tally(10, 10, 3)), (true, 5_000));
     }
 }
