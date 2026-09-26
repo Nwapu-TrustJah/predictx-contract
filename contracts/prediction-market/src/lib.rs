@@ -363,10 +363,6 @@ impl PredictionMarket {
 
     // ── Payouts ────────────────────────────────────────────────────────────────
 
-    pub fn claim_winnings(env: Env, user: Address, poll_id: u64) -> Result<i128, PredictXError> {
-        payouts::claim_winnings(&env, user, poll_id)
-    }
-
     pub fn get_platform_stats(env: Env) -> PlatformStats {
         get_platform_stats(&env)
     }
