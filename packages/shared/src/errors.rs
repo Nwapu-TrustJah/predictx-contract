@@ -80,4 +80,8 @@ pub enum PredictXError {
     OutcomeNotAvailable = 37,
     /// The reward amount must not be negative.
     InvalidRewardAmount = 38,
+    /// The address supplied as the voting oracle is not a compatible oracle.
+    InvalidOracle = 39,
+    /// Oracle rotation was rejected because polls are still unresolved.
+    OracleRotationBlocked = 40,
 }
