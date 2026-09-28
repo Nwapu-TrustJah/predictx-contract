@@ -9,9 +9,6 @@ on:
 env:
     # Pinned so a new release never silently changes what CI installs.
     SOROBAN_CLI_VERSION: "22.6.0"
-    # A dedicated root rather than $CARGO_HOME, so the prebuilt binary is
-    # cached under its own key instead of being tied to the workspace lockfile.
-    SOROBAN_CLI_ROOT: $HOME/.soroban-cli
 
 jobs:
     test:
@@ -27,11 +24,16 @@ jobs:
                   target: wasm32-unknown-unknown
                   override: true
 
+            # Single source of truth for the install root and cache key. It has
+            # to be an absolute path: actions/cache validates the path with
+            # fs.existsSync and does not expand `~`, which fails silently with
+            # only a warning and quietly turns every run into a cold rebuild.
             - name: Resolve toolchain version
               id: toolchain
               run: |
                   version=$(rustc --version | cut -d' ' -f2)
                   echo "version=$version" >> "$GITHUB_OUTPUT"
+                  echo "soroban-cli-root=${RUNNER_TEMP}/soroban-cli" >> "$GITHUB_OUTPUT"
                   echo "soroban-cache-key=soroban-cli-${SOROBAN_CLI_VERSION}-${version}-${RUNNER_OS}-${RUNNER_ARCH}" >> "$GITHUB_OUTPUT"
 
             # Caches the cargo registry, the cargo git checkouts, the workspace
@@ -46,14 +48,13 @@ jobs:
                     . -> target
                   cache-on-failure: true
 
-            # `~` is expanded to $HOME, i.e. the same $SOROBAN_CLI_ROOT above.
             # No restore-keys: falling back to a different CLI version would
             # silently change what CI tests against.
             - name: Restore cached Soroban CLI
               id: soroban-cli-cache
               uses: actions/cache/restore@v4
               with:
-                  path: ~/.soroban-cli
+                  path: ${{ steps.toolchain.outputs.soroban-cli-root }}
                   key: ${{ steps.toolchain.outputs.soroban-cache-key }}
 
             # Only needed to *compile* soroban-cli: its keyring/secret-service
@@ -66,7 +67,7 @@ jobs:
 
             - name: Install Soroban CLI
               if: steps.soroban-cli-cache.outputs.cache-hit != 'true'
-              run: cargo install --locked soroban-cli --version "$SOROBAN_CLI_VERSION" --root "$SOROBAN_CLI_ROOT"
+              run: cargo install --locked soroban-cli --version "$SOROBAN_CLI_VERSION" --root "${{ steps.toolchain.outputs.soroban-cli-root }}"
 
             # A separate save step rather than a post step on purpose: a plain
             # actions/cache only saves on success(), so a run that fails later
@@ -77,11 +78,17 @@ jobs:
               if: steps.soroban-cli-cache.outputs.cache-hit != 'true'
               uses: actions/cache/save@v4
               with:
-                  path: ~/.soroban-cli
+                  path: ${{ steps.toolchain.outputs.soroban-cli-root }}
                   key: ${{ steps.toolchain.outputs.soroban-cache-key }}
 
             - name: Add Soroban CLI to PATH
-              run: echo "$SOROBAN_CLI_ROOT/bin" >> "$GITHUB_PATH"
+              run: echo "${{ steps.toolchain.outputs.soroban-cli-root }}/bin" >> "$GITHUB_PATH"
+
+            # Guards the two failure modes this caching can introduce: a cache
+            # that silently restores nothing, and a binary that cannot start
+            # because we skipped installing its system libraries.
+            - name: Verify Soroban CLI
+              run: soroban --version
 
             - name: Build all contracts (WASM)
               run: cargo build --target wasm32-unknown-unknown --release
