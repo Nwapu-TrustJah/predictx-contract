@@ -175,7 +175,8 @@ extern crate std;
 #[cfg(test)]
 mod test {
     use super::*;
-    use soroban_sdk::testutils::Address as _;
+    use soroban_sdk::testutils::{Address as _, MockAuth, MockAuthInvoke};
+    use soroban_sdk::IntoVal;
 
     fn setup() -> (Env, Address, TreasuryClient<'static>, Address, Address) {
         let env = Env::default();
@@ -314,5 +315,72 @@ mod test {
 
         assert_eq!(token_client.balance(&recipient), 75_i128);
         assert_eq!(token_client.balance(&contract_id), 175_i128);
+    }
+
+    #[test]
+    fn deposit_and_set_market_enforce_auth() {
+        let env = Env::default();
+        let contract_id = env.register(Treasury, ());
+        let client = TreasuryClient::new(&env, &contract_id);
+
+        let admin = Address::generate(&env);
+        client
+            .mock_auths(&[MockAuth {
+                address: &admin,
+                invoke: &MockAuthInvoke {
+                    contract: &contract_id,
+                    fn_name: "initialize",
+                    args: (&admin,).into_val(&env),
+                    sub_invokes: &[],
+                },
+            }])
+            .initialize(&admin);
+
+        let market = Address::generate(&env);
+
+        // set_market without admin auth must fail
+        let err = client
+            .mock_auths(&[])
+            .try_set_market(&admin, &market);
+        assert!(err.is_err(), "set_market without admin auth must fail");
+
+        // set_market with targeted admin auth succeeds
+        client
+            .mock_auths(&[MockAuth {
+                address: &admin,
+                invoke: &MockAuthInvoke {
+                    contract: &contract_id,
+                    fn_name: "set_market",
+                    args: (&admin, &market).into_val(&env),
+                    sub_invokes: &[],
+                },
+            }])
+            .set_market(&admin, &market);
+
+        assert_eq!(client.market(), market);
+
+        let user = Address::generate(&env);
+
+        // deposit without user auth must fail
+        let err = client
+            .mock_auths(&[])
+            .try_deposit(&user, &50_i128);
+        assert!(err.is_err(), "deposit without caller auth must fail");
+
+        // deposit with targeted user auth succeeds
+        let new_bal = client
+            .mock_auths(&[MockAuth {
+                address: &user,
+                invoke: &MockAuthInvoke {
+                    contract: &contract_id,
+                    fn_name: "deposit",
+                    args: (&user, 50_i128).into_val(&env),
+                    sub_invokes: &[],
+                },
+            }])
+            .deposit(&user, &50_i128);
+
+        assert_eq!(new_bal, 50_i128);
+        assert_eq!(client.balance(&user), 50_i128);
     }
 }

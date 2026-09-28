@@ -98,6 +98,7 @@ extern crate std;
 mod test {
     use super::*;
     use soroban_sdk::testutils::Address as _;
+    use soroban_sdk::IntoVal;
 
     #[test]
     fn create_and_get_poll() {
@@ -121,5 +122,54 @@ mod test {
         assert_eq!(poll.question, question);
         assert_eq!(poll.status, PollStatus::Active);
         assert_eq!(poll.lock_time, 123_u64);
+    }
+
+    #[test]
+    fn create_poll_enforces_creator_auth() {
+        let env = Env::default();
+        let contract_id = env.register(PollFactory, ());
+        let client = PollFactoryClient::new(&env, &contract_id);
+
+        let admin = Address::generate(&env);
+        client.mock_auths(&[
+            soroban_sdk::testutils::MockAuth {
+                address: &admin,
+                invoke: &soroban_sdk::testutils::MockAuthInvoke {
+                    contract: &contract_id,
+                    fn_name: "initialize",
+                    args: (&admin,).into_val(&env),
+                    sub_invokes: &[],
+                },
+            },
+        ]).initialize(&admin);
+
+        let creator = Address::generate(&env);
+        let question = String::from_str(&env, "Will Arsenal win the league?");
+        let lock_time = 1_000_u64;
+
+        // Calling without authorising creator must fail authentication
+        let err = client
+            .mock_auths(&[])
+            .try_create_poll(&creator, &question, &lock_time);
+        assert!(err.is_err(), "create_poll without creator auth must fail");
+
+        // Calling with targeted auth for creator succeeds
+        let poll_id = client
+            .mock_auths(&[
+                soroban_sdk::testutils::MockAuth {
+                    address: &creator,
+                    invoke: &soroban_sdk::testutils::MockAuthInvoke {
+                        contract: &contract_id,
+                        fn_name: "create_poll",
+                        args: (&creator, question.clone(), lock_time).into_val(&env),
+                        sub_invokes: &[],
+                    },
+                },
+            ])
+            .create_poll(&creator, &question, &lock_time);
+
+        assert_eq!(poll_id, 1);
+        let poll = client.get_poll(&poll_id);
+        assert_eq!(poll.creator, creator);
     }
 }
