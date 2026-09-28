@@ -73,6 +73,8 @@ impl PollFactory {
 				no_count: 0,
 				status: PollStatus::Active,
 				outcome: None,
+				resolver: None,
+				resolution_basis: None,
 				resolution_time: 0,
 				created_at: env.ledger().timestamp(),
         };

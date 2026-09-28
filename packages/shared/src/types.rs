@@ -100,6 +100,10 @@ pub struct Poll {
     pub status: PollStatus,
     /// `None` until resolved; `Some(true)` = Yes won, `Some(false)` = No won.
     pub outcome: Option<bool>,
+    /// Address that finalized the poll outcome.
+    pub resolver: Option<Address>,
+    /// Evidence or rationale reference supplied at resolution time.
+    pub resolution_basis: Option<String>,
     /// Unix timestamp when the poll was resolved.
     pub resolution_time: u64,
     /// Unix timestamp when the poll was created.

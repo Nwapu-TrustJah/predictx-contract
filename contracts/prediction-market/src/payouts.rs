@@ -1,4 +1,4 @@
-use soroban_sdk::{Address, Env, Symbol};
+use soroban_sdk::{Address, Env, String, Symbol};
 use predictx_shared::{
     Poll, PollStatus, Stake, StakeSide, PredictXError,
     BPS_DENOMINATOR,
@@ -11,6 +11,7 @@ pub fn resolve_poll(
     admin: Address,
     poll_id: u64,
     outcome: bool,
+    resolution_basis: String,
 ) -> Result<(), PredictXError> {
     admin.require_auth();
     let stored_admin: Address = env
@@ -27,12 +28,22 @@ pub fn resolve_poll(
         .persistent()
         .get(&DataKey::Poll(poll_id))
         .ok_or(PredictXError::PollNotFound)?;
-    if poll.status == PollStatus::Resolved {
+    if poll.status == PollStatus::Resolved || poll.outcome.is_some() {
         return Err(PredictXError::PollAlreadyResolved);
+    }
+
+    if poll.status == PollStatus::Cancelled {
+        return Err(PredictXError::PollNotActive);
+    }
+
+    if env.ledger().timestamp() < poll.lock_time {
+        return Err(PredictXError::PollNotLocked);
     }
 
     poll.status = PollStatus::Resolved;
     poll.outcome = Some(outcome);
+    poll.resolver = Some(admin.clone());
+    poll.resolution_basis = Some(resolution_basis.clone());
     poll.resolution_time = env.ledger().timestamp();
     env.storage()
         .persistent()
@@ -43,7 +54,7 @@ pub fn resolve_poll(
         / BPS_DENOMINATOR as i128;
     env.events().publish(
         (Symbol::new(env, "PollResolved"), poll_id),
-        (outcome, total_pool, fee),
+        (outcome, total_pool, fee, admin, resolution_basis),
     );
     Ok(())
 }
@@ -272,6 +283,18 @@ mod test {
         TestSetup { env, admin, oracle_id, token_addr, contract_id, client }
     }
 
+    fn stake_user(
+        s: &TestSetup,
+        poll_id: u64,
+        side: StakeSide,
+        amount: i128,
+    ) -> Address {
+        let user = Address::generate(&s.env);
+        mint_tokens(s, &user, amount);
+        s.client.stake(&user, &poll_id, &amount, &side);
+        user
+    }
+
     fn mint_tokens(s: &TestSetup, to: &Address, amount: i128) {
         let sac = token::StellarAssetClient::new(&s.env, &s.token_addr);
         sac.mint(to, &amount);
@@ -316,6 +339,8 @@ mod test {
                 no_count: if no_pool > 0 { 1 } else { 0 },
                 status: PollStatus::Resolved,
                 outcome: Some(outcome_yes),
+                resolver: Some(s.admin.clone()),
+                resolution_basis: Some(String::from_str(&s.env, "test")),
                 resolution_time: 1_000_000,
                 created_at: 900_000,
             };
@@ -543,7 +568,8 @@ mod test {
         let s = setup();
         let poll_id = create_poll(&s, 2_000_000);
         let winner = stake_user(&s, poll_id, StakeSide::Yes, 100_000_000);
-        s.client.resolve_poll(&s.admin, &poll_id, &true);
+        s.env.ledger().set_timestamp(2_000_001);
+        s.client.resolve_poll(&s.admin, &poll_id, &true, &String::from_str(&s.env, "test"));
 
         let claimed = s.client.claim_winnings(&winner, &poll_id);
 
@@ -558,7 +584,8 @@ mod test {
         let s = setup();
         let poll_id = create_poll(&s, 2_000_000);
         let winner = stake_user(&s, poll_id, StakeSide::No, 50_000_000);
-        s.client.resolve_poll(&s.admin, &poll_id, &false);
+        s.env.ledger().set_timestamp(2_000_001);
+        s.client.resolve_poll(&s.admin, &poll_id, &false, &String::from_str(&s.env, "test"));
 
         // The quote and the claim must agree, both fee-free.
         assert_eq!(s.client.calculate_winnings(&poll_id, &winner), 50_000_000);
