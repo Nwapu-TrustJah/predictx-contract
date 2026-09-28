@@ -5,11 +5,12 @@ mod staking;
 pub(crate) mod token_utils;
 
 use predictx_shared::{
-    Match, PlatformStats, Poll, PollCategory, PollStatus, PredictXError, Stake, StakeSide,
+    DataKey, Match, PlatformStats, Poll, PollCategory, PollStatus, PredictXError, Stake, StakeSide,
     MAX_POLLS_PER_MATCH,
 };
 use soroban_sdk::{contract, contractimpl, contracttype, Address, Env, String, Symbol, Vec};
 
+mod payouts;
 mod voting_oracle {
     soroban_sdk::contractimport!(file = "wasm/voting_oracle.wasm");
 }
@@ -28,31 +29,6 @@ fn map_oracle_poll_status(status: voting_oracle::PollStatus) -> PollStatus {
 
 #[contract]
 pub struct PredictionMarket;
-
-#[contracttype]
-#[derive(Clone)]
-pub enum DataKey {
-    // ── oracle / admin keys ───────────────────────────────────────────────────
-    Admin,
-    VotingOracle,
-    Paused,
-    TokenAddress,
-    TreasuryAddress,
-    PlatformFeeBps,
-    Stake(u64, Address),
-    EmergencyClaimed(u64, Address),
-    PlatformStats,
-    // ── match management keys ─────────────────────────────────────────────────
-    Initialized,
-    NextMatchId,
-    NextPollId,
-    Match(u64),
-    MatchPolls(u64),
-    // ── poll & staking keys ───────────────────────────────────────────────────
-    Poll(u64),
-    UserStakes(Address),
-    HasStaked(u64, Address),
-}
 
 /// Pool state returned by `get_pool_info`.
 #[contracttype]
@@ -340,15 +316,7 @@ impl PredictionMarket {
             return Err(PredictXError::PollAlreadyResolved);
         }
 
-        poll.outcome = Some(outcome);
-        poll.resolution_time = env.ledger().timestamp();
-        poll.status = PollStatus::Resolved;
-
-        env.storage()
-            .persistent()
-            .set(&DataKey::Poll(poll_id), &poll);
-
-        Ok(())
+        payouts::record_poll_resolution(&env, &mut poll, outcome)
     }
 
     pub fn get_poll(env: Env, poll_id: u64) -> Result<Poll, PredictXError> {
@@ -454,15 +422,6 @@ impl PredictionMarket {
     }
 
     // ── Payouts ───────────────────────────────────────────────────────────────
-
-    pub fn resolve_poll(
-        env: Env,
-        admin: Address,
-        poll_id: u64,
-        outcome: bool,
-    ) -> Result<(), PredictXError> {
-        payouts::resolve_poll(&env, admin, poll_id, outcome)
-    }
 
     /// Claim winnings after a resolved poll.
     ///

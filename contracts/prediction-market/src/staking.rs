@@ -1,9 +1,9 @@
 use soroban_sdk::{Address, Env, Symbol, Vec};
+use crate::{PoolInfo, get_platform_stats, set_platform_stats, ensure_not_paused, token_utils};
 use predictx_shared::{
-    Poll, PollStatus, Stake, StakeSide, PredictXError,
+    DataKey, Poll, PollStatus, Stake, StakeSide, PredictXError,
     MIN_STAKE_AMOUNT, BPS_DENOMINATOR,
 };
-use crate::{DataKey, PoolInfo, get_platform_stats, set_platform_stats, ensure_not_paused, token_utils};
 
 // ── Stake placement ───────────────────────────────────────────────────────────
 
@@ -213,8 +213,8 @@ mod test {
         testutils::{Address as _, Ledger},
         token, Address, Env, String,
     };
-    use predictx_shared::{PollCategory, PollStatus, PredictXError, StakeSide, Poll};
-    use crate::{DataKey, PredictionMarket, PredictionMarketClient};
+    use predictx_shared::{DataKey, PollCategory, PollStatus, PredictXError, StakeSide, Poll};
+    use crate::{PredictionMarket, PredictionMarketClient};
 
     // ── Helpers ───────────────────────────────────────────────────────────────
 
