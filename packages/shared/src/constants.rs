@@ -33,3 +33,10 @@ pub const EMERGENCY_TIMEOUT_SECS: u64 = 604_800;
 
 /// Minimum stake amount in token base units. `10_000_000` = 10 tokens (7 decimal places).
 pub const MIN_STAKE_AMOUNT: i128 = 10_000_000;
+
+/// Maximum amount for a single stake on a poll, in token base units.
+/// `100_000_000` = 100 tokens (7 decimal places). Caps any one stake so a
+/// single account cannot dominate a pool, and keeps the payout arithmetic
+/// inside a predictable range. The bound is per stake, not per user: several
+/// smaller stakes on the same poll still add up.
+pub const MAX_STAKE_AMOUNT: i128 = 100_000_000;

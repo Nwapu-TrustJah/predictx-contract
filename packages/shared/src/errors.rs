@@ -80,4 +80,32 @@ pub enum PredictXError {
     OutcomeNotAvailable = 37,
     /// The reward amount must not be negative.
     InvalidRewardAmount = 38,
+    /// Stake amount is above the maximum allowed for a single stake.
+    StakeAboveMaximum = 39,
+    /// The poll's current status does not allow the requested transition.
+    InvalidStateTransition = 40,
+    /// The stake is on the winning side but its payout rounds down to zero.
+    PayoutRoundsToZero = 41,
+}
+
+#[cfg(test)]
+mod test {
+    use super::PredictXError;
+
+    /// Discriminants are part of the contract's public interface: they are
+    /// what an indexer decodes an error code against. New variants must only
+    /// ever be *appended* so previously-deployed error codes keep their
+    /// meaning.
+    #[test]
+    fn appended_discriminants_are_stable() {
+        assert_eq!(PredictXError::NotInitialized as u32, 1);
+        assert_eq!(PredictXError::Unauthorized as u32, 3);
+        assert_eq!(PredictXError::NotOnWinningSide as u32, 14);
+        assert_eq!(PredictXError::ContractPaused as u32, 33);
+        assert_eq!(PredictXError::StakeBelowMinimum as u32, 34);
+        assert_eq!(PredictXError::InvalidRewardAmount as u32, 38);
+        assert_eq!(PredictXError::StakeAboveMaximum as u32, 39);
+        assert_eq!(PredictXError::InvalidStateTransition as u32, 40);
+        assert_eq!(PredictXError::PayoutRoundsToZero as u32, 41);
+    }
 }

@@ -1,7 +1,7 @@
 use soroban_sdk::{Address, Env, Symbol, Vec};
 use predictx_shared::{
     Poll, PollStatus, Stake, StakeSide, PredictXError,
-    MIN_STAKE_AMOUNT, BPS_DENOMINATOR,
+    MIN_STAKE_AMOUNT, MAX_STAKE_AMOUNT, BPS_DENOMINATOR,
 };
 use crate::{DataKey, PoolInfo, get_platform_stats, set_platform_stats, ensure_not_paused, token_utils};
 
@@ -13,6 +13,10 @@ use crate::{DataKey, PoolInfo, get_platform_stats, set_platform_stats, ensure_no
 /// 2. Transfers tokens from staker to contract (interactions — first because
 ///    Soroban token transfers are safe against re-entrancy)
 /// 3. Records state changes (effects)
+///
+/// A single stake must sit within `[MIN_STAKE_AMOUNT, MAX_STAKE_AMOUNT]`; both
+/// bounds are inclusive. The ceiling is per stake, not per user — a user may
+/// still back a poll with several accounts.
 pub fn stake(
     env: &Env,
     staker: Address,
@@ -30,6 +34,9 @@ pub fn stake(
     }
     if amount < MIN_STAKE_AMOUNT {
         return Err(PredictXError::StakeBelowMinimum);
+    }
+    if amount > MAX_STAKE_AMOUNT {
+        return Err(PredictXError::StakeAboveMaximum);
     }
 
     let mut poll: Poll = env
@@ -213,7 +220,10 @@ mod test {
         testutils::{Address as _, Ledger},
         token, Address, Env, String,
     };
-    use predictx_shared::{PollCategory, PollStatus, PredictXError, StakeSide, Poll};
+    use predictx_shared::{
+        Poll, PollCategory, PollStatus, PredictXError, StakeSide,
+        MAX_STAKE_AMOUNT, MIN_STAKE_AMOUNT,
+    };
     use crate::{DataKey, PredictionMarket, PredictionMarketClient};
 
     // ── Helpers ───────────────────────────────────────────────────────────────
@@ -418,6 +428,60 @@ mod test {
         assert_eq!(err, Ok(PredictXError::StakeBelowMinimum));
     }
 
+    // ── Maximum stake cap ─────────────────────────────────────────────────────
+
+    #[test]
+    fn stake_accepts_exactly_the_maximum() {
+        let s = setup();
+        let poll_id = create_test_poll(&s, 2_000_000);
+        let user = Address::generate(&s.env);
+        mint_tokens(&s, &user, MAX_STAKE_AMOUNT);
+
+        let stake = s.client.stake(&user, &poll_id, &MAX_STAKE_AMOUNT, &StakeSide::Yes);
+
+        assert_eq!(stake.amount, MAX_STAKE_AMOUNT);
+        let pool = s.client.get_pool_info(&poll_id);
+        assert_eq!(pool.yes_pool, MAX_STAKE_AMOUNT);
+    }
+
+    #[test]
+    fn stake_rejects_one_base_unit_above_the_maximum() {
+        let s = setup();
+        let poll_id = create_test_poll(&s, 2_000_000);
+        let user = Address::generate(&s.env);
+        let too_large: i128 = MAX_STAKE_AMOUNT + 1;
+        mint_tokens(&s, &user, too_large);
+
+        let err = s
+            .client
+            .try_stake(&user, &poll_id, &too_large, &StakeSide::Yes)
+            .expect_err("should reject");
+
+        assert_eq!(err, Ok(PredictXError::StakeAboveMaximum));
+        // The rejected stake must leave the pool untouched.
+        let pool = s.client.get_pool_info(&poll_id);
+        assert_eq!(pool.yes_pool, 0);
+        assert!(!s.client.has_user_staked(&poll_id, &user));
+    }
+
+    #[test]
+    fn stake_rejects_far_above_the_maximum() {
+        let s = setup();
+        let poll_id = create_test_poll(&s, 2_000_000);
+        let user = Address::generate(&s.env);
+        // A whale-sized bet: 10_000 tokens at 7dp.
+        let whale: i128 = 1_000_000_000;
+        mint_tokens(&s, &user, whale);
+
+        let err = s
+            .client
+            .try_stake(&user, &poll_id, &whale, &StakeSide::No)
+            .expect_err("should reject");
+
+        assert_eq!(err, Ok(PredictXError::StakeAboveMaximum));
+        assert_eq!(token_balance(&s, &user), whale, "no tokens may move");
+    }
+
     // ── Pool management ───────────────────────────────────────────────────────
 
     #[test]
@@ -432,7 +496,7 @@ mod test {
             }
             v
         };
-        let amounts: [i128; 3] = [100_000_000, 200_000_000, 150_000_000];
+        let amounts: [i128; 3] = [20_000_000, 40_000_000, 30_000_000];
 
         for i in 0..3u32 {
             mint_tokens(&s, &users.get(i).unwrap(), amounts[i as usize]);
@@ -471,7 +535,8 @@ mod test {
     fn concurrent_staking_on_both_sides() {
         let s = setup();
         let poll_id = create_test_poll(&s, 2_000_000);
-        let base: i128 = 50_000_000;
+        // base * 5 stayers must stay inside MAX_STAKE_AMOUNT.
+        let base: i128 = 10_000_000;
 
         let mut total_yes: i128 = 0;
         let mut total_no: i128 = 0;
@@ -563,8 +628,8 @@ mod test {
 
         let user1 = Address::generate(&s.env);
         let user2 = Address::generate(&s.env);
-        let amount1: i128 = 100_000_000;
-        let amount2: i128 = 200_000_000;
+        let amount1: i128 = 30_000_000;
+        let amount2: i128 = 40_000_000;
         mint_tokens(&s, &user1, amount1);
         mint_tokens(&s, &user2, amount2);
 
@@ -583,10 +648,10 @@ mod test {
         let s = setup();
         let poll_id = create_test_poll(&s, 2_000_000);
 
-        // Build a pool: Yes = 7_000 tokens, No = 3_000 tokens
-        // (using 7 decimal places: 7_000 * 10^7 = 70_000_000_000)
-        let yes_amount: i128 = 70_000_000_000;
-        let no_amount: i128 = 30_000_000_000;
+        // Build a pool: Yes = 70 tokens, No = 30 tokens
+        // (using 7 decimal places, both inside MAX_STAKE_AMOUNT)
+        let yes_amount: i128 = 70_000_000;
+        let no_amount: i128 = 30_000_000;
 
         let yes_user = Address::generate(&s.env);
         let no_user = Address::generate(&s.env);
@@ -596,24 +661,24 @@ mod test {
         s.client.stake(&yes_user, &poll_id, &yes_amount, &StakeSide::Yes);
         s.client.stake(&no_user, &poll_id, &no_amount, &StakeSide::No);
 
-        // Simulate a new 700-token yes stake (7_000_000_000 base units)
-        let new_stake: i128 = 7_000_000_000;
+        // Preview the smallest acceptable stake (MIN_STAKE_AMOUNT) on Yes.
+        let new_stake: i128 = MIN_STAKE_AMOUNT;
         let winnings = s.client.calculate_potential_winnings(
             &poll_id,
             &StakeSide::Yes,
             &new_stake,
         );
 
-        // pool_on_side_after = 70B + 7B = 77B = 77_000_000_000
-        // total_pool_after   = 77B + 30B = 107B = 107_000_000_000
-        // winnings = 7B * 107B * 9500 / (77B * 10000)
-        let expected = new_stake * 107_000_000_000_i128 * 9500
-            / (77_000_000_000_i128 * 10_000);
+        // pool_on_side_after = 70M + 10M = 80M
+        // total_pool_after   = 80M + 30M = 110M
+        // winnings = 10M * 110M * 9500 / (80M * 10000)
+        let expected = new_stake * 110_000_000_i128 * 9500
+            / (80_000_000_i128 * 10_000);
         assert_eq!(winnings, expected);
         assert!(winnings > 0);
 
         // Winnings should be less than total pool (sanity check)
-        assert!(winnings < 107_000_000_000);
+        assert!(winnings < 110_000_000);
     }
 
     #[test]
@@ -696,7 +761,7 @@ mod test {
         let deposit: i128 = 200_000_000;
         mint_tokens(&s, &user, deposit);
 
-        let stake_amount: i128 = 150_000_000;
+        let stake_amount: i128 = 40_000_000;
         s.client.stake(&user, &poll_id, &stake_amount, &StakeSide::Yes);
 
         // User should have deposit - stake_amount left
@@ -709,7 +774,8 @@ mod test {
     fn multiple_stakes_accumulate_contract_balance() {
         let s = setup();
         let poll_id = create_test_poll(&s, 2_000_000);
-        let base: i128 = 50_000_000;
+        // base * 4 stakers must stay inside MAX_STAKE_AMOUNT.
+        let base: i128 = 10_000_000;
         let mut total: i128 = 0;
 
         for i in 1..=4_i128 {
