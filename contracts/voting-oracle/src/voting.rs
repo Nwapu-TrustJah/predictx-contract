@@ -188,7 +188,9 @@ fn eligible_voter_count(env: &Env, poll_id: u64, outcome: VoteChoice) -> u32 {
 }
 
 /// Resolve a voting poll when the winning outcome reaches the automatic
-/// resolution threshold after the voting window closes.
+/// resolution threshold after the voting window closes. A leading `Unclear`
+/// returns `ConsensusNotReached` and leaves the poll in `Voting` for admin
+/// handling; only Yes/No outcomes are stored as terminal results.
 pub fn auto_resolve(env: &Env, poll_id: u64) -> Result<VoteChoice, PredictXError> {
     if !env
         .storage()
@@ -215,6 +217,10 @@ pub fn auto_resolve(env: &Env, poll_id: u64) -> Result<VoteChoice, PredictXError
         } else {
             (VoteChoice::Unclear, tally.unclear_votes)
         };
+
+    if outcome == VoteChoice::Unclear {
+        return Err(PredictXError::ConsensusNotReached);
+    }
 
     if tally.total_voters == 0 {
         return Err(PredictXError::ConsensusNotReached);
@@ -537,6 +543,35 @@ mod test {
         let err = client
             .try_auto_resolve(&1_u64)
             .expect_err("84.9% consensus must not auto-resolve");
+
+        assert_eq!(err, Ok(PredictXError::ConsensusNotReached));
+        assert_eq!(client.get_poll_status(&1_u64), PollStatus::Voting);
+        let missing_outcome = client
+            .try_get_poll_outcome(&1_u64)
+            .expect_err("a rejected poll must not have a stored outcome");
+        assert_eq!(missing_outcome, Ok(PredictXError::PollNotFound));
+    }
+
+    #[test]
+    fn auto_resolve_rejects_unclear_leading_tally() {
+        let (env, _admin, client) = setup();
+        crate::storage::write_tally(
+            &env,
+            &predictx_shared::VoteTally {
+                poll_id: 1,
+                yes_votes: 5,
+                no_votes: 5,
+                unclear_votes: 90,
+                total_voters: 100,
+                voting_end_time: 1_000_000 + VOTING_WINDOW_SECS,
+                reward_pool: 0,
+            },
+        );
+        env.ledger().set_timestamp(1_000_000 + VOTING_WINDOW_SECS);
+
+        let err = client
+            .try_auto_resolve(&1_u64)
+            .expect_err("an Unclear majority must not resolve the poll");
 
         assert_eq!(err, Ok(PredictXError::ConsensusNotReached));
         assert_eq!(client.get_poll_status(&1_u64), PollStatus::Voting);
