@@ -3,7 +3,7 @@ use predictx_shared::{
     Poll, PollStatus, Stake, StakeSide, PredictXError,
     BPS_DENOMINATOR,
 };
-use crate::{DataKey, get_platform_stats, set_platform_stats, token_utils};
+use crate::{DataKey, get_platform_stats, has_emergency_claimed, set_platform_stats, token_utils};
 
 /// Resolve a poll using the configured admin and record its final outcome.
 pub fn resolve_poll(
@@ -96,7 +96,7 @@ pub fn claim_winnings(
         .get(&DataKey::Stake(poll_id, claimant.clone()))
         .ok_or(PredictXError::NotStaker)?;
 
-    if stake.claimed {
+    if stake.claimed || has_emergency_claimed(env, poll_id, &claimant) {
         return Err(PredictXError::AlreadyClaimed);
     }
 
