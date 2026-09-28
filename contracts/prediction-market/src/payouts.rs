@@ -3,7 +3,7 @@ use predictx_shared::{
     Poll, PollStatus, Stake, StakeSide, PredictXError,
     BPS_DENOMINATOR,
 };
-use crate::{DataKey, get_platform_stats, set_platform_stats, token_utils};
+use crate::{DataKey, get_platform_stats, set_platform_stats, polls, token_utils};
 
 /// Resolve a poll using the configured admin and record its final outcome.
 pub fn resolve_poll(
@@ -31,12 +31,12 @@ pub fn resolve_poll(
         return Err(PredictXError::PollAlreadyResolved);
     }
 
-    poll.status = PollStatus::Resolved;
     poll.outcome = Some(outcome);
     poll.resolution_time = env.ledger().timestamp();
     env.storage()
         .persistent()
         .set(&DataKey::Poll(poll_id), &poll);
+    polls::transition_status(&env, poll_id, PollStatus::Resolved)?;
 
     let total_pool = poll.yes_pool + poll.no_pool;
     let fee = total_pool * token_utils::get_platform_fee_bps(env) as i128
@@ -127,26 +127,36 @@ pub fn claim_winnings(
             return Err(PredictXError::NotOnWinningSide);
         }
 
-        // Proportional share of total pool, after platform fee.
-        //
-        // payout = stake_amount * total_pool * (BPS_DENOMINATOR - fee_bps)
-        //          / (winning_pool * BPS_DENOMINATOR)
-        //
-        // Integer division rounds down; any dust remains in the contract.
-        let fee_bps = token_utils::get_platform_fee_bps(env);
-        let fee_factor = (BPS_DENOMINATOR - fee_bps) as i128;
-        let bps = BPS_DENOMINATOR as i128;
+        let losing_pool: i128 = if outcome_yes { poll.no_pool } else { poll.yes_pool };
+        if losing_pool <= 0 {
+            // ── One-sided pool: refund the winner at par, no fee ──────────────
+            //
+            // Nothing was staked on the losing side, so there is no opposing
+            // liquidity to share and no "winner's profit" to skim a fee from.
+            // Mirrors `calculate_winnings`.
+            stake.amount
+        } else {
+            // Proportional share of total pool, after platform fee.
+            //
+            // payout = stake_amount * total_pool * (BPS_DENOMINATOR - fee_bps)
+            //          / (winning_pool * BPS_DENOMINATOR)
+            //
+            // Integer division rounds down; any dust remains in the contract.
+            let fee_bps = token_utils::get_platform_fee_bps(env);
+            let fee_factor = (BPS_DENOMINATOR - fee_bps) as i128;
+            let bps = BPS_DENOMINATOR as i128;
 
-        let gross = stake.amount * total_pool / winning_pool;
-        let net = gross * fee_factor / bps;
-        let fee = gross - net;
+            let gross = stake.amount * total_pool / winning_pool;
+            let net = gross * fee_factor / bps;
+            let fee = gross - net;
 
-        // Send platform fee to treasury
-        if fee > 0 {
-            token_utils::transfer_to_treasury(env, fee)?;
+            // Send platform fee to treasury
+            if fee > 0 {
+                token_utils::transfer_to_treasury(env, fee)?;
+            }
+
+            net
         }
-
-        net
     };
 
     // ── Mark claimed & persist ────────────────────────────────────────────────
@@ -279,6 +289,14 @@ mod test {
 
     fn token_balance(s: &TestSetup, addr: &Address) -> i128 {
         token::Client::new(&s.env, &s.token_addr).balance(addr)
+    }
+
+    /// Create a user, fund them, place a stake, and return the user address.
+    fn stake_user(s: &TestSetup, poll_id: u64, side: StakeSide, amount: i128) -> Address {
+        let user = Address::generate(&s.env);
+        mint_tokens(s, &user, amount);
+        s.client.stake(&user, &poll_id, &amount, &side);
+        user
     }
 
     /// Create a match + poll and return the poll_id.
@@ -543,7 +561,7 @@ mod test {
         let s = setup();
         let poll_id = create_poll(&s, 2_000_000);
         let winner = stake_user(&s, poll_id, StakeSide::Yes, 100_000_000);
-        s.client.resolve_poll(&s.admin, &poll_id, &true);
+        s.client.admin_resolve_poll(&s.admin, &poll_id, &true);
 
         let claimed = s.client.claim_winnings(&winner, &poll_id);
 
@@ -558,7 +576,7 @@ mod test {
         let s = setup();
         let poll_id = create_poll(&s, 2_000_000);
         let winner = stake_user(&s, poll_id, StakeSide::No, 50_000_000);
-        s.client.resolve_poll(&s.admin, &poll_id, &false);
+        s.client.admin_resolve_poll(&s.admin, &poll_id, &false);
 
         // The quote and the claim must agree, both fee-free.
         assert_eq!(s.client.calculate_winnings(&poll_id, &winner), 50_000_000);

@@ -1,5 +1,7 @@
 use soroban_sdk::{contracttype, Address};
 
+use crate::PollStatus;
+
 /// Storage keys for all PredictX contracts.
 ///
 /// Storage tier guidance:
@@ -39,6 +41,8 @@ pub enum DataKey {
     Match(u64),
     /// `poll_id` → `Poll`. (Persistent)
     Poll(u64),
+    /// `status` → `Vec<u64>` poll IDs currently in that status bucket. (Persistent)
+    PollsByStatus(PollStatus),
     /// `(poll_id, user)` → `Stake`. (Persistent)
     Stake(u64, Address),
     /// `user` → `Vec<u64>` poll IDs the user has staked on. (Persistent)

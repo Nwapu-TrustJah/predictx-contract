@@ -1,6 +1,8 @@
 #![no_std]
 
 mod matches;
+mod payouts;
+mod polls;
 mod staking;
 pub(crate) mod token_utils;
 
@@ -50,6 +52,8 @@ pub enum DataKey {
     MatchPolls(u64),
     // ── poll & staking keys ───────────────────────────────────────────────────
     Poll(u64),
+    /// `status` → `Vec<u64>` poll IDs currently in that status bucket.
+    PollsByStatus(PollStatus),
     UserStakes(Address),
     HasStaked(u64, Address),
 }
@@ -187,6 +191,9 @@ impl PredictionMarket {
         let oracle_id = get_oracle(&env)?;
         let client = voting_oracle::Client::new(&env, &oracle_id);
         client.set_poll_status(&poll_id, &voting_oracle::PollStatus::Cancelled);
+        if env.storage().persistent().has(&DataKey::Poll(poll_id)) {
+            polls::transition_status(&env, poll_id, PollStatus::Cancelled)?;
+        }
         env.events().publish((Symbol::new(&env, "PollCancelled"),), poll_id);
         Ok(())
     }
@@ -296,6 +303,7 @@ impl PredictionMarket {
         env.storage()
             .persistent()
             .set(&DataKey::Poll(poll_id), &poll);
+        polls::add_to_index(&env, poll_id, PollStatus::Active);
 
         match_polls.push_back(poll_id);
         env.storage()
@@ -342,11 +350,11 @@ impl PredictionMarket {
 
         poll.outcome = Some(outcome);
         poll.resolution_time = env.ledger().timestamp();
-        poll.status = PollStatus::Resolved;
 
         env.storage()
             .persistent()
             .set(&DataKey::Poll(poll_id), &poll);
+        polls::transition_status(&env, poll_id, PollStatus::Resolved)?;
 
         Ok(())
     }
@@ -356,6 +364,14 @@ impl PredictionMarket {
             .persistent()
             .get(&DataKey::Poll(poll_id))
             .ok_or(PredictXError::PollNotFound)
+    }
+
+    /// Page through all poll IDs currently in `status`.
+    ///
+    /// `start` is the zero-based offset into the bucket and `limit` caps the
+    /// number of results returned (clamped to the max page size).
+    pub fn get_polls_by_status(env: Env, status: PollStatus, start: u32, limit: u32) -> Vec<u64> {
+        polls::get_polls_by_status(&env, status, start, limit)
     }
 
     // ── Staking ───────────────────────────────────────────────────────────────
@@ -455,7 +471,9 @@ impl PredictionMarket {
 
     // ── Payouts ───────────────────────────────────────────────────────────────
 
-    pub fn resolve_poll(
+    /// Admin-only resolution entry point that records the outcome, updates the
+    /// status index, and emits the resolution fee.
+    pub fn admin_resolve_poll(
         env: Env,
         admin: Address,
         poll_id: u64,
