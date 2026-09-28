@@ -1,6 +1,7 @@
 #![no_std]
 
 mod matches;
+mod payouts;
 mod staking;
 pub(crate) mod token_utils;
 
@@ -316,41 +317,6 @@ impl PredictionMarket {
         Ok(poll_id)
     }
 
-
-    /// Resolve a poll with a boolean outcome. Callable only by the registered oracle.
-    pub fn resolve_poll(
-        env: Env,
-        caller: Address,
-        poll_id: u64,
-        outcome: bool,
-    ) -> Result<(), PredictXError> {
-        caller.require_auth();
-        let oracle = get_oracle(&env)?;
-        if caller != oracle {
-            return Err(PredictXError::Unauthorized);
-        }
-
-        let mut poll: Poll = env
-            .storage()
-            .persistent()
-            .get(&DataKey::Poll(poll_id))
-            .ok_or(PredictXError::PollNotFound)?;
-
-        if poll.status == PollStatus::Resolved || poll.outcome.is_some() {
-            return Err(PredictXError::PollAlreadyResolved);
-        }
-
-        poll.outcome = Some(outcome);
-        poll.resolution_time = env.ledger().timestamp();
-        poll.status = PollStatus::Resolved;
-
-        env.storage()
-            .persistent()
-            .set(&DataKey::Poll(poll_id), &poll);
-
-        Ok(())
-    }
-
     pub fn get_poll(env: Env, poll_id: u64) -> Result<Poll, PredictXError> {
         env.storage()
             .persistent()
@@ -455,13 +421,14 @@ impl PredictionMarket {
 
     // ── Payouts ───────────────────────────────────────────────────────────────
 
+    /// Resolve a poll with a boolean outcome. Callable by the registered oracle or admin.
     pub fn resolve_poll(
         env: Env,
-        admin: Address,
+        caller: Address,
         poll_id: u64,
         outcome: bool,
     ) -> Result<(), PredictXError> {
-        payouts::resolve_poll(&env, admin, poll_id, outcome)
+        payouts::resolve_poll(&env, caller, poll_id, outcome)
     }
 
     /// Claim winnings after a resolved poll.
@@ -632,7 +599,7 @@ mod test {
     #[test]
     fn emergency_withdraw_on_cancelled_poll_refunds_stake() {
         let (env, admin, oracle_id, contract_id, client) = setup_emergency_env();
-        let oracle_client = voting_oracle::Client::new(&env, &oracle_id);
+        let _oracle_client = voting_oracle::Client::new(&env, &oracle_id);
         let token_addr: Address = env.as_contract(&contract_id, || {
             env.storage().instance().get(&DataKey::TokenAddress).unwrap()
         });
