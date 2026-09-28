@@ -6,15 +6,19 @@ on:
     pull_request:
         branches: [main]
 
+env:
+    # Pinned so a new release never silently changes what CI installs.
+    SOROBAN_CLI_VERSION: "22.6.0"
+    # A dedicated root rather than $CARGO_HOME, so the prebuilt binary is
+    # cached under its own key instead of being tied to the workspace lockfile.
+    SOROBAN_CLI_ROOT: $HOME/.soroban-cli
+
 jobs:
     test:
         runs-on: ubuntu-latest
         steps:
             - name: Checkout repository
               uses: actions/checkout@v4
-
-            - name: Install system dependencies
-              run: sudo apt-get update && sudo apt-get install -y libdbus-1-dev libudev-dev pkg-config
 
             - name: Install Rust toolchain
               uses: dtolnay/rust-toolchain@1.82.0
@@ -23,8 +27,45 @@ jobs:
                   target: wasm32-unknown-unknown
                   override: true
 
+            - name: Resolve toolchain version
+              id: toolchain
+              run: echo "version=$(rustc --version | cut -d' ' -f2)" >> "$GITHUB_OUTPUT"
+
+            # Caches the cargo registry, the cargo git checkouts, the workspace
+            # target directory and $CARGO_HOME/bin. The key hashes every
+            # Cargo.toml/Cargo.lock, rust-toolchain.toml and the resolved rust
+            # version, so it is invalidated by dependency or toolchain changes.
+            - name: Cache cargo artifacts
+              uses: Swatinem/rust-cache@v2
+              with:
+                  workspaces: |
+                    . -> target
+                  cache-on-failure: true
+
+            # `~` is expanded to $HOME, i.e. the same $SOROBAN_CLI_ROOT above.
+            # No restore-keys: falling back to a different CLI version would
+            # silently change what CI tests against.
+            - name: Restore cached Soroban CLI
+              id: soroban-cli-cache
+              uses: actions/cache@v4
+              with:
+                  path: ~/.soroban-cli
+                  key: soroban-cli-${{ env.SOROBAN_CLI_VERSION }}-${{ steps.toolchain.outputs.version }}-${{ runner.os }}-${{ runner.arch }}
+
+            # Only needed to *compile* soroban-cli: its keyring/secret-service
+            # dependency links against libdbus-1 and libudev. Neither the
+            # workspace build nor the tests need them, so this is skipped
+            # entirely on a cache hit.
+            - name: Install system dependencies
+              if: steps.soroban-cli-cache.outputs.cache-hit != 'true'
+              run: sudo apt-get update && sudo apt-get install -y libdbus-1-dev libudev-dev pkg-config
+
             - name: Install Soroban CLI
-              run: cargo install --locked soroban-cli --version 22.6.0
+              if: steps.soroban-cli-cache.outputs.cache-hit != 'true'
+              run: cargo install --locked soroban-cli --version "$SOROBAN_CLI_VERSION" --root "$SOROBAN_CLI_ROOT"
+
+            - name: Add Soroban CLI to PATH
+              run: echo "$SOROBAN_CLI_ROOT/bin" >> "$GITHUB_PATH"
 
             - name: Build all contracts (WASM)
               run: cargo build --target wasm32-unknown-unknown --release
