@@ -41,6 +41,8 @@ pub enum DataKey {
     PlatformFeeBps,
     Stake(u64, Address),
     EmergencyClaimed(u64, Address),
+    MatchStakerCount(u64),
+    HasMatchStaked(u64, Address),
     PlatformStats,
     // ── match management keys ─────────────────────────────────────────────────
     Initialized,
@@ -62,6 +64,15 @@ pub struct PoolInfo {
     pub no_pool: i128,
     pub yes_count: u32,
     pub no_count: u32,
+}
+
+/// Aggregate stake activity for a match.
+#[contracttype]
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct MatchStats {
+    pub poll_count: u32,
+    pub total_staked: i128,
+    pub distinct_stakers: u64,
 }
 
 fn get_admin(env: &Env) -> Result<Address, PredictXError> {
@@ -447,6 +458,10 @@ impl PredictionMarket {
 
     pub fn get_match_polls(env: Env, match_id: u64) -> Result<Vec<u64>, PredictXError> {
         matches::get_match_polls(&env, match_id)
+    }
+
+    pub fn get_match_stats(env: Env, match_id: u64) -> Result<MatchStats, PredictXError> {
+        matches::get_match_stats(&env, match_id)
     }
 
     pub fn get_match_count(env: Env) -> u64 {

@@ -77,6 +77,20 @@ pub fn stake(
         .persistent()
         .set(&DataKey::HasStaked(poll_id, staker.clone()), &true);
 
+    let match_has_staked_key = DataKey::HasMatchStaked(poll.match_id, staker.clone());
+    if !env.storage().persistent().has(&match_has_staked_key) {
+        env.storage().persistent().set(&match_has_staked_key, &true);
+        let distinct_stakers: u64 = env
+            .storage()
+            .persistent()
+            .get(&DataKey::MatchStakerCount(poll.match_id))
+            .unwrap_or(0);
+        env.storage().persistent().set(
+            &DataKey::MatchStakerCount(poll.match_id),
+            &(distinct_stakers + 1),
+        );
+    }
+
     // Update pool totals
     match side {
         StakeSide::Yes => {

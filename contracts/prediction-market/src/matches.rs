@@ -1,6 +1,6 @@
 use soroban_sdk::{Address, Env, String, Symbol, Vec};
 use predictx_shared::{Match, PredictXError};
-use crate::DataKey;   // ← uses prediction-market's local DataKey, not shared one
+use crate::{DataKey, MatchStats};
 
 // ── Internal helper ───────────────────────────────────────────────────────────
 
@@ -151,6 +151,30 @@ pub fn get_match_polls(env: &Env, match_id: u64) -> Result<Vec<u64>, PredictXErr
         .unwrap_or(Vec::new(env)))
 }
 
+pub fn get_match_stats(env: &Env, match_id: u64) -> Result<MatchStats, PredictXError> {
+    let poll_ids = get_match_polls(env, match_id)?;
+    let mut total_staked = 0_i128;
+
+    for poll_id in poll_ids.iter() {
+        let poll: predictx_shared::Poll = env
+            .storage()
+            .persistent()
+            .get(&DataKey::Poll(poll_id))
+            .ok_or(PredictXError::PollNotFound)?;
+        total_staked += poll.yes_pool + poll.no_pool;
+    }
+
+    Ok(MatchStats {
+        poll_count: poll_ids.len(),
+        total_staked,
+        distinct_stakers: env
+            .storage()
+            .persistent()
+            .get(&DataKey::MatchStakerCount(match_id))
+            .unwrap_or(0),
+    })
+}
+
 pub fn get_match_count(env: &Env) -> u64 {
     env.storage()
         .instance()
@@ -167,9 +191,9 @@ mod test {
 
     use soroban_sdk::{
         testutils::{Address as _, Ledger},
-        Address, Env, String,
+        token, Address, Env, String,
     };
-    use predictx_shared::PredictXError;
+    use predictx_shared::{PollCategory, PredictXError, StakeSide, MAX_POLLS_PER_MATCH};
     use crate::{PredictionMarket, PredictionMarketClient};
 
     // setup now passes a dummy oracle address and token address to match the real initialize signature
@@ -198,6 +222,55 @@ mod test {
             &s(env, "Premier League"), &s(env, "Emirates"),
             &KICKOFF,
         )
+    }
+
+    fn setup_stats() -> (Env, Address, Address, PredictionMarketClient<'static>) {
+        let env = Env::default();
+        env.mock_all_auths();
+        let admin = Address::generate(&env);
+        let oracle_id = env.register(crate::voting_oracle::WASM, ());
+        crate::voting_oracle::Client::new(&env, &oracle_id).initialize(&admin);
+        let token_addr = env
+            .register_stellar_asset_contract_v2(Address::generate(&env))
+            .address();
+        let contract_id = env.register(PredictionMarket, ());
+        let client = PredictionMarketClient::new(&env, &contract_id);
+        client.initialize(
+            &admin,
+            &oracle_id,
+            &token_addr,
+            &Address::generate(&env),
+            &500_u32,
+        );
+        env.ledger().with_mut(|ledger| ledger.timestamp = 1_000_000);
+        (env, admin, token_addr, client)
+    }
+
+    fn create_poll(
+        env: &Env,
+        client: &PredictionMarketClient,
+        admin: &Address,
+        match_id: u64,
+    ) -> u64 {
+        client.create_poll(
+            admin,
+            &match_id,
+            &s(env, "Will the event happen?"),
+            &PollCategory::PlayerEvent,
+            &1_002_000,
+        )
+    }
+
+    fn mint_and_stake(
+        env: &Env,
+        client: &PredictionMarketClient,
+        token_addr: &Address,
+        staker: &Address,
+        poll_id: u64,
+        amount: i128,
+    ) {
+        token::StellarAssetClient::new(env, token_addr).mint(staker, &amount);
+        client.stake(staker, &poll_id, &amount, &StakeSide::Yes);
     }
 
     #[test]
@@ -360,6 +433,67 @@ mod test {
         let (_, _, client) = setup();
         let err = client.try_get_match_polls(&999u64).unwrap_err().unwrap();
         assert_eq!(err, PredictXError::MatchNotFound);
+    }
+
+    #[test]
+    fn test_get_match_stats_empty() {
+        let (env, admin, client) = setup();
+        let match_id = default_match(&env, &client, &admin);
+
+        let stats = client.get_match_stats(&match_id);
+        assert_eq!(stats.poll_count, 0);
+        assert_eq!(stats.total_staked, 0);
+        assert_eq!(stats.distinct_stakers, 0);
+    }
+
+    #[test]
+    fn test_get_match_stats_aggregates_multiple_polls_and_stakers() {
+        let (env, admin, token_addr, client) = setup_stats();
+        let match_id = default_match(&env, &client, &admin);
+        let poll_one = create_poll(&env, &client, &admin, match_id);
+        let poll_two = create_poll(&env, &client, &admin, match_id);
+        let poll_three = create_poll(&env, &client, &admin, match_id);
+        let alice = Address::generate(&env);
+        let bob = Address::generate(&env);
+
+        mint_and_stake(&env, &client, &token_addr, &alice, poll_one, 10_000_000);
+        mint_and_stake(&env, &client, &token_addr, &bob, poll_one, 20_000_000);
+        mint_and_stake(&env, &client, &token_addr, &alice, poll_two, 30_000_000);
+        mint_and_stake(&env, &client, &token_addr, &bob, poll_three, 40_000_000);
+
+        let stats = client.get_match_stats(&match_id);
+        assert_eq!(stats.poll_count, 3);
+        assert_eq!(stats.total_staked, 100_000_000);
+        assert_eq!(stats.distinct_stakers, 2);
+    }
+
+    #[test]
+    fn test_get_match_stats_at_max_polls_counts_unique_stakers() {
+        let (env, admin, token_addr, client) = setup_stats();
+        let match_id = default_match(&env, &client, &admin);
+        let repeated_staker = Address::generate(&env);
+        let other_staker = Address::generate(&env);
+        let mut first_poll = 0;
+        let mut last_poll = 0;
+
+        for index in 0..MAX_POLLS_PER_MATCH {
+            let poll_id = create_poll(&env, &client, &admin, match_id);
+            if index == 0 {
+                first_poll = poll_id;
+            }
+            if index == MAX_POLLS_PER_MATCH - 1 {
+                last_poll = poll_id;
+            }
+        }
+
+        mint_and_stake(&env, &client, &token_addr, &repeated_staker, first_poll, 20_000_000);
+        mint_and_stake(&env, &client, &token_addr, &repeated_staker, last_poll, 30_000_000);
+        mint_and_stake(&env, &client, &token_addr, &other_staker, last_poll, 40_000_000);
+
+        let stats = client.get_match_stats(&match_id);
+        assert_eq!(stats.poll_count, MAX_POLLS_PER_MATCH);
+        assert_eq!(stats.total_staked, 90_000_000);
+        assert_eq!(stats.distinct_stakers, 2);
     }
 
     #[allow(unused_variables)]
