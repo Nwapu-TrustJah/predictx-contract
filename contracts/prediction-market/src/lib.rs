@@ -1,8 +1,12 @@
 #![no_std]
 
 mod matches;
+mod payouts;
 mod staking;
 pub(crate) mod token_utils;
+
+#[cfg(test)]
+mod e2e;
 
 use predictx_shared::{
     Match, PlatformStats, Poll, PollCategory, PollStatus, PredictXError, Stake, StakeSide,
@@ -69,7 +73,7 @@ fn get_admin(env: &Env) -> Result<Address, PredictXError> {
         .ok_or(PredictXError::NotInitialized)
 }
 
-fn get_oracle(env: &Env) -> Result<Address, PredictXError> {
+pub(crate) fn get_oracle(env: &Env) -> Result<Address, PredictXError> {
     env.storage().instance().get(&DataKey::VotingOracle)
         .ok_or(PredictXError::NotInitialized)
 }
@@ -317,38 +321,15 @@ impl PredictionMarket {
     }
 
 
-    /// Resolve a poll with a boolean outcome. Callable only by the registered oracle.
+    /// Resolve a poll with a boolean outcome. Callable only by the registered
+    /// oracle; delegates to [`payouts::resolve_poll`].
     pub fn resolve_poll(
         env: Env,
         caller: Address,
         poll_id: u64,
         outcome: bool,
     ) -> Result<(), PredictXError> {
-        caller.require_auth();
-        let oracle = get_oracle(&env)?;
-        if caller != oracle {
-            return Err(PredictXError::Unauthorized);
-        }
-
-        let mut poll: Poll = env
-            .storage()
-            .persistent()
-            .get(&DataKey::Poll(poll_id))
-            .ok_or(PredictXError::PollNotFound)?;
-
-        if poll.status == PollStatus::Resolved || poll.outcome.is_some() {
-            return Err(PredictXError::PollAlreadyResolved);
-        }
-
-        poll.outcome = Some(outcome);
-        poll.resolution_time = env.ledger().timestamp();
-        poll.status = PollStatus::Resolved;
-
-        env.storage()
-            .persistent()
-            .set(&DataKey::Poll(poll_id), &poll);
-
-        Ok(())
+        payouts::resolve_poll(&env, caller, poll_id, outcome)
     }
 
     pub fn get_poll(env: Env, poll_id: u64) -> Result<Poll, PredictXError> {
@@ -454,15 +435,6 @@ impl PredictionMarket {
     }
 
     // ── Payouts ───────────────────────────────────────────────────────────────
-
-    pub fn resolve_poll(
-        env: Env,
-        admin: Address,
-        poll_id: u64,
-        outcome: bool,
-    ) -> Result<(), PredictXError> {
-        payouts::resolve_poll(&env, admin, poll_id, outcome)
-    }
 
     /// Claim winnings after a resolved poll.
     ///
@@ -632,7 +604,7 @@ mod test {
     #[test]
     fn emergency_withdraw_on_cancelled_poll_refunds_stake() {
         let (env, admin, oracle_id, contract_id, client) = setup_emergency_env();
-        let oracle_client = voting_oracle::Client::new(&env, &oracle_id);
+        let _oracle_client = voting_oracle::Client::new(&env, &oracle_id);
         let token_addr: Address = env.as_contract(&contract_id, || {
             env.storage().instance().get(&DataKey::TokenAddress).unwrap()
         });
