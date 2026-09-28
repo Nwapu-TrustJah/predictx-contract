@@ -3,7 +3,7 @@ use predictx_shared::{
     Poll, PollStatus, Stake, StakeSide, PredictXError,
     BPS_DENOMINATOR,
 };
-use crate::{DataKey, get_platform_stats, set_platform_stats, token_utils};
+use crate::{DataKey, get_platform_stats, set_platform_stats, token_utils, ensure_not_paused};
 
 /// Resolve a poll using the configured admin and record its final outcome.
 pub fn resolve_poll(
@@ -12,6 +12,7 @@ pub fn resolve_poll(
     poll_id: u64,
     outcome: bool,
 ) -> Result<(), PredictXError> {
+    ensure_not_paused(env)?;
     admin.require_auth();
     let stored_admin: Address = env
         .storage()
@@ -71,6 +72,7 @@ pub fn claim_winnings(
     claimant: Address,
     poll_id: u64,
 ) -> Result<i128, PredictXError> {
+    ensure_not_paused(env)?;
     claimant.require_auth();
 
     // ── Load & validate poll ──────────────────────────────────────────────────
@@ -127,7 +129,12 @@ pub fn claim_winnings(
             return Err(PredictXError::NotOnWinningSide);
         }
 
-        // Proportional share of total pool, after platform fee.
+        // If there is no losing pool (one-sided), refund at par with no fee.
+        let losing_pool = if outcome_yes { poll.no_pool } else { poll.yes_pool };
+        if losing_pool <= 0 {
+            stake.amount
+        } else {
+            // Proportional share of total pool, after platform fee.
         //
         // payout = stake_amount * total_pool * (BPS_DENOMINATOR - fee_bps)
         //          / (winning_pool * BPS_DENOMINATOR)
@@ -147,6 +154,8 @@ pub fn claim_winnings(
         }
 
         net
+        }
+
     };
 
     // ── Mark claimed & persist ────────────────────────────────────────────────
@@ -337,6 +346,15 @@ mod test {
             };
             s.env.storage().persistent().set(&DataKey::Stake(poll_id, user.clone()), &stake);
         });
+    }
+
+    /// Helper that creates a user, mints tokens and places a stake through the
+    /// normal staking flow. Returns the user address.
+    fn stake_user(s: &TestSetup, poll_id: u64, side: StakeSide, amount: i128) -> Address {
+        let user = Address::generate(&s.env);
+        mint_tokens(s, &user, amount);
+        s.client.stake(&user, &poll_id, &amount, &side);
+        user
     }
 
     // ── Tests: empty winning-pool path (issue #74) ────────────────────────────

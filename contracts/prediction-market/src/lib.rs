@@ -2,6 +2,7 @@
 
 mod matches;
 mod staking;
+mod payouts;
 pub(crate) mod token_utils;
 
 use predictx_shared::{
@@ -318,12 +319,13 @@ impl PredictionMarket {
 
 
     /// Resolve a poll with a boolean outcome. Callable only by the registered oracle.
-    pub fn resolve_poll(
+    pub fn oracle_resolve_poll(
         env: Env,
         caller: Address,
         poll_id: u64,
         outcome: bool,
     ) -> Result<(), PredictXError> {
+        ensure_not_paused(&env)?;
         caller.require_auth();
         let oracle = get_oracle(&env)?;
         if caller != oracle {
@@ -762,7 +764,7 @@ mod test {
         let treasury = Address::generate(&env);
         client.initialize(&admin, &oracle, &tok, &treasury, &TEST_FEE_BPS);
         seed_active_poll(&env, &contract_id, 1, &admin);
-        let err = client.try_resolve_poll(&stranger, &1_u64, &true).expect_err("non-oracle");
+        let err = client.try_oracle_resolve_poll(&stranger, &1_u64, &true).expect_err("non-oracle");
         assert_eq!(err, Ok(PredictXError::Unauthorized));
     }
 
@@ -777,7 +779,7 @@ mod test {
         let tok = Address::generate(&env);
         let treasury = Address::generate(&env);
         client.initialize(&admin, &oracle, &tok, &treasury, &TEST_FEE_BPS);
-        let err = client.try_resolve_poll(&oracle, &99_u64, &false).expect_err("missing");
+        let err = client.try_oracle_resolve_poll(&oracle, &99_u64, &false).expect_err("missing");
         assert_eq!(err, Ok(PredictXError::PollNotFound));
     }
 
@@ -794,7 +796,7 @@ mod test {
         let treasury = Address::generate(&env);
         client.initialize(&admin, &oracle, &tok, &treasury, &TEST_FEE_BPS);
         seed_active_poll(&env, &contract_id, 7, &admin);
-        client.resolve_poll(&oracle, &7_u64, &true);
+        client.oracle_resolve_poll(&oracle, &7_u64, &true);
         let poll = client.get_poll(&7_u64);
         assert_eq!(poll.outcome, Some(true));
         assert_eq!(poll.resolution_time, 1_700_000_000);
@@ -813,9 +815,73 @@ mod test {
         let treasury = Address::generate(&env);
         client.initialize(&admin, &oracle, &tok, &treasury, &TEST_FEE_BPS);
         seed_active_poll(&env, &contract_id, 3, &admin);
-        client.resolve_poll(&oracle, &3_u64, &false);
-        let err = client.try_resolve_poll(&oracle, &3_u64, &true).expect_err("already");
+        client.oracle_resolve_poll(&oracle, &3_u64, &false);
+        let err = client.try_oracle_resolve_poll(&oracle, &3_u64, &true).expect_err("already");
         assert_eq!(err, Ok(PredictXError::PollAlreadyResolved));
+    }
+
+    #[test]
+    fn paused_mutators_verdicts() {
+        let (env, admin, oracle_id, contract_id, client) = setup_emergency_env();
+
+        // Prepare a poll + stake that can be emergency-withdrawn.
+        let poll_id: u64 = 77;
+        let user = Address::generate(&env);
+        let amount: i128 = 42;
+
+        // Fund contract to allow refunds
+        let token_addr: Address = env.as_contract(&contract_id, || {
+            env.storage().instance().get(&DataKey::TokenAddress).unwrap()
+        });
+        mint_to(&env, &token_addr, &contract_id, amount);
+
+        // Inject stake record
+        let stake = Stake { user: user.clone(), poll_id, amount, side: StakeSide::Yes, claimed: false, staked_at: env.ledger().timestamp() };
+        env.as_contract(&contract_id, || {
+            env.storage().persistent().set(&DataKey::Stake(poll_id, user.clone()), &stake);
+        });
+
+        // Mark poll cancelled on oracle so emergency_withdraw is eligible
+        let oracle_client = voting_oracle::Client::new(&env, &oracle_id);
+        oracle_client.set_poll_status(&poll_id, &voting_oracle::PollStatus::Cancelled);
+
+        // Pause contract
+        client.pause(&admin);
+
+        // Mutators that must be rejected while paused — assert individually
+        let err = client.try_set_oracle(&oracle_id).expect_err("set_oracle should be blocked");
+        assert_eq!(err, Ok(PredictXError::EmergencyWithdrawNotAllowed));
+
+        let err = client.try_cancel_poll(&admin, &poll_id).expect_err("cancel_poll should be blocked");
+        assert_eq!(err, Ok(PredictXError::EmergencyWithdrawNotAllowed));
+
+        let err = client.try_create_poll(&admin, &1_u64, &String::from_str(&env, "Q"), &PollCategory::PlayerEvent, &999999_u64).expect_err("create_poll should be blocked");
+        assert_eq!(err, Ok(PredictXError::EmergencyWithdrawNotAllowed));
+
+        let err = client.try_stake(&user, &poll_id, &amount, &StakeSide::Yes).expect_err("stake should be blocked");
+        assert_eq!(err, Ok(PredictXError::EmergencyWithdrawNotAllowed));
+
+        let err = client.try_create_match(&admin, &String::from_str(&env, "A"), &String::from_str(&env, "B"), &String::from_str(&env, "L"), &String::from_str(&env, "V"), &1_600_000_u64).expect_err("create_match should be blocked");
+        assert_eq!(err, Ok(PredictXError::EmergencyWithdrawNotAllowed));
+
+        let err = client.try_update_match(&admin, &1_u64, &None, &None, &None, &None, &None).expect_err("update_match should be blocked");
+        assert_eq!(err, Ok(PredictXError::EmergencyWithdrawNotAllowed));
+
+        let err = client.try_finish_match(&admin, &1_u64).expect_err("finish_match should be blocked");
+        assert_eq!(err, Ok(PredictXError::EmergencyWithdrawNotAllowed));
+
+        let err = client.try_oracle_resolve_poll(&oracle_id, &poll_id, &true).expect_err("oracle resolve_poll should be blocked");
+        assert_eq!(err, Ok(PredictXError::EmergencyWithdrawNotAllowed));
+
+        let err = client.try_resolve_poll(&admin, &poll_id, &true).expect_err("admin resolve_poll should be blocked");
+        assert_eq!(err, Ok(PredictXError::EmergencyWithdrawNotAllowed));
+
+        let err = client.try_claim_winnings(&user, &poll_id).expect_err("claim_winnings should be blocked");
+        assert_eq!(err, Ok(PredictXError::EmergencyWithdrawNotAllowed));
+
+        // Emergency withdraw should remain callable while paused
+        let refunded = client.emergency_withdraw(&user, &poll_id);
+        assert_eq!(refunded, amount);
     }
 
 }
