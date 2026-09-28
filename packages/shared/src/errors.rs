@@ -76,4 +76,10 @@ pub enum PredictXError {
     MaxVotersReached = 35,
     /// The poll's parent match has not finished yet.
     MatchNotFinished = 36,
+    /// The voter did not back the winning outcome (including `Unclear`).
+    VoterNotEligible = 36,
+    /// The poll has no resolved outcome yet.
+    OutcomeNotAvailable = 37,
+    /// The reward amount must not be negative.
+    InvalidRewardAmount = 38,
 }
