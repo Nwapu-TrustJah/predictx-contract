@@ -724,4 +724,31 @@ mod test {
         assert_eq!(s.client.get_contract_balance(), total);
         assert_eq!(token_balance(&s, &s.contract_id), total);
     }
+    #[test]
+    fn stake_insufficient_balance_returns_transfer_failed() {
+        let s = setup();
+        let poll_id = create_test_poll(&s, 2_000_000);
+        let user = Address::generate(&s.env);
+
+        // Mint less than the stake amount
+        let mint_amount: i128 = 10_000_000; // equals MIN_STAKE_AMOUNT
+        let stake_amount: i128 = 50_000_000;
+        mint_tokens(&s, &user, mint_amount);
+
+        // Attempting to stake more than the user holds should return TransferFailed
+        let err = s
+            .client
+            .try_stake(&user, &poll_id, &stake_amount, &StakeSide::Yes)
+            .expect_err("should fail due to insufficient balance");
+        assert_eq!(err, Ok(PredictXError::TransferFailed));
+
+        // Verify no state was written: pool is unchanged, user has no stake
+        let pool = s.client.get_pool_info(&poll_id);
+        assert_eq!(pool.yes_pool, 0);
+        assert_eq!(pool.no_pool, 0);
+        assert!(!s.client.has_user_staked(&poll_id, &user));
+
+        // User still holds their original tokens
+        assert_eq!(token_balance(&s, &user), mint_amount);
+    }
 }
