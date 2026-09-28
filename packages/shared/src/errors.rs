@@ -80,4 +80,8 @@ pub enum PredictXError {
     OutcomeNotAvailable = 37,
     /// The reward amount must not be negative.
     InvalidRewardAmount = 38,
+    /// Duplicate address provided among required distinct addresses.
+    DuplicateAddress = 39,
+    /// Address is not a valid token contract.
+    InvalidTokenAddress = 40,
 }

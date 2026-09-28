@@ -166,11 +166,22 @@ mod test {
     extern crate std;
 
     use soroban_sdk::{
+        contract, contractimpl,
         testutils::{Address as _, Ledger},
         Address, Env, String,
     };
     use predictx_shared::PredictXError;
     use crate::{PredictionMarket, PredictionMarketClient};
+
+    #[contract]
+    struct DummyToken;
+
+    #[contractimpl]
+    impl DummyToken {
+        pub fn decimals(_env: Env) -> u32 {
+            7
+        }
+    }
 
     // setup now passes a dummy oracle address and token address to match the real initialize signature
     fn setup() -> (Env, Address, PredictionMarketClient<'static>) {
@@ -180,7 +191,7 @@ mod test {
         let client = PredictionMarketClient::new(&env, &cid);
         let admin = Address::generate(&env);
         let oracle = Address::generate(&env);   // dummy — not used by match functions
-        let token = Address::generate(&env);    // dummy — not used by match functions
+        let token = env.register(DummyToken, ());
         let treasury = Address::generate(&env); // dummy — not used by match functions
         client.initialize(&admin, &oracle, &token, &treasury, &500_u32);
         env.ledger().with_mut(|l| l.timestamp = 1_000_000);
