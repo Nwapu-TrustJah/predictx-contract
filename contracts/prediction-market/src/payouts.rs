@@ -1,9 +1,6 @@
+use crate::{get_platform_stats, set_platform_stats, token_utils, DataKey};
+use predictx_shared::{Poll, PollStatus, PredictXError, Stake, StakeSide, BPS_DENOMINATOR};
 use soroban_sdk::{Address, Env, Symbol};
-use predictx_shared::{
-    Poll, PollStatus, Stake, StakeSide, PredictXError,
-    BPS_DENOMINATOR,
-};
-use crate::{DataKey, get_platform_stats, set_platform_stats, token_utils};
 
 /// Resolve a poll using the configured admin and record its final outcome.
 pub fn resolve_poll(
@@ -39,8 +36,7 @@ pub fn resolve_poll(
         .set(&DataKey::Poll(poll_id), &poll);
 
     let total_pool = poll.yes_pool + poll.no_pool;
-    let fee = total_pool * token_utils::get_platform_fee_bps(env) as i128
-        / BPS_DENOMINATOR as i128;
+    let fee = total_pool * token_utils::get_platform_fee_bps(env) as i128 / BPS_DENOMINATOR as i128;
     env.events().publish(
         (Symbol::new(env, "PollResolved"), poll_id),
         (outcome, total_pool, fee),
@@ -66,11 +62,7 @@ pub fn resolve_poll(
 ///
 /// **This is the one place `NotOnWinningSide` must NOT be returned.**
 /// Returning it here would lock funds in the contract with no recovery path.
-pub fn claim_winnings(
-    env: &Env,
-    claimant: Address,
-    poll_id: u64,
-) -> Result<i128, PredictXError> {
+pub fn claim_winnings(env: &Env, claimant: Address, poll_id: u64) -> Result<i128, PredictXError> {
     claimant.require_auth();
 
     // ── Load & validate poll ──────────────────────────────────────────────────
@@ -102,7 +94,11 @@ pub fn claim_winnings(
 
     // ── Determine winning pool and payout ─────────────────────────────────────
 
-    let winning_pool: i128 = if outcome_yes { poll.yes_pool } else { poll.no_pool };
+    let winning_pool: i128 = if outcome_yes {
+        poll.yes_pool
+    } else {
+        poll.no_pool
+    };
     let total_pool: i128 = poll.yes_pool + poll.no_pool;
 
     let payout: i128 = if winning_pool == 0 {
@@ -178,11 +174,7 @@ pub fn claim_winnings(
 }
 
 /// Calculate a resolved poll's payout for a user without transferring tokens.
-pub fn calculate_winnings(
-    env: &Env,
-    poll_id: u64,
-    user: Address,
-) -> Result<i128, PredictXError> {
+pub fn calculate_winnings(env: &Env, poll_id: u64, user: Address) -> Result<i128, PredictXError> {
     let poll: Poll = env
         .storage()
         .persistent()
@@ -202,7 +194,13 @@ pub fn calculate_winnings(
     if winning_pool == 0 {
         return Ok(stake.amount);
     }
-    if stake.side != if outcome { StakeSide::Yes } else { StakeSide::No } {
+    if stake.side
+        != if outcome {
+            StakeSide::Yes
+        } else {
+            StakeSide::No
+        }
+    {
         return Ok(0);
     }
 
@@ -227,14 +225,12 @@ pub fn calculate_winnings(
 mod test {
     extern crate std;
 
+    use crate::{DataKey, PredictionMarket, PredictionMarketClient};
+    use predictx_shared::{Poll, PollCategory, PollStatus, PredictXError, Stake, StakeSide};
     use soroban_sdk::{
         testutils::{Address as _, Ledger},
         token, Address, Env, String,
     };
-    use predictx_shared::{
-        Poll, PollCategory, PollStatus, PredictXError, Stake, StakeSide,
-    };
-    use crate::{DataKey, PredictionMarket, PredictionMarketClient};
 
     // ── Test helpers ──────────────────────────────────────────────────────────
 
@@ -269,7 +265,21 @@ mod test {
 
         env.ledger().with_mut(|l| l.timestamp = 1_000_000);
 
-        TestSetup { env, admin, oracle_id, token_addr, contract_id, client }
+        TestSetup {
+            env,
+            admin,
+            oracle_id,
+            token_addr,
+            contract_id,
+            client,
+        }
+    }
+
+    fn stake_user(s: &TestSetup, poll_id: u64, side: StakeSide, amount: i128) -> Address {
+        let user = Address::generate(&s.env);
+        mint_tokens(s, &user, amount);
+        s.client.stake(&user, &poll_id, &amount, &side);
+        user
     }
 
     fn mint_tokens(s: &TestSetup, to: &Address, amount: i128) {
@@ -301,7 +311,13 @@ mod test {
     }
 
     /// Directly inject a resolved poll with a given outcome into storage.
-    fn inject_resolved_poll(s: &TestSetup, poll_id: u64, outcome_yes: bool, yes_pool: i128, no_pool: i128) {
+    fn inject_resolved_poll(
+        s: &TestSetup,
+        poll_id: u64,
+        outcome_yes: bool,
+        yes_pool: i128,
+        no_pool: i128,
+    ) {
         s.env.as_contract(&s.contract_id, || {
             let poll = Poll {
                 poll_id,
@@ -319,7 +335,10 @@ mod test {
                 resolution_time: 1_000_000,
                 created_at: 900_000,
             };
-            s.env.storage().persistent().set(&DataKey::Poll(poll_id), &poll);
+            s.env
+                .storage()
+                .persistent()
+                .set(&DataKey::Poll(poll_id), &poll);
         });
     }
 
@@ -335,7 +354,10 @@ mod test {
                 claimed: false,
                 staked_at: 900_000,
             };
-            s.env.storage().persistent().set(&DataKey::Stake(poll_id, user.clone()), &stake);
+            s.env
+                .storage()
+                .persistent()
+                .set(&DataKey::Stake(poll_id, user.clone()), &stake);
         });
     }
 
@@ -473,8 +495,10 @@ mod test {
         mint_tokens(&s, &yes_user, yes_amount);
         mint_tokens(&s, &no_user, no_amount);
 
-        s.client.stake(&yes_user, &poll_id, &yes_amount, &StakeSide::Yes);
-        s.client.stake(&no_user, &poll_id, &no_amount, &StakeSide::No);
+        s.client
+            .stake(&yes_user, &poll_id, &yes_amount, &StakeSide::Yes);
+        s.client
+            .stake(&no_user, &poll_id, &no_amount, &StakeSide::No);
 
         // Resolve with Yes winning
         inject_resolved_poll(&s, poll_id, true, yes_amount, no_amount);
@@ -502,7 +526,8 @@ mod test {
         mint_tokens(&s, &yes_user, amount);
         mint_tokens(&s, &no_user, amount);
 
-        s.client.stake(&yes_user, &poll_id, &amount, &StakeSide::Yes);
+        s.client
+            .stake(&yes_user, &poll_id, &amount, &StakeSide::Yes);
         s.client.stake(&no_user, &poll_id, &amount, &StakeSide::No);
 
         // Resolve with Yes winning — No user is the loser
