@@ -3,7 +3,7 @@ use predictx_shared::{
     Poll, PollStatus, Stake, StakeSide, PredictXError,
     BPS_DENOMINATOR,
 };
-use crate::{DataKey, get_platform_stats, set_platform_stats, token_utils};
+use crate::{DataKey, get_platform_stats, set_platform_stats, token_utils, load_poll, store_poll, load_stake, store_stake};
 
 /// Resolve a poll using the configured admin and record its final outcome.
 pub fn resolve_poll(
@@ -22,10 +22,7 @@ pub fn resolve_poll(
         return Err(PredictXError::Unauthorized);
     }
 
-    let mut poll: Poll = env
-        .storage()
-        .persistent()
-        .get(&DataKey::Poll(poll_id))
+    let mut poll: Poll = load_poll(env, poll_id)
         .ok_or(PredictXError::PollNotFound)?;
     if poll.status == PollStatus::Resolved {
         return Err(PredictXError::PollAlreadyResolved);
@@ -34,9 +31,7 @@ pub fn resolve_poll(
     poll.status = PollStatus::Resolved;
     poll.outcome = Some(outcome);
     poll.resolution_time = env.ledger().timestamp();
-    env.storage()
-        .persistent()
-        .set(&DataKey::Poll(poll_id), &poll);
+    store_poll(env, &poll);
 
     let total_pool = poll.yes_pool + poll.no_pool;
     let fee = total_pool * token_utils::get_platform_fee_bps(env) as i128
@@ -75,10 +70,7 @@ pub fn claim_winnings(
 
     // ── Load & validate poll ──────────────────────────────────────────────────
 
-    let poll: Poll = env
-        .storage()
-        .persistent()
-        .get(&DataKey::Poll(poll_id))
+    let poll: Poll = load_poll(env, poll_id)
         .ok_or(PredictXError::PollNotFound)?;
 
     if poll.status != PollStatus::Resolved {
@@ -90,10 +82,7 @@ pub fn claim_winnings(
 
     // ── Load & validate stake ─────────────────────────────────────────────────
 
-    let mut stake: Stake = env
-        .storage()
-        .persistent()
-        .get(&DataKey::Stake(poll_id, claimant.clone()))
+    let mut stake: Stake = load_stake(env, poll_id, &claimant)
         .ok_or(PredictXError::NotStaker)?;
 
     if stake.claimed {
@@ -152,9 +141,7 @@ pub fn claim_winnings(
     // ── Mark claimed & persist ────────────────────────────────────────────────
 
     stake.claimed = true;
-    env.storage()
-        .persistent()
-        .set(&DataKey::Stake(poll_id, claimant.clone()), &stake);
+    store_stake(env, poll_id, &stake);
 
     // ── Transfer payout to claimant ───────────────────────────────────────────
 
@@ -183,15 +170,9 @@ pub fn calculate_winnings(
     poll_id: u64,
     user: Address,
 ) -> Result<i128, PredictXError> {
-    let poll: Poll = env
-        .storage()
-        .persistent()
-        .get(&DataKey::Poll(poll_id))
+    let poll: Poll = load_poll(env, poll_id)
         .ok_or(PredictXError::PollNotFound)?;
-    let stake: Stake = env
-        .storage()
-        .persistent()
-        .get(&DataKey::Stake(poll_id, user))
+    let stake: Stake = load_stake(env, poll_id, &user)
         .ok_or(PredictXError::NotStaker)?;
     if poll.status != PollStatus::Resolved {
         return Err(PredictXError::PollNotLocked);
