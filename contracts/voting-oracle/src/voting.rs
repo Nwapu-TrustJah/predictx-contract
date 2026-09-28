@@ -304,7 +304,7 @@ mod test {
 
         // Register poll 1 as a known poll. `initiate_voting` (#80) will later
         // be the real production path for this transition.
-        client.set_poll_status(&1_u64, &PollStatus::Voting);
+        client.set_poll_status(&admin, &1_u64, &PollStatus::Voting);
 
         (env, admin, client)
     }
@@ -411,8 +411,8 @@ mod test {
 
     #[test]
     fn cast_vote_rejects_active_poll() {
-        let (env, _admin, client) = setup();
-        client.set_poll_status(&1_u64, &PollStatus::Active);
+        let (env, admin, client) = setup();
+        client.set_poll_status(&admin, &1_u64, &PollStatus::Active);
 
         let err = client
             .try_cast_vote(&voter(&env), &1_u64, &VoteChoice::Yes)
@@ -423,8 +423,8 @@ mod test {
 
     #[test]
     fn cast_vote_rejects_resolved_poll() {
-        let (env, _admin, client) = setup();
-        client.set_poll_status(&1_u64, &PollStatus::Resolved);
+        let (env, admin, client) = setup();
+        client.set_poll_status(&admin, &1_u64, &PollStatus::Resolved);
 
         let err = client
             .try_cast_vote(&voter(&env), &1_u64, &VoteChoice::Yes)
@@ -481,11 +481,11 @@ mod test {
 
     #[test]
     fn same_voter_can_vote_on_two_different_polls() {
-        let (env, _admin, client) = setup();
+        let (env, admin, client) = setup();
         let v = voter(&env);
 
         client.cast_vote(&v, &1_u64, &VoteChoice::Yes);
-        client.set_poll_status(&2_u64, &PollStatus::Voting);
+        client.set_poll_status(&admin, &2_u64, &PollStatus::Voting);
 
         let tally = client.cast_vote(&v, &2_u64, &VoteChoice::Yes);
 

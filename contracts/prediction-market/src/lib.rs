@@ -186,7 +186,7 @@ impl PredictionMarket {
         admin.require_auth();
         let oracle_id = get_oracle(&env)?;
         let client = voting_oracle::Client::new(&env, &oracle_id);
-        client.set_poll_status(&poll_id, &voting_oracle::PollStatus::Cancelled);
+        client.set_poll_status(&admin, &poll_id, &voting_oracle::PollStatus::Cancelled);
         env.events().publish((Symbol::new(&env, "PollCancelled"),), poll_id);
         Ok(())
     }
@@ -553,7 +553,7 @@ mod test {
         let oracle_id = env.register(voting_oracle::WASM, ());
         let oracle_client = voting_oracle::Client::new(&env, &oracle_id);
         oracle_client.initialize(&admin);
-        oracle_client.set_poll_status(&7_u64, &voting_oracle::PollStatus::Resolved);
+        oracle_client.set_poll_status(&admin, &7_u64, &voting_oracle::PollStatus::Resolved);
         let contract_id = env.register(PredictionMarket, ());
         let client = PredictionMarketClient::new(&env, &contract_id);
         let tok = Address::generate(&env);
@@ -659,14 +659,14 @@ mod test {
 
     #[test]
     fn emergency_withdraw_after_dispute_timeout() {
-        let (env, _admin, oracle_id, contract_id, client) = setup_emergency_env();
+        let (env, admin, oracle_id, contract_id, client) = setup_emergency_env();
         let oracle_client = voting_oracle::Client::new(&env, &oracle_id);
         let token_addr: Address = env.as_contract(&contract_id, || {
             env.storage().instance().get(&DataKey::TokenAddress).unwrap()
         });
 
         env.ledger().set_timestamp(100);
-        oracle_client.set_poll_status(&5_u64, &voting_oracle::PollStatus::Disputed);
+        oracle_client.set_poll_status(&admin, &5_u64, &voting_oracle::PollStatus::Disputed);
 
         let user = Address::generate(&env);
         let amount: i128 = 25;
@@ -684,11 +684,11 @@ mod test {
 
     #[test]
     fn emergency_withdraw_rejected_before_timeout() {
-        let (env, _admin, oracle_id, contract_id, client) = setup_emergency_env();
+        let (env, admin, oracle_id, contract_id, client) = setup_emergency_env();
         let oracle_client = voting_oracle::Client::new(&env, &oracle_id);
 
         env.ledger().set_timestamp(200);
-        oracle_client.set_poll_status(&2_u64, &voting_oracle::PollStatus::Locked);
+        oracle_client.set_poll_status(&admin, &2_u64, &voting_oracle::PollStatus::Locked);
 
         let user = Address::generate(&env);
         let stake = Stake { user: user.clone(), poll_id: 2, amount: 30, side: StakeSide::Yes, claimed: false, staked_at: env.ledger().timestamp() };
@@ -703,14 +703,14 @@ mod test {
 
     #[test]
     fn emergency_withdraw_prevents_double_withdrawal() {
-        let (env, _admin, oracle_id, contract_id, client) = setup_emergency_env();
+        let (env, admin, oracle_id, contract_id, client) = setup_emergency_env();
         let oracle_client = voting_oracle::Client::new(&env, &oracle_id);
         let token_addr: Address = env.as_contract(&contract_id, || {
             env.storage().instance().get(&DataKey::TokenAddress).unwrap()
         });
 
         env.ledger().set_timestamp(300);
-        oracle_client.set_poll_status(&3_u64, &voting_oracle::PollStatus::Disputed);
+        oracle_client.set_poll_status(&admin, &3_u64, &voting_oracle::PollStatus::Disputed);
 
         let user = Address::generate(&env);
         let amount: i128 = 40;
