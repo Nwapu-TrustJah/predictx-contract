@@ -61,13 +61,13 @@ pub enum VoteChoice {
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct Match {
     pub match_id: u64,
-    /// Home team name (max 256 bytes).
+    /// Home team name (max 256 bytes, non-empty).
     pub home_team: String,
-    /// Away team name (max 256 bytes).
+    /// Away team name (max 256 bytes, non-empty).
     pub away_team: String,
-    /// League or competition name.
+    /// League or competition name (max 256 bytes).
     pub league: String,
-    /// Stadium / venue name.
+    /// Stadium / venue name (max 256 bytes).
     pub venue: String,
     /// Unix timestamp for kick-off.
     pub kickoff_time: u64,

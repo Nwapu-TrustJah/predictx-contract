@@ -80,4 +80,16 @@ pub enum PredictXError {
     OutcomeNotAvailable = 37,
     /// The reward amount must not be negative.
     InvalidRewardAmount = 38,
+    /// A team name cannot be empty.
+    EmptyTeamName = 39,
+    /// A match string field exceeds the maximum allowed length.
+    MatchStringTooLong = 40,
 }
+
+/// Alias for `EmptyTeamName` matching alternative naming conventions.
+#[allow(non_upper_case_globals)]
+pub const TeamNameEmpty: PredictXError = PredictXError::EmptyTeamName;
+
+/// Alias for `MatchStringTooLong` matching alternative naming conventions.
+#[allow(non_upper_case_globals)]
+pub const MatchFieldTooLong: PredictXError = PredictXError::MatchStringTooLong;
