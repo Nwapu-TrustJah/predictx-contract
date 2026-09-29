@@ -104,6 +104,8 @@ pub struct Poll {
     pub resolution_time: u64,
     /// Unix timestamp when the poll was created.
     pub created_at: u64,
+    /// Total amount escrowed for this poll (yes_pool + no_pool).
+    pub escrow: i128,
 }
 
 /// A single user's stake on a poll.
@@ -159,6 +161,19 @@ pub struct PlatformStats {
     pub total_stakes_placed: u64,
     pub total_payouts: i128,
     pub total_users: u64,
+}
+
+/// Per-poll escrow / liability view.
+#[contracttype]
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct PollEscrow {
+    pub poll_id: u64,
+    /// Total tokens escrowed for this poll.
+    pub escrowed: i128,
+    /// Cumulative amount already paid out from this poll's escrow.
+    pub paid_out: i128,
+    /// Maximum cumulative outflow allowed (pool + fee).
+    pub max_outflow: i128,
 }
 
 /// Per-user activity statistics.

@@ -55,6 +55,8 @@ pub enum DataKey {
     UserStats(Address),
     /// `(poll_id, voter)` → `i128` unclaimed voter reward. (Persistent)
     VoterReward(u64, Address),
+    /// `poll_id` → `i128` total escrowed stake for the poll. (Persistent)
+    PollEscrow(u64),
 
     // ── Temporary storage ─────────────────────────────────────────────────────
     /// `poll_id` → `VoteTally`. (Temporary — only needed during voting window)

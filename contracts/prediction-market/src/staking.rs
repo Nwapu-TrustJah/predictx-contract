@@ -3,7 +3,7 @@ use predictx_shared::{
     Poll, PollStatus, Stake, StakeSide, PredictXError,
     MIN_STAKE_AMOUNT, BPS_DENOMINATOR,
 };
-use crate::{DataKey, PoolInfo, get_platform_stats, set_platform_stats, ensure_not_paused, token_utils};
+use crate::{DataKey, PoolInfo, get_platform_stats, set_platform_stats, ensure_not_paused, token_utils, escrow};
 
 // ── Stake placement ───────────────────────────────────────────────────────────
 
@@ -109,6 +109,9 @@ pub fn stake(
     stats.total_stakes_placed += 1;
     set_platform_stats(env, &stats);
 
+    // Track per-poll escrow liability
+    escrow::add_liability(env, poll_id, amount);
+
     // Emit event
     env.events().publish(
         (Symbol::new(env, "StakePlaced"), poll_id, staker),
@@ -185,6 +188,11 @@ pub fn calculate_potential_winnings(
     let winnings = amount * total_pool_after * fee_factor / (pool_on_side_after * bps);
 
     Ok(winnings)
+}
+
+/// Return the per-poll escrow liability tracked by the contract.
+pub fn get_poll_escrow(env: &Env, poll_id: u64) -> i128 {
+    escrow::get_liability(env, poll_id)
 }
 
 /// Return pool state for a poll.

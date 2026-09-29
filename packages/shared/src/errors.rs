@@ -72,4 +72,15 @@ pub enum PredictXError {
     ContractPaused = 33,
     /// Stake amount is below the minimum required.
     StakeBelowMinimum = 34,
+    /// The poll already has the maximum number of voters.
+    MaxVotersReached = 35,
+    /// The voter did not back the winning outcome (including `Unclear`).
+    VoterNotEligible = 36,
+    /// The poll has no resolved outcome yet.
+    OutcomeNotAvailable = 37,
+    /// The reward amount must not be negative.
+    InvalidRewardAmount = 38,
+    /// The poll does not have enough escrowed funds to cover the requested outflow.
+    /// Returned before any token movement so one poll cannot spend another poll's stake.
+    InsufficientPollEscrow = 39,
 }
