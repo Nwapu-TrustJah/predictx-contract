@@ -317,6 +317,30 @@ impl PredictionMarket {
     }
 
 
+    /// Move an active poll to Locked once its lock time is reached.
+    /// Anyone may trigger this transition; no authorization is required.
+    pub fn lock_poll(env: Env, poll_id: u64) -> Result<(), PredictXError> {
+        let mut poll: Poll = env
+            .storage()
+            .persistent()
+            .get(&DataKey::Poll(poll_id))
+            .ok_or(PredictXError::PollNotFound)?;
+
+        if poll.status != PollStatus::Active {
+            return Err(PredictXError::PollNotActive);
+        }
+        if env.ledger().timestamp() < poll.lock_time {
+            return Err(PredictXError::PollNotLocked);
+        }
+
+        poll.status = PollStatus::Locked;
+        env.storage()
+            .persistent()
+            .set(&DataKey::Poll(poll_id), &poll);
+
+        Ok(())
+    }
+
     /// Resolve a poll with a boolean outcome. Callable only by the registered oracle.
     pub fn resolve_poll(
         env: Env,
@@ -747,6 +771,93 @@ mod test {
         env.as_contract(contract_id, || {
             env.storage().persistent().set(&DataKey::Poll(poll_id), &poll);
         });
+    }
+
+    #[test]
+    fn lock_poll_rejects_before_lock_time_without_changing_poll() {
+        let env = Env::default();
+        let contract_id = env.register(PredictionMarket, ());
+        let client = PredictionMarketClient::new(&env, &contract_id);
+        seed_active_poll(&env, &contract_id, 1, &Address::generate(&env));
+        let original = client.get_poll(&1);
+        env.ledger().set_timestamp(original.lock_time - 1);
+
+        assert_eq!(
+            client.try_lock_poll(&1),
+            Err(Ok(PredictXError::PollNotLocked))
+        );
+        assert_eq!(client.get_poll(&1), original);
+    }
+
+    #[test]
+    fn lock_poll_persists_at_and_after_lock_time_without_authorization() {
+        let env = Env::default();
+        let contract_id = env.register(PredictionMarket, ());
+        let client = PredictionMarketClient::new(&env, &contract_id);
+        let creator = Address::generate(&env);
+        for poll_id in [1_u64, 2] {
+            seed_active_poll(&env, &contract_id, poll_id, &creator);
+        }
+
+        // No mocked or supplied authorizations: even the creator need not sign.
+        for (poll_id, delay) in [(1_u64, 0_u64), (2, 1)] {
+            let mut expected = client.get_poll(&poll_id);
+            expected.yes_pool = 50_000_000;
+            expected.no_pool = 25_000_000;
+            expected.yes_count = 2;
+            expected.no_count = 1;
+            env.as_contract(&contract_id, || {
+                env.storage()
+                    .persistent()
+                    .set(&DataKey::Poll(poll_id), &expected);
+            });
+            env.ledger().set_timestamp(expected.lock_time + delay);
+            client.lock_poll(&poll_id);
+            expected.status = PollStatus::Locked;
+            assert_eq!(client.get_poll(&poll_id), expected);
+            assert!(env.auths().is_empty());
+        }
+    }
+
+    #[test]
+    fn lock_poll_rejects_repeated_locks_and_other_non_active_statuses() {
+        let env = Env::default();
+        let contract_id = env.register(PredictionMarket, ());
+        let client = PredictionMarketClient::new(&env, &contract_id);
+        seed_active_poll(&env, &contract_id, 1, &Address::generate(&env));
+        env.ledger().set_timestamp(client.get_poll(&1).lock_time);
+        client.lock_poll(&1);
+
+        for status in [
+            PollStatus::Locked,
+            PollStatus::Voting,
+            PollStatus::AdminReview,
+            PollStatus::Disputed,
+            PollStatus::Resolved,
+            PollStatus::Cancelled,
+        ] {
+            let mut expected = client.get_poll(&1);
+            expected.status = status;
+            env.as_contract(&contract_id, || {
+                env.storage().persistent().set(&DataKey::Poll(1), &expected);
+            });
+            assert_eq!(
+                client.try_lock_poll(&1),
+                Err(Ok(PredictXError::PollNotActive))
+            );
+            assert_eq!(client.get_poll(&1), expected);
+        }
+    }
+
+    #[test]
+    fn lock_poll_rejects_unknown_poll() {
+        let env = Env::default();
+        let contract_id = env.register(PredictionMarket, ());
+        let client = PredictionMarketClient::new(&env, &contract_id);
+        assert_eq!(
+            client.try_lock_poll(&99),
+            Err(Ok(PredictXError::PollNotFound))
+        );
     }
 
     #[test]
