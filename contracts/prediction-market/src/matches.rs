@@ -159,6 +159,47 @@ pub fn get_match_count(env: &Env) -> u64 {
         .saturating_sub(1)
 }
 
+/// Maximum number of matches returned by a single `list_matches` call.
+pub const MAX_MATCH_PAGE_SIZE: u32 = 50;
+
+/// Returns a page of matches starting at `start` (1-based match id) with at
+/// most `limit` entries. The page size is capped at `MAX_MATCH_PAGE_SIZE`.
+/// Paging past the end returns an empty vector. Matches are returned in
+/// ascending id order and every match is covered exactly once across pages.
+pub fn list_matches(env: &Env, start: u64, limit: u32) -> Vec<Match> {
+    let mut out: Vec<Match> = Vec::new(env);
+
+    let capped = if limit > MAX_MATCH_PAGE_SIZE {
+        MAX_MATCH_PAGE_SIZE
+    } else {
+        limit
+    };
+
+    if capped == 0 {
+        return out;
+    }
+
+    let total = get_match_count(env);
+    if start == 0 || start > total {
+        return out;
+    }
+
+    let end = start.saturating_add(capped as u64).saturating_sub(1).min(total);
+    let mut id = start;
+    while id <= end {
+        if let Some(m) = env
+            .storage()
+            .persistent()
+            .get::<DataKey, Match>(&DataKey::Match(id))
+        {
+            out.push_back(m);
+        }
+        id += 1;
+    }
+
+    out
+}
+
 // ── Tests ─────────────────────────────────────────────────────────────────────
 
 #[cfg(test)]
@@ -367,5 +408,59 @@ mod test {
     fn test_get_match_count_starts_zero() {
         let (_, _, client) = setup();
         assert_eq!(client.get_match_count(), 0);
+    }
+
+    #[test]
+    fn test_list_matches_pages_cover_every_match_once() {
+        let (env, admin, client) = setup();
+        for _ in 0..5 {
+            default_match(&env, &client, &admin);
+        }
+
+        let page1 = client.list_matches(&1u64, &2u32);
+        let page2 = client.list_matches(&3u64, &2u32);
+        let page3 = client.list_matches(&5u64, &2u32);
+
+        assert_eq!(page1.len(), 2);
+        assert_eq!(page2.len(), 2);
+        assert_eq!(page3.len(), 1);
+
+        let mut ids: Vec<u64> = Vec::new(&env);
+        for m in page1.iter() { ids.push_back(m.match_id); }
+        for m in page2.iter() { ids.push_back(m.match_id); }
+        for m in page3.iter() { ids.push_back(m.match_id); }
+
+        assert_eq!(ids.len(), 5);
+        for (i, id) in ids.iter().enumerate() {
+            assert_eq!(id, (i as u64) + 1);
+        }
+    }
+
+    #[test]
+    fn test_list_matches_caps_page_size() {
+        let (env, admin, client) = setup();
+        for _ in 0..3 {
+            default_match(&env, &client, &admin);
+        }
+        // Requesting more than the cap still returns at most the cap.
+        let page = client.list_matches(&1u64, &10_000u32);
+        assert_eq!(page.len(), 3);
+        assert!(page.len() <= 50);
+    }
+
+    #[test]
+    fn test_list_matches_past_end_returns_empty() {
+        let (env, admin, client) = setup();
+        default_match(&env, &client, &admin);
+        default_match(&env, &client, &admin);
+
+        let past = client.list_matches(&3u64, &10u32);
+        assert_eq!(past.len(), 0);
+
+        let zero_start = client.list_matches(&0u64, &10u32);
+        assert_eq!(zero_start.len(), 0);
+
+        let zero_limit = client.list_matches(&1u64, &0u32);
+        assert_eq!(zero_limit.len(), 0);
     }
 }
