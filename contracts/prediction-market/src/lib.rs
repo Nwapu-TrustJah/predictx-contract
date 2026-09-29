@@ -80,7 +80,7 @@ fn is_paused(env: &Env) -> bool {
 
 pub(crate) fn ensure_not_paused(env: &Env) -> Result<(), PredictXError> {
     if is_paused(env) {
-        return Err(PredictXError::EmergencyWithdrawNotAllowed);
+        return Err(PredictXError::ContractPaused);
     }
     Ok(())
 }
@@ -578,7 +578,7 @@ mod test {
         client.pause(&admin);
         assert_eq!(client.is_paused(), true);
         let err = client.try_set_oracle(&oracle).expect_err("should be blocked");
-        assert_eq!(err, Ok(PredictXError::EmergencyWithdrawNotAllowed));
+        assert_eq!(err, Ok(PredictXError::ContractPaused));
         client.unpause(&admin);
         assert_eq!(client.is_paused(), false);
     }
