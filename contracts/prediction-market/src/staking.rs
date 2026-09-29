@@ -118,6 +118,32 @@ pub fn stake(
     Ok(stake_record)
 }
 
+// ── Treasury accounting events ────────────────────────────────────────────────
+
+/// Emit `FeesDeposited(from, amount)` after a successful fee deposit.
+pub fn emit_fees_deposited(env: &Env, from: Address, amount: i128) {
+    env.events().publish(
+        (Symbol::new(env, "FeesDeposited"), from),
+        amount,
+    );
+}
+
+/// Emit `FeesWithdrawn(to, amount)` after a successful fee withdrawal.
+pub fn emit_fees_withdrawn(env: &Env, to: Address, amount: i128) {
+    env.events().publish(
+        (Symbol::new(env, "FeesWithdrawn"), to),
+        amount,
+    );
+}
+
+/// Emit `RewardsFunded(poll_id, amount)` after rewards are funded.
+pub fn emit_rewards_funded(env: &Env, poll_id: u64, amount: i128) {
+    env.events().publish(
+        (Symbol::new(env, "RewardsFunded"), poll_id),
+        amount,
+    );
+}
+
 // ── View functions ────────────────────────────────────────────────────────────
 
 /// Retrieve a user's stake record for a poll.
