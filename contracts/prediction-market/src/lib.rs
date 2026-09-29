@@ -1,12 +1,13 @@
 #![no_std]
 
 mod matches;
+mod payouts;
 mod staking;
 pub(crate) mod token_utils;
 
 use predictx_shared::{
     Match, PlatformStats, Poll, PollCategory, PollStatus, PredictXError, Stake, StakeSide,
-    MAX_POLLS_PER_MATCH,
+    UserStats, MAX_POLLS_PER_MATCH,
 };
 use soroban_sdk::{contract, contractimpl, contracttype, Address, Env, String, Symbol, Vec};
 
@@ -52,6 +53,8 @@ pub enum DataKey {
     Poll(u64),
     UserStakes(Address),
     HasStaked(u64, Address),
+    /// `user` → `UserStats` per-user activity aggregates. (Persistent)
+    UserStats(Address),
 }
 
 /// Pool state returned by `get_pool_info`.
@@ -317,38 +320,16 @@ impl PredictionMarket {
     }
 
 
-    /// Resolve a poll with a boolean outcome. Callable only by the registered oracle.
+    /// Resolve a poll with a boolean outcome, recording it in the payouts
+    /// engine. Callable by the admin or the registered oracle — whichever
+    /// authority resolves the poll first wins.
     pub fn resolve_poll(
         env: Env,
         caller: Address,
         poll_id: u64,
         outcome: bool,
     ) -> Result<(), PredictXError> {
-        caller.require_auth();
-        let oracle = get_oracle(&env)?;
-        if caller != oracle {
-            return Err(PredictXError::Unauthorized);
-        }
-
-        let mut poll: Poll = env
-            .storage()
-            .persistent()
-            .get(&DataKey::Poll(poll_id))
-            .ok_or(PredictXError::PollNotFound)?;
-
-        if poll.status == PollStatus::Resolved || poll.outcome.is_some() {
-            return Err(PredictXError::PollAlreadyResolved);
-        }
-
-        poll.outcome = Some(outcome);
-        poll.resolution_time = env.ledger().timestamp();
-        poll.status = PollStatus::Resolved;
-
-        env.storage()
-            .persistent()
-            .set(&DataKey::Poll(poll_id), &poll);
-
-        Ok(())
+        payouts::resolve_poll(&env, caller, poll_id, outcome)
     }
 
     pub fn get_poll(env: Env, poll_id: u64) -> Result<Poll, PredictXError> {
@@ -380,6 +361,11 @@ impl PredictionMarket {
 
     pub fn has_user_staked(env: Env, poll_id: u64, user: Address) -> bool {
         staking::has_user_staked(&env, poll_id, &user)
+    }
+
+    /// Per-user activity statistics (dashboard read path).
+    pub fn get_user_stats(env: Env, user: Address) -> UserStats {
+        staking::get_user_stats(&env, &user)
     }
 
     pub fn calculate_potential_winnings(
@@ -451,17 +437,6 @@ impl PredictionMarket {
 
     pub fn get_match_count(env: Env) -> u64 {
         matches::get_match_count(&env)
-    }
-
-    // ── Payouts ───────────────────────────────────────────────────────────────
-
-    pub fn resolve_poll(
-        env: Env,
-        admin: Address,
-        poll_id: u64,
-        outcome: bool,
-    ) -> Result<(), PredictXError> {
-        payouts::resolve_poll(&env, admin, poll_id, outcome)
     }
 
     /// Claim winnings after a resolved poll.

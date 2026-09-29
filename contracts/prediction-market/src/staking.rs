@@ -1,9 +1,43 @@
 use soroban_sdk::{Address, Env, Symbol, Vec};
 use predictx_shared::{
-    Poll, PollStatus, Stake, StakeSide, PredictXError,
+    Poll, PollStatus, Stake, StakeSide, UserStats, PredictXError,
     MIN_STAKE_AMOUNT, BPS_DENOMINATOR,
 };
 use crate::{DataKey, PoolInfo, get_platform_stats, set_platform_stats, ensure_not_paused, token_utils};
+
+// ── User statistics ──────────────────────────────────────────────────────────
+
+/// Load a user's aggregate stats, creating a zeroed record for first-time users.
+pub(crate) fn get_user_stats(env: &Env, user: &Address) -> UserStats {
+    env.storage()
+        .persistent()
+        .get(&DataKey::UserStats(user.clone()))
+        .unwrap_or(UserStats {
+            total_staked: 0,
+            total_won: 0,
+            total_lost: 0,
+            polls_participated: 0,
+            polls_won: 0,
+            polls_lost: 0,
+            votes_cast: 0,
+            voting_rewards_earned: 0,
+        })
+}
+
+/// Record a successful stake in the user's stats.
+///
+/// One storage read + one write per stake — no scans.
+/// `polls_participated` counts *distinct* polls: a user can only stake once
+/// per poll (enforced by `HasStaked`), so every successful stake is a new
+/// poll participation by construction.
+fn record_stake_in_user_stats(env: &Env, staker: &Address, amount: i128) {
+    let mut user_stats = get_user_stats(env, staker);
+    user_stats.total_staked += amount;
+    user_stats.polls_participated += 1;
+    env.storage()
+        .persistent()
+        .set(&DataKey::UserStats(staker.clone()), &user_stats);
+}
 
 // ── Stake placement ───────────────────────────────────────────────────────────
 
@@ -108,6 +142,9 @@ pub fn stake(
     stats.total_value_locked += amount;
     stats.total_stakes_placed += 1;
     set_platform_stats(env, &stats);
+
+    // Update per-user stats (issue #149)
+    record_stake_in_user_stats(env, &staker, amount);
 
     // Emit event
     env.events().publish(
@@ -574,6 +611,98 @@ mod test {
         let stats = s.client.get_platform_stats();
         assert_eq!(stats.total_value_locked, amount1 + amount2);
         assert_eq!(stats.total_stakes_placed, 2);
+    }
+
+    // ── User stats (issue #149) ───────────────────────────────────────────────
+
+    /// First stake creates a zeroed-then-updated record rather than erroring.
+    #[test]
+    fn user_stats_created_on_first_stake() {
+        let s = setup();
+        let poll_id = create_test_poll(&s, 2_000_000);
+        let user = Address::generate(&s.env);
+        let amount: i128 = 50_000_000;
+        mint_tokens(&s, &user, amount);
+
+        // No record exists before the first stake
+        s.env.as_contract(&s.contract_id, || {
+            assert!(!s.env
+                .storage()
+                .persistent()
+                .has(&DataKey::UserStats(user.clone())));
+        });
+
+        s.client.stake(&user, &poll_id, &amount, &StakeSide::Yes);
+
+        let stats = s.client.get_user_stats(&user);
+        assert_eq!(stats.total_staked, amount);
+        assert_eq!(stats.polls_participated, 1);
+    }
+
+    /// `total_staked` accumulates across polls for the same user.
+    #[test]
+    fn user_stats_total_staked_accumulates_across_polls() {
+        let s = setup();
+        let poll_id1 = create_test_poll(&s, 2_000_000);
+        let poll_id2 = create_test_poll(&s, 2_000_000);
+        let poll_id3 = create_test_poll(&s, 2_000_000);
+
+        let user = Address::generate(&s.env);
+        let amounts: [i128; 3] = [50_000_000, 120_000_000, 30_000_000];
+        mint_tokens(&s, &user, amounts[0] + amounts[1] + amounts[2]);
+
+        s.client.stake(&user, &poll_id1, &amounts[0], &StakeSide::Yes);
+        s.client.stake(&user, &poll_id2, &amounts[1], &StakeSide::No);
+        s.client.stake(&user, &poll_id3, &amounts[2], &StakeSide::Yes);
+
+        let stats = s.client.get_user_stats(&user);
+        assert_eq!(stats.total_staked, amounts[0] + amounts[1] + amounts[2]);
+        assert_eq!(stats.polls_participated, 3);
+    }
+
+    /// `polls_participated` counts distinct polls, not stakes.
+    ///
+    /// A user can place at most one stake per poll (`AlreadyStaked` guard),
+    /// so the equivalent of "two stakes on one poll" is: two users on one
+    /// poll, each with their own counter — plus a rejected double-stake on
+    /// the same poll must not touch the failed staker's stats.
+    #[test]
+    fn user_stats_polls_participated_counts_distinct_polls_not_stakes() {
+        let s = setup();
+        let poll_id = create_test_poll(&s, 2_000_000);
+        let poll_id2 = create_test_poll(&s, 2_000_000);
+
+        let user_a = Address::generate(&s.env);
+        let user_b = Address::generate(&s.env);
+        let amount: i128 = 60_000_000;
+        mint_tokens(&s, &user_a, amount * 2);
+        mint_tokens(&s, &user_b, amount);
+
+        // user_a stakes on two distinct polls → polls_participated == 2
+        s.client.stake(&user_a, &poll_id, &amount, &StakeSide::Yes);
+        s.client.stake(&user_a, &poll_id2, &amount, &StakeSide::No);
+
+        // user_b is rejected by the AlreadyStaked-equivalent guard (same poll
+        // as user_a is fine, but a second stake on the SAME poll must fail);
+        // user_b's single successful stake on poll_id is their only participation.
+        let err = s
+            .client
+            .try_stake(&user_a, &poll_id, &amount, &StakeSide::No)
+            .expect_err("double stake on the same poll should fail");
+        assert_eq!(err, Ok(PredictXError::AlreadyStaked));
+
+        s.client.stake(&user_b, &poll_id, &amount, &StakeSide::No);
+
+        let stats_a = s.client.get_user_stats(&user_a);
+        assert_eq!(stats_a.polls_participated, 2);
+        assert_eq!(stats_a.total_staked, amount * 2);
+
+        let stats_b = s.client.get_user_stats(&user_b);
+        assert_eq!(stats_b.polls_participated, 1);
+        assert_eq!(stats_b.total_staked, amount);
+
+        // The rejected double-stake must not have mutated user_a's stats
+        assert_eq!(s.client.get_user_stats(&user_a).polls_participated, 2);
     }
 
     // ── Potential winnings calculator ─────────────────────────────────────────

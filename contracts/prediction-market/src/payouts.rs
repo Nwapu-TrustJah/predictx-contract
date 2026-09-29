@@ -5,21 +5,34 @@ use predictx_shared::{
 };
 use crate::{DataKey, get_platform_stats, set_platform_stats, token_utils};
 
-/// Resolve a poll using the configured admin and record its final outcome.
+/// Resolve a poll and record its final outcome in the payouts engine.
+///
+/// Callable by the **admin** (manual resolution) or the registered **voting
+/// oracle** (automated resolution flow) — whichever authority resolves the
+/// poll first wins; subsequent calls fail with `PollAlreadyResolved`.
 pub fn resolve_poll(
     env: &Env,
-    admin: Address,
+    caller: Address,
     poll_id: u64,
     outcome: bool,
 ) -> Result<(), PredictXError> {
-    admin.require_auth();
+    caller.require_auth();
+
+    // ── Authorisation: admin or registered oracle ─────────────────────────
     let stored_admin: Address = env
         .storage()
         .instance()
         .get(&DataKey::Admin)
         .ok_or(PredictXError::NotInitialized)?;
-    if admin != stored_admin {
-        return Err(PredictXError::Unauthorized);
+    if caller != stored_admin {
+        let oracle_id: Address = env
+            .storage()
+            .instance()
+            .get(&DataKey::VotingOracle)
+            .ok_or(PredictXError::NotInitialized)?;
+        if caller != oracle_id {
+            return Err(PredictXError::Unauthorized);
+        }
     }
 
     let mut poll: Poll = env
@@ -127,26 +140,36 @@ pub fn claim_winnings(
             return Err(PredictXError::NotOnWinningSide);
         }
 
-        // Proportional share of total pool, after platform fee.
-        //
-        // payout = stake_amount * total_pool * (BPS_DENOMINATOR - fee_bps)
-        //          / (winning_pool * BPS_DENOMINATOR)
-        //
-        // Integer division rounds down; any dust remains in the contract.
-        let fee_bps = token_utils::get_platform_fee_bps(env);
-        let fee_factor = (BPS_DENOMINATOR - fee_bps) as i128;
-        let bps = BPS_DENOMINATOR as i128;
+        // No-contest (issue #73): nothing was staked on the losing side, so
+        // there is no pot to skim a platform fee from. Every winner is
+        // refunded their exact stake rather than a fee-discounted share of a
+        // one-sided pool. Mirrors `calculate_winnings`.
+        let losing_pool = if outcome_yes { poll.no_pool } else { poll.yes_pool };
 
-        let gross = stake.amount * total_pool / winning_pool;
-        let net = gross * fee_factor / bps;
-        let fee = gross - net;
+        if losing_pool <= 0 {
+            stake.amount
+        } else {
+            // Proportional share of total pool, after platform fee.
+            //
+            // payout = stake_amount * total_pool * (BPS_DENOMINATOR - fee_bps)
+            //          / (winning_pool * BPS_DENOMINATOR)
+            //
+            // Integer division rounds down; any dust remains in the contract.
+            let fee_bps = token_utils::get_platform_fee_bps(env);
+            let fee_factor = (BPS_DENOMINATOR - fee_bps) as i128;
+            let bps = BPS_DENOMINATOR as i128;
 
-        // Send platform fee to treasury
-        if fee > 0 {
-            token_utils::transfer_to_treasury(env, fee)?;
+            let gross = stake.amount * total_pool / winning_pool;
+            let net = gross * fee_factor / bps;
+            let fee = gross - net;
+
+            // Send platform fee to treasury
+            if fee > 0 {
+                token_utils::transfer_to_treasury(env, fee)?;
+            }
+
+            net
         }
-
-        net
     };
 
     // ── Mark claimed & persist ────────────────────────────────────────────────
@@ -275,6 +298,15 @@ mod test {
     fn mint_tokens(s: &TestSetup, to: &Address, amount: i128) {
         let sac = token::StellarAssetClient::new(&s.env, &s.token_addr);
         sac.mint(to, &amount);
+    }
+
+    /// Create a fresh user, fund them and place a stake on `poll_id`.
+    /// Returns the user address.
+    fn stake_user(s: &TestSetup, poll_id: u64, side: StakeSide, amount: i128) -> Address {
+        let user = Address::generate(&s.env);
+        mint_tokens(s, &user, amount);
+        s.client.stake(&user, &poll_id, &amount, &side);
+        user
     }
 
     fn token_balance(s: &TestSetup, addr: &Address) -> i128 {
