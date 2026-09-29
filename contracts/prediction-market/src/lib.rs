@@ -52,7 +52,6 @@ pub enum DataKey {
     Poll(u64),
     UserStakes(Address),
     HasStaked(u64, Address),
-    MaxStakePerUser,
     UserPollStakeTotal(u64, Address),
 }
 
@@ -119,6 +118,11 @@ fn set_emergency_claimed(env: &Env, poll_id: u64, user: &Address) {
 
 const EMERGENCY_TIMEOUT_SECS: u64 = 7 * 24 * 60 * 60;
 
+/// Maximum cumulative amount a single address may stake on a single poll.
+/// A per-transaction cap is trivially bypassed by splitting across several
+/// calls, so we cap the running total per (poll, user) instead.
+pub const MAX_CUMULATIVE_STAKE_PER_POLL: i128 = 1_000_000;
+
 #[contractimpl]
 impl PredictionMarket {
     pub fn initialize(
@@ -174,21 +178,6 @@ impl PredictionMarket {
     }
 
     pub fn is_paused(env: Env) -> bool { is_paused(&env) }
-
-    /// Set the maximum cumulative stake a single address may hold on a single poll.
-    pub fn set_max_stake_per_user(env: Env, admin: Address, max: i128) -> Result<(), PredictXError> {
-        ensure_not_paused(&env)?;
-        let stored_admin = get_admin(&env)?;
-        if admin != stored_admin { return Err(PredictXError::Unauthorized); }
-        admin.require_auth();
-        env.storage().instance().set(&DataKey::MaxStakePerUser, &max);
-        Ok(())
-    }
-
-    /// Read the configured maximum cumulative stake per user per poll.
-    pub fn get_max_stake_per_user(env: Env) -> i128 {
-        env.storage().instance().get(&DataKey::MaxStakePerUser).unwrap_or(0)
-    }
 
     pub fn oracle_poll_status(env: Env, poll_id: u64) -> Result<PollStatus, PredictXError> {
         let oracle_id = get_oracle(&env)?;
@@ -384,35 +373,7 @@ impl PredictionMarket {
         amount: i128,
         side: StakeSide,
     ) -> Result<Stake, PredictXError> {
-        let max: i128 = env
-            .storage()
-            .instance()
-            .get(&DataKey::MaxStakePerUser)
-            .unwrap_or(0);
-        let current: i128 = env
-            .storage()
-            .persistent()
-            .get(&DataKey::UserPollStakeTotal(poll_id, staker.clone()))
-            .unwrap_or(0);
-        let new_total = current
-            .checked_add(amount)
-            .ok_or(PredictXError::InvalidAmount)?;
-        if max > 0 && new_total > max {
-            return Err(PredictXError::StakeLimitExceeded);
-        }
-        let result = staking::stake(&env, staker.clone(), poll_id, amount, side)?;
-        env.storage()
-            .persistent()
-            .set(&DataKey::UserPollStakeTotal(poll_id, staker.clone()), &new_total);
-        Ok(result)
-    }
-
-    /// Read the running cumulative stake total for a user on a poll.
-    pub fn get_user_poll_stake_total(env: Env, poll_id: u64, user: Address) -> i128 {
-        env.storage()
-            .persistent()
-            .get(&DataKey::UserPollStakeTotal(poll_id, user))
-            .unwrap_or(0)
+        staking::stake(&env, staker, poll_id, amount, side)
     }
 
     pub fn get_stake_info(env: Env, poll_id: u64, user: Address) -> Result<Stake, PredictXError> {
@@ -425,6 +386,10 @@ impl PredictionMarket {
 
     pub fn has_user_staked(env: Env, poll_id: u64, user: Address) -> bool {
         staking::has_user_staked(&env, poll_id, &user)
+    }
+
+    pub fn get_user_poll_stake_total(env: Env, poll_id: u64, user: Address) -> i128 {
+        staking::get_user_poll_stake_total(&env, poll_id, &user)
     }
 
     pub fn calculate_potential_winnings(
@@ -861,6 +826,74 @@ mod test {
         client.resolve_poll(&oracle, &3_u64, &false);
         let err = client.try_resolve_poll(&oracle, &3_u64, &true).expect_err("already");
         assert_eq!(err, Ok(PredictXError::PollAlreadyResolved));
+    }
+
+    // ── Cumulative stake cap tests ────────────────────────────────────────────
+
+    #[test]
+    fn two_stakes_under_cumulative_limit_both_succeed() {
+        let env = Env::default();
+        env.mock_all_auths();
+        let contract_id = env.register(PredictionMarket, ());
+        let client = PredictionMarketClient::new(&env, &contract_id);
+        let admin = Address::generate(&env);
+        let oracle = Address::generate(&env);
+        let tok = Address::generate(&env);
+        let treasury = Address::generate(&env);
+        client.initialize(&admin, &oracle, &tok, &treasury, &TEST_FEE_BPS);
+        seed_active_poll(&env, &contract_id, 1, &admin);
+
+        let user = Address::generate(&env);
+        let first = MAX_CUMULATIVE_STAKE_PER_POLL / 4;
+        let second = MAX_CUMULATIVE_STAKE_PER_POLL / 4;
+        client.stake(&user, &1_u64, &first, &StakeSide::Yes);
+        client.stake(&user, &1_u64, &second, &StakeSide::Yes);
+        assert_eq!(
+            client.get_user_poll_stake_total(&1_u64, &user),
+            first + second
+        );
+    }
+
+    #[test]
+    fn stake_crossing_cumulative_limit_is_rejected() {
+        let env = Env::default();
+        env.mock_all_auths();
+        let contract_id = env.register(PredictionMarket, ());
+        let client = PredictionMarketClient::new(&env, &contract_id);
+        let admin = Address::generate(&env);
+        let oracle = Address::generate(&env);
+        let tok = Address::generate(&env);
+        let treasury = Address::generate(&env);
+        client.initialize(&admin, &oracle, &tok, &treasury, &TEST_FEE_BPS);
+        seed_active_poll(&env, &contract_id, 2, &admin);
+
+        let user = Address::generate(&env);
+        let first = MAX_CUMULATIVE_STAKE_PER_POLL / 2;
+        client.stake(&user, &2_u64, &first, &StakeSide::Yes);
+        let err = client
+            .try_stake(&user, &2_u64, &(first + 1), &StakeSide::Yes)
+            .expect_err("should reject crossing the cap");
+        assert_eq!(err, Ok(PredictXError::StakeLimitExceeded));
+        assert_eq!(client.get_user_poll_stake_total(&2_u64, &user), first);
+    }
+
+    #[test]
+    fn user_poll_stake_total_is_readable_and_starts_at_zero() {
+        let env = Env::default();
+        env.mock_all_auths();
+        let contract_id = env.register(PredictionMarket, ());
+        let client = PredictionMarketClient::new(&env, &contract_id);
+        let admin = Address::generate(&env);
+        let oracle = Address::generate(&env);
+        let tok = Address::generate(&env);
+        let treasury = Address::generate(&env);
+        client.initialize(&admin, &oracle, &tok, &treasury, &TEST_FEE_BPS);
+        seed_active_poll(&env, &contract_id, 3, &admin);
+
+        let user = Address::generate(&env);
+        assert_eq!(client.get_user_poll_stake_total(&3_u64, &user), 0);
+        client.stake(&user, &3_u64, &10, &StakeSide::No);
+        assert_eq!(client.get_user_poll_stake_total(&3_u64, &user), 10);
     }
 
 }

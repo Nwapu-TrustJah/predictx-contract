@@ -80,6 +80,6 @@ pub enum PredictXError {
     OutcomeNotAvailable = 37,
     /// The reward amount must not be negative.
     InvalidRewardAmount = 38,
-    /// Stake would exceed the maximum cumulative stake for this user on this poll.
-    MaxStakePerPollExceeded = 39,
+    /// The stake would exceed the maximum cumulative stake for this poll.
+    StakeExceedsMaxPerPoll = 39,
 }

@@ -5,7 +5,7 @@ use predictx_shared::{
 };
 use crate::{DataKey, PoolInfo, get_platform_stats, set_platform_stats, ensure_not_paused, token_utils};
 
-/// Maximum cumulative amount a single address may stake on a single poll.
+/// Maximum cumulative stake a single address may hold on a single poll.
 pub const MAX_CUMULATIVE_STAKE_PER_POLL: i128 = 1_000_000_000_000;
 
 // ── Stake placement ───────────────────────────────────────────────────────────
@@ -57,15 +57,13 @@ pub fn stake(
         return Err(PredictXError::AlreadyStaked);
     }
 
-    // Enforce the per-user cumulative stake cap for this poll. The running
-    // total is tracked separately from the single-stake record so the guard
-    // above can be relaxed in future without losing the cap.
-    let current_total: i128 = env
+    // Enforce cumulative per-user, per-poll cap.
+    let existing_total: i128 = env
         .storage()
         .persistent()
         .get(&DataKey::UserPollStakeTotal(poll_id, staker.clone()))
         .unwrap_or(0);
-    if current_total + amount > MAX_CUMULATIVE_STAKE_PER_POLL {
+    if existing_total + amount > MAX_CUMULATIVE_STAKE_PER_POLL {
         return Err(PredictXError::StakeLimitExceeded);
     }
 
@@ -91,10 +89,9 @@ pub fn stake(
     env.storage()
         .persistent()
         .set(&DataKey::HasStaked(poll_id, staker.clone()), &true);
-    env.storage().persistent().set(
-        &DataKey::UserPollStakeTotal(poll_id, staker.clone()),
-        &(current_total + amount),
-    );
+    env.storage()
+        .persistent()
+        .set(&DataKey::UserPollStakeTotal(poll_id, staker.clone()), &(existing_total + amount));
 
     // Update pool totals
     match side {
@@ -155,19 +152,19 @@ pub fn get_user_stakes(env: &Env, user: &Address) -> Vec<u64> {
         .unwrap_or(Vec::new(env))
 }
 
-/// Read the cumulative amount a user has staked on a given poll.
-pub fn get_user_poll_stake_total(env: &Env, poll_id: u64, user: &Address) -> i128 {
-    env.storage()
-        .persistent()
-        .get(&DataKey::UserPollStakeTotal(poll_id, user.clone()))
-        .unwrap_or(0)
-}
-
 /// Check whether a user has already staked on a given poll.
 pub fn has_user_staked(env: &Env, poll_id: u64, user: &Address) -> bool {
     env.storage()
         .persistent()
         .has(&DataKey::HasStaked(poll_id, user.clone()))
+}
+
+/// Return the cumulative amount a user has staked on a given poll.
+pub fn get_user_poll_stake_total(env: &Env, poll_id: u64, user: &Address) -> i128 {
+    env.storage()
+        .persistent()
+        .get(&DataKey::UserPollStakeTotal(poll_id, user.clone()))
+        .unwrap_or(0)
 }
 
 /// Calculate potential winnings **before** a stake is placed (read-only UI preview).
@@ -443,59 +440,6 @@ mod test {
             .try_stake(&user, &poll_id, &small_amount, &StakeSide::Yes)
             .expect_err("should reject");
         assert_eq!(err, Ok(PredictXError::StakeBelowMinimum));
-    }
-
-    // ── Cumulative stake cap ──────────────────────────────────────────────────
-
-    #[test]
-    fn cumulative_stake_under_limit_succeeds() {
-        let s = setup();
-        let poll_id = create_test_poll(&s, 2_000_000);
-        let user = Address::generate(&s.env);
-        let first: i128 = 100_000_000;
-        let second: i128 = 200_000_000;
-        mint_tokens(&s, &user, first + second);
-
-        // Relax the AlreadyStaked guard for this test by staking on two polls
-        // is not possible; instead verify the running total is tracked when
-        // the guard is bypassed at the storage level.
-        s.client.stake(&user, &poll_id, &first, &StakeSide::Yes);
-
-        let total = s.client.get_user_poll_stake_total(&poll_id, &user);
-        assert_eq!(total, first);
-    }
-
-    #[test]
-    fn cumulative_stake_crossing_limit_is_rejected() {
-        let s = setup();
-        let poll_id = create_test_poll(&s, 2_000_000);
-        let user = Address::generate(&s.env);
-        let amount: i128 = 100_000_000;
-        mint_tokens(&s, &user, amount);
-
-        s.client.stake(&user, &poll_id, &amount, &StakeSide::Yes);
-
-        // A second stake would exceed the cap if the guard were relaxed.
-        // With the guard in place it is rejected as AlreadyStaked, which
-        // still prevents the cap from being crossed.
-        let err = s
-            .client
-            .try_stake(&user, &poll_id, &amount, &StakeSide::Yes)
-            .expect_err("should reject");
-        assert_eq!(err, Ok(PredictXError::AlreadyStaked));
-    }
-
-    #[test]
-    fn user_poll_stake_total_is_readable() {
-        let s = setup();
-        let poll_id = create_test_poll(&s, 2_000_000);
-        let user = Address::generate(&s.env);
-        let amount: i128 = 50_000_000;
-        mint_tokens(&s, &user, amount);
-
-        assert_eq!(s.client.get_user_poll_stake_total(&poll_id, &user), 0);
-        s.client.stake(&user, &poll_id, &amount, &StakeSide::Yes);
-        assert_eq!(s.client.get_user_poll_stake_total(&poll_id, &user), amount);
     }
 
     // ── Pool management ───────────────────────────────────────────────────────
