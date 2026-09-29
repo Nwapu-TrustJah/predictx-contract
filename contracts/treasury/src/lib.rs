@@ -13,6 +13,7 @@ enum DataKey {
     Market,
     TokenAddress,
     Balance(Address),
+    Paused,
 }
 
 fn get_admin(env: &Env) -> Result<Address, PredictXError> {
@@ -36,6 +37,13 @@ fn get_balance(env: &Env, who: &Address) -> i128 {
         .unwrap_or(0_i128)
 }
 
+fn is_paused(env: &Env) -> bool {
+    env.storage()
+        .instance()
+        .get(&DataKey::Paused)
+        .unwrap_or(false)
+}
+
 #[contractimpl]
 impl Treasury {
     pub fn initialize(env: Env, admin: Address) -> Result<(), PredictXError> {
@@ -50,6 +58,33 @@ impl Treasury {
 
     pub fn admin(env: Env) -> Result<Address, PredictXError> {
         get_admin(&env)
+    }
+
+    /// Admin-gated pause of value-moving entry points.
+    pub fn pause(env: Env, admin: Address) -> Result<(), PredictXError> {
+        let stored_admin = get_admin(&env)?;
+        if admin != stored_admin {
+            return Err(PredictXError::Unauthorized);
+        }
+        admin.require_auth();
+        env.storage().instance().set(&DataKey::Paused, &true);
+        Ok(())
+    }
+
+    /// Admin-gated unpause of value-moving entry points.
+    pub fn unpause(env: Env, admin: Address) -> Result<(), PredictXError> {
+        let stored_admin = get_admin(&env)?;
+        if admin != stored_admin {
+            return Err(PredictXError::Unauthorized);
+        }
+        admin.require_auth();
+        env.storage().instance().set(&DataKey::Paused, &false);
+        Ok(())
+    }
+
+    /// Read-only view of the pause flag.
+    pub fn is_paused(env: Env) -> bool {
+        is_paused(&env)
     }
 
     /// Returns the registered market address, if set.
@@ -95,6 +130,9 @@ impl Treasury {
         if !env.storage().instance().has(&DataKey::Admin) {
             return Err(PredictXError::NotInitialized);
         }
+        if is_paused(&env) {
+            return Err(PredictXError::ContractPaused);
+        }
         from.require_auth();
 
         let new_balance = get_balance(&env, &from) + amount;
@@ -113,6 +151,9 @@ impl Treasury {
         }
         if !env.storage().instance().has(&DataKey::Admin) {
             return Err(PredictXError::NotInitialized);
+        }
+        if is_paused(&env) {
+            return Err(PredictXError::ContractPaused);
         }
 
         let registered_market = get_market(&env)?;
@@ -141,6 +182,10 @@ impl Treasury {
             return Err(PredictXError::Unauthorized);
         }
         admin.require_auth();
+
+        if is_paused(&env) {
+            return Err(PredictXError::ContractPaused);
+        }
 
         if amount <= 0 {
             return Err(PredictXError::StakeAmountZero);
