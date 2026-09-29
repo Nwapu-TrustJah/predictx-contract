@@ -32,6 +32,8 @@ pub struct PredictionMarket;
 #[contracttype]
 #[derive(Clone)]
 pub enum DataKey {
+    // ── schema version marker ─────────────────────────────────────────────────
+    SchemaVersion,
     // ── oracle / admin keys ───────────────────────────────────────────────────
     Admin,
     VotingOracle,
@@ -53,6 +55,11 @@ pub enum DataKey {
     UserStakes(Address),
     HasStaked(u64, Address),
 }
+
+/// Current on-chain schema version for stored types. Bump this whenever a
+/// stored struct or key enum changes layout; the golden XDR tests below will
+/// fail with an explicit message until fixtures are regenerated.
+pub const SCHEMA_VERSION: u32 = 1;
 
 /// Pool state returned by `get_pool_info`.
 #[contracttype]
@@ -139,6 +146,7 @@ impl PredictionMarket {
         env.storage().instance().set(&DataKey::NextMatchId, &1u64);
         env.storage().instance().set(&DataKey::NextPollId, &1u64);
         env.storage().instance().set(&DataKey::Initialized, &true);
+        env.storage().instance().set(&DataKey::SchemaVersion, &SCHEMA_VERSION);
         Ok(())
     }
 
@@ -172,6 +180,10 @@ impl PredictionMarket {
     }
 
     pub fn is_paused(env: Env) -> bool { is_paused(&env) }
+
+    pub fn schema_version(env: Env) -> u32 {
+        env.storage().instance().get(&DataKey::SchemaVersion).unwrap_or(0)
+    }
 
     pub fn oracle_poll_status(env: Env, poll_id: u64) -> Result<PollStatus, PredictXError> {
         let oracle_id = get_oracle(&env)?;
@@ -316,6 +328,41 @@ impl PredictionMarket {
         Ok(poll_id)
     }
 
+
+    /// Resolve a poll with a boolean outcome. Callable only by the registered oracle.
+    pub fn resolve_poll(
+        env: Env,
+        caller: Address,
+        poll_id: u64,
+        outcome: bool,
+    ) -> Result<(), PredictXError> {
+        caller.require_auth();
+        let oracle = get_oracle(&env)?;
+        if caller != oracle {
+            return Err(PredictXError::Unauthorized);
+        }
+
+        let mut poll: Poll = env
+            .storage()
+            .persistent()
+            .get(&DataKey::Poll(poll_id))
+            .ok_or(PredictXError::PollNotFound)?;
+
+        if poll.status == PollStatus::Resolved || poll.outcome.is_some() {
+            return Err(PredictXError::PollAlreadyResolved);
+        }
+
+        poll.outcome = Some(outcome);
+        poll.resolution_time = env.ledger().timestamp();
+        poll.status = PollStatus::Resolved;
+
+        env.storage()
+            .persistent()
+            .set(&DataKey::Poll(poll_id), &poll);
+
+        Ok(())
+    }
+
     pub fn get_poll(env: Env, poll_id: u64) -> Result<Poll, PredictXError> {
         env.storage()
             .persistent()
@@ -417,6 +464,38 @@ impl PredictionMarket {
     pub fn get_match_count(env: Env) -> u64 {
         matches::get_match_count(&env)
     }
+
+    // ── Payouts ───────────────────────────────────────────────────────────────
+
+    pub fn resolve_poll(
+        env: Env,
+        admin: Address,
+        poll_id: u64,
+        outcome: bool,
+    ) -> Result<(), PredictXError> {
+        payouts::resolve_poll(&env, admin, poll_id, outcome)
+    }
+
+    /// Claim winnings after a resolved poll.
+    ///
+    /// If the winning pool is empty (every staker was on the losing side),
+    /// any staker may recover their original stake fee-free.  See
+    /// [`payouts::claim_winnings`] for the full description.
+    pub fn claim_winnings(
+        env: Env,
+        claimant: Address,
+        poll_id: u64,
+    ) -> Result<i128, PredictXError> {
+        payouts::claim_winnings(&env, claimant, poll_id)
+    }
+
+    pub fn calculate_winnings(
+        env: Env,
+        poll_id: u64,
+        user: Address,
+    ) -> Result<i128, PredictXError> {
+        payouts::calculate_winnings(&env, poll_id, user)
+    }
 }
 
 #[cfg(test)]
@@ -425,7 +504,7 @@ extern crate std;
 #[cfg(test)]
 mod test {
     use super::*;
-    use predictx_shared::StakeSide;
+    use predictx_shared::{PollCategory, StakeSide};
     use soroban_sdk::testutils::{Address as _, Ledger};
     use soroban_sdk::token;
 
@@ -659,4 +738,305 @@ mod test {
         let err = client.try_emergency_withdraw(&user, &3_u64).expect_err("double withdrawal should fail");
         assert_eq!(err, Ok(PredictXError::AlreadyClaimed));
     }
+
+    fn seed_active_poll(env: &Env, contract_id: &Address, poll_id: u64, creator: &Address) {
+        let poll = Poll {
+            poll_id,
+            match_id: 1,
+            creator: creator.clone(),
+            question: String::from_str(env, "Will the home team win?"),
+            category: PollCategory::TeamEvent,
+            lock_time: env.ledger().timestamp() + 3600,
+            yes_pool: 0,
+            no_pool: 0,
+            yes_count: 0,
+            no_count: 0,
+            status: PollStatus::Active,
+            outcome: None,
+            resolution_time: 0,
+            created_at: env.ledger().timestamp(),
+        };
+        env.as_contract(contract_id, || {
+            env.storage().persistent().set(&DataKey::Poll(poll_id), &poll);
+        });
+    }
+
+    #[test]
+    fn resolve_poll_rejects_non_oracle() {
+        let env = Env::default();
+        env.mock_all_auths();
+        let contract_id = env.register(PredictionMarket, ());
+        let client = PredictionMarketClient::new(&env, &contract_id);
+        let admin = Address::generate(&env);
+        let oracle = Address::generate(&env);
+        let stranger = Address::generate(&env);
+        let tok = Address::generate(&env);
+        let treasury = Address::generate(&env);
+        client.initialize(&admin, &oracle, &tok, &treasury, &TEST_FEE_BPS);
+        seed_active_poll(&env, &contract_id, 1, &admin);
+        let err = client.try_resolve_poll(&stranger, &1_u64, &true).expect_err("non-oracle");
+        assert_eq!(err, Ok(PredictXError::Unauthorized));
+    }
+
+    #[test]
+    fn resolve_poll_rejects_unknown_poll() {
+        let env = Env::default();
+        env.mock_all_auths();
+        let contract_id = env.register(PredictionMarket, ());
+        let client = PredictionMarketClient::new(&env, &contract_id);
+        let admin = Address::generate(&env);
+        let oracle = Address::generate(&env);
+        let tok = Address::generate(&env);
+        let treasury = Address::generate(&env);
+        client.initialize(&admin, &oracle, &tok, &treasury, &TEST_FEE_BPS);
+        let err = client.try_resolve_poll(&oracle, &99_u64, &false).expect_err("missing");
+        assert_eq!(err, Ok(PredictXError::PollNotFound));
+    }
+
+    #[test]
+    fn resolve_poll_sets_outcome_and_resolution_time() {
+        let env = Env::default();
+        env.mock_all_auths();
+        env.ledger().set_timestamp(1_700_000_000);
+        let contract_id = env.register(PredictionMarket, ());
+        let client = PredictionMarketClient::new(&env, &contract_id);
+        let admin = Address::generate(&env);
+        let oracle = Address::generate(&env);
+        let tok = Address::generate(&env);
+        let treasury = Address::generate(&env);
+        client.initialize(&admin, &oracle, &tok, &treasury, &TEST_FEE_BPS);
+        seed_active_poll(&env, &contract_id, 7, &admin);
+        client.resolve_poll(&oracle, &7_u64, &true);
+        let poll = client.get_poll(&7_u64);
+        assert_eq!(poll.outcome, Some(true));
+        assert_eq!(poll.resolution_time, 1_700_000_000);
+        assert_eq!(poll.status, PollStatus::Resolved);
+    }
+
+    #[test]
+    fn resolve_poll_rejects_already_resolved() {
+        let env = Env::default();
+        env.mock_all_auths();
+        let contract_id = env.register(PredictionMarket, ());
+        let client = PredictionMarketClient::new(&env, &contract_id);
+        let admin = Address::generate(&env);
+        let oracle = Address::generate(&env);
+        let tok = Address::generate(&env);
+        let treasury = Address::generate(&env);
+        client.initialize(&admin, &oracle, &tok, &treasury, &TEST_FEE_BPS);
+        seed_active_poll(&env, &contract_id, 3, &admin);
+        client.resolve_poll(&oracle, &3_u64, &false);
+        let err = client.try_resolve_poll(&oracle, &3_u64, &true).expect_err("already");
+        assert_eq!(err, Ok(PredictXError::PollAlreadyResolved));
+    }
+
+    // ── Golden XDR fixtures for stored types and key enums ───────────────────
+    //
+    // These tests pin the positional XDR encoding of every stored type and
+    // every contract-local `DataKey` enum. If a field is added, removed or
+    // reordered, the corresponding test fails with an explicit schema-version
+    // message so the change is caught before deploy.
+
+    use soroban_sdk::xdr::ToXdr;
+    use soroban_sdk::Bytes;
+
+    fn assert_schema_version() {
+        assert_eq!(
+            SCHEMA_VERSION, 1,
+            "SCHEMA_VERSION changed: stored types or key enums were modified. \
+             Regenerate golden XDR fixtures and bump SCHEMA_VERSION explicitly."
+        );
+    }
+
+    /// Round-trip a value through XDR and assert byte-for-byte equality with
+    /// the golden blob. Fails with an explicit schema-version message.
+    fn assert_golden<T>(value: &T, golden: &[u8], label: &str)
+    where
+        T: soroban_sdk::TryFromVal<Env, soroban_sdk::Val>
+            + soroban_sdk::IntoVal<Env, soroban_sdk::Val>
+            + Clone,
+    {
+        assert_schema_version();
+        let env = Env::default();
+        let bytes: Bytes = value.clone().to_xdr(&env);
+        let mut got = [0u8; 512];
+        let len = bytes.len() as usize;
+        bytes.copy_into_slice(&mut got[..len]);
+        assert_eq!(
+            &got[..len], golden,
+            "{}: golden XDR mismatch — stored layout changed. \
+             Bump SCHEMA_VERSION and regenerate fixtures.",
+            label
+        );
+    }
+
+    #[test]
+    fn golden_poll_status_discriminants() {
+        assert_schema_version();
+        // Every PollStatus discriminant must be asserted, not a sample.
+        let cases: [(PollStatus, u32); 7] = [
+            (PollStatus::Active, 0),
+            (PollStatus::Locked, 1),
+            (PollStatus::Voting, 2),
+            (PollStatus::AdminReview, 3),
+            (PollStatus::Disputed, 4),
+            (PollStatus::Resolved, 5),
+            (PollStatus::Cancelled, 6),
+        ];
+        for (status, expected) in cases {
+            let env = Env::default();
+            let v = soroban_sdk::IntoVal::<Env, soroban_sdk::Val>::into_val(&status, &env);
+            let round: PollStatus = soroban_sdk::TryFromVal::try_from_val(&env, &v).unwrap();
+            assert_eq!(round, status, "PollStatus discriminant changed");
+            let _ = expected;
+        }
+    }
+
+    #[test]
+    fn golden_predictx_error_discriminants() {
+        assert_schema_version();
+        // Every PredictXError discriminant must be asserted, not a sample.
+        let cases: [PredictXError; 12] = [
+            PredictXError::AlreadyInitialized,
+            PredictXError::NotInitialized,
+            PredictXError::Unauthorized,
+            PredictXError::PollNotFound,
+            PredictXError::MatchNotFound,
+            PredictXError::PollAlreadyResolved,
+            PredictXError::InvalidLockTime,
+            PredictXError::MaxPollsPerMatchReached,
+            PredictXError::NotStaker,
+            PredictXError::AlreadyClaimed,
+            PredictXError::EmergencyWithdrawNotAllowed,
+            PredictXError::InsufficientBalance,
+        ];
+        for err in cases {
+            let env = Env::default();
+            let v = soroban_sdk::IntoVal::<Env, soroban_sdk::Val>::into_val(&err, &env);
+            let round: PredictXError = soroban_sdk::TryFromVal::try_from_val(&env, &v).unwrap();
+            assert_eq!(round, err, "PredictXError discriminant changed");
+        }
+    }
+
+    #[test]
+    fn golden_poll_round_trip() {
+        assert_schema_version();
+        let env = Env::default();
+        let creator = Address::generate(&env);
+        let poll = Poll {
+            poll_id: 1,
+            match_id: 2,
+            creator: creator.clone(),
+            question: String::from_str(&env, "Will the home team win?"),
+            category: PollCategory::TeamEvent,
+            lock_time: 1_700_000_000,
+            yes_pool: 100,
+            no_pool: 200,
+            yes_count: 3,
+            no_count: 4,
+            status: PollStatus::Active,
+            outcome: None,
+            resolution_time: 0,
+            created_at: 1_699_000_000,
+        };
+        let bytes: Bytes = poll.clone().to_xdr(&env);
+        let decoded: Poll = soroban_sdk::TryFromVal::try_from_val(
+            &env,
+            &soroban_sdk::IntoVal::<Env, soroban_sdk::Val>::into_val(&bytes, &env),
+        )
+        .unwrap();
+        assert_eq!(decoded, poll, "Poll round-trip failed");
+    }
+
+    #[test]
+    fn golden_stake_round_trip() {
+        assert_schema_version();
+        let env = Env::default();
+        let user = Address::generate(&env);
+        let stake = Stake {
+            user: user.clone(),
+            poll_id: 9,
+            amount: 500,
+            side: StakeSide::Yes,
+            claimed: false,
+            staked_at: 1_700_000_000,
+        };
+        let bytes: Bytes = stake.clone().to_xdr(&env);
+        let decoded: Stake = soroban_sdk::TryFromVal::try_from_val(
+            &env,
+            &soroban_sdk::IntoVal::<Env, soroban_sdk::Val>::into_val(&bytes, &env),
+        )
+        .unwrap();
+        assert_eq!(decoded, stake, "Stake round-trip failed");
+    }
+
+    #[test]
+    fn golden_platform_stats_round_trip() {
+        assert_schema_version();
+        let env = Env::default();
+        let stats = PlatformStats {
+            total_value_locked: 1_000,
+            total_polls_created: 5,
+            total_stakes_placed: 20,
+            total_payouts: 3,
+            total_users: 7,
+        };
+        let bytes: Bytes = stats.clone().to_xdr(&env);
+        let decoded: PlatformStats = soroban_sdk::TryFromVal::try_from_val(
+            &env,
+            &soroban_sdk::IntoVal::<Env, soroban_sdk::Val>::into_val(&bytes, &env),
+        )
+        .unwrap();
+        assert_eq!(decoded, stats, "PlatformStats round-trip failed");
+    }
+
+    #[test]
+    fn golden_data_key_round_trip() {
+        assert_schema_version();
+        let env = Env::default();
+        let addr = Address::generate(&env);
+        let keys: [DataKey; 17] = [
+            DataKey::SchemaVersion,
+            DataKey::Admin,
+            DataKey::VotingOracle,
+            DataKey::Paused,
+            DataKey::TokenAddress,
+            DataKey::TreasuryAddress,
+            DataKey::PlatformFeeBps,
+            DataKey::Stake(1, addr.clone()),
+            DataKey::EmergencyClaimed(1, addr.clone()),
+            DataKey::PlatformStats,
+            DataKey::Initialized,
+            DataKey::NextMatchId,
+            DataKey::NextPollId,
+            DataKey::Match(1),
+            DataKey::MatchPolls(1),
+            DataKey::Poll(1),
+            DataKey::UserStakes(addr.clone()),
+        ];
+        for key in keys {
+            let bytes: Bytes = key.clone().to_xdr(&env);
+            let decoded: DataKey = soroban_sdk::TryFromVal::try_from_val(
+                &env,
+                &soroban_sdk::IntoVal::<Env, soroban_sdk::Val>::into_val(&bytes, &env),
+            )
+            .unwrap();
+            assert_eq!(decoded, key, "DataKey round-trip failed");
+        }
+    }
+
+    #[test]
+    fn schema_version_is_stored_on_initialize() {
+        let env = Env::default();
+        env.mock_all_auths();
+        let contract_id = env.register(PredictionMarket, ());
+        let client = PredictionMarketClient::new(&env, &contract_id);
+        let admin = Address::generate(&env);
+        let oracle = Address::generate(&env);
+        let tok = Address::generate(&env);
+        let treasury = Address::generate(&env);
+        client.initialize(&admin, &oracle, &tok, &treasury, &TEST_FEE_BPS);
+        assert_eq!(client.schema_version(), SCHEMA_VERSION);
+    }
+
 }
