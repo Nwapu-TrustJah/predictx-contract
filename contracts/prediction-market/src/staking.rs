@@ -1,7 +1,7 @@
 use soroban_sdk::{Address, Env, Symbol, Vec};
 use predictx_shared::{
     Poll, PollStatus, Stake, StakeSide, PredictXError,
-    MIN_STAKE_AMOUNT, BPS_DENOMINATOR,
+    MIN_STAKE_AMOUNT, BPS_DENOMINATOR, MAX_CUMULATIVE_STAKE_PER_POLL,
 };
 use crate::{DataKey, PoolInfo, get_platform_stats, set_platform_stats, ensure_not_paused, token_utils};
 
@@ -46,20 +46,28 @@ pub fn stake(
         return Err(PredictXError::PollLocked);
     }
 
-    // Track cumulative stake per user per poll.  The previous guard rejected
-    // any second stake outright; that guard is relaxed here so a user may
-    // top up their position as long as the running total stays within the
-    // per-poll cap.
-    let existing_total: i128 = env
+    if env
+        .storage()
+        .persistent()
+        .has(&DataKey::HasStaked(poll_id, staker.clone()))
+    {
+        return Err(PredictXError::AlreadyStaked);
+    }
+
+    // Enforce the maximum cumulative stake per user per poll.  A per-call cap
+    // is trivially bypassed by splitting across several calls, so we track the
+    // running total for this (poll, user) pair and reject any stake that would
+    // push it over the limit.
+    let current_total: i128 = env
         .storage()
         .persistent()
         .get(&DataKey::UserPollStakeTotal(poll_id, staker.clone()))
         .unwrap_or(0);
-    let new_total = existing_total
+    let new_total = current_total
         .checked_add(amount)
         .ok_or(PredictXError::StakeAmountZero)?;
     if new_total > MAX_CUMULATIVE_STAKE_PER_POLL {
-        return Err(PredictXError::StakeLimitExceeded);
+        return Err(PredictXError::CumulativeStakeLimitExceeded);
     }
 
     // ── Interactions ──────────────────────────────────────────────────────────
@@ -71,16 +79,21 @@ pub fn stake(
     let stake_record = Stake {
         user: staker.clone(),
         poll_id,
-        amount: new_total,
+        amount,
         side,
         claimed: false,
         staked_at: env.ledger().timestamp(),
     };
 
-    // Store stake record + running total
+    // Store stake record + flag
     env.storage()
         .persistent()
         .set(&DataKey::Stake(poll_id, staker.clone()), &stake_record);
+    env.storage()
+        .persistent()
+        .set(&DataKey::HasStaked(poll_id, staker.clone()), &true);
+
+    // Persist the updated cumulative total for this (poll, user) pair.
     env.storage()
         .persistent()
         .set(&DataKey::UserPollStakeTotal(poll_id, staker.clone()), &new_total);
@@ -106,9 +119,7 @@ pub fn stake(
         .persistent()
         .get(&DataKey::UserStakes(staker.clone()))
         .unwrap_or(Vec::new(env));
-    if !user_stakes.iter().any(|id| id == poll_id) {
-        user_stakes.push_back(poll_id);
-    }
+    user_stakes.push_back(poll_id);
     env.storage()
         .persistent()
         .set(&DataKey::UserStakes(staker.clone()), &user_stakes);
@@ -153,7 +164,10 @@ pub fn has_user_staked(env: &Env, poll_id: u64, user: &Address) -> bool {
         .has(&DataKey::HasStaked(poll_id, user.clone()))
 }
 
-/// Return the cumulative amount a user has staked on a poll so far.
+/// Return the cumulative amount a user has staked on a given poll.
+///
+/// This is the running total used to enforce `MAX_CUMULATIVE_STAKE_PER_POLL`.
+/// Returns `0` if the user has never staked on the poll.
 pub fn get_user_poll_stake_total(env: &Env, poll_id: u64, user: &Address) -> i128 {
     env.storage()
         .persistent()
@@ -434,6 +448,66 @@ mod test {
             .try_stake(&user, &poll_id, &small_amount, &StakeSide::Yes)
             .expect_err("should reject");
         assert_eq!(err, Ok(PredictXError::StakeBelowMinimum));
+    }
+
+    // ── Cumulative stake limit ────────────────────────────────────────────────
+
+    #[test]
+    fn two_stakes_summing_under_limit_both_succeed() {
+        let s = setup();
+        let poll_id = create_test_poll(&s, 2_000_000);
+        let user = Address::generate(&s.env);
+
+        // Two stakes that together stay strictly below the cumulative cap.
+        let first: i128 = MAX_CUMULATIVE_STAKE_PER_POLL / 4;
+        let second: i128 = MAX_CUMULATIVE_STAKE_PER_POLL / 4;
+        mint_tokens(&s, &user, first + second);
+
+        s.client.stake(&user, &poll_id, &first, &StakeSide::Yes);
+        s.client.stake(&user, &poll_id, &second, &StakeSide::No);
+
+        assert_eq!(
+            s.client.get_user_poll_stake_total(&poll_id, &user),
+            first + second
+        );
+    }
+
+    #[test]
+    fn stake_crossing_cumulative_limit_is_rejected() {
+        let s = setup();
+        let poll_id = create_test_poll(&s, 2_000_000);
+        let user = Address::generate(&s.env);
+
+        // First stake fills most of the cap; the second would cross it.
+        let first: i128 = MAX_CUMULATIVE_STAKE_PER_POLL - 1;
+        let second: i128 = 2;
+        mint_tokens(&s, &user, first + second);
+
+        s.client.stake(&user, &poll_id, &first, &StakeSide::Yes);
+
+        let err = s
+            .client
+            .try_stake(&user, &poll_id, &second, &StakeSide::No)
+            .expect_err("should reject stake crossing cumulative limit");
+        assert_eq!(err, Ok(PredictXError::CumulativeStakeLimitExceeded));
+
+        // The running total must be unchanged after the rejected stake.
+        assert_eq!(s.client.get_user_poll_stake_total(&poll_id, &user), first);
+    }
+
+    #[test]
+    fn running_total_is_readable_and_starts_at_zero() {
+        let s = setup();
+        let poll_id = create_test_poll(&s, 2_000_000);
+        let user = Address::generate(&s.env);
+        let amount: i128 = 50_000_000;
+        mint_tokens(&s, &user, amount);
+
+        assert_eq!(s.client.get_user_poll_stake_total(&poll_id, &user), 0);
+
+        s.client.stake(&user, &poll_id, &amount, &StakeSide::Yes);
+
+        assert_eq!(s.client.get_user_poll_stake_total(&poll_id, &user), amount);
     }
 
     // ── Pool management ───────────────────────────────────────────────────────

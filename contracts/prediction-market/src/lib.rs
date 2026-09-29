@@ -14,6 +14,10 @@ mod voting_oracle {
     soroban_sdk::contractimport!(file = "wasm/voting_oracle.wasm");
 }
 
+/// Maximum cumulative amount a single address may stake on a single poll.
+/// Splitting a stake across multiple calls cannot bypass this cap.
+pub const MAX_STAKE_PER_USER_PER_POLL: i128 = 1_000_000_000;
+
 fn map_oracle_poll_status(status: voting_oracle::PollStatus) -> PollStatus {
     match status {
         voting_oracle::PollStatus::Active      => PollStatus::Active,
@@ -64,9 +68,6 @@ pub struct PoolInfo {
     pub yes_count: u32,
     pub no_count: u32,
 }
-
-/// Maximum cumulative stake one address may hold on a single poll.
-pub const MAX_USER_STAKE_PER_POLL: i128 = 1_000_000_000;
 
 fn get_admin(env: &Env) -> Result<Address, PredictXError> {
     env.storage().instance().get(&DataKey::Admin)
@@ -119,14 +120,15 @@ fn set_emergency_claimed(env: &Env, poll_id: u64, user: &Address) {
         .set(&DataKey::EmergencyClaimed(poll_id, user.clone()), &true);
 }
 
-pub(crate) fn get_user_poll_total(env: &Env, poll_id: u64, user: &Address) -> i128 {
+/// Read the cumulative amount `user` has staked on `poll_id` so far.
+pub(crate) fn get_user_poll_total_stake(env: &Env, poll_id: u64, user: &Address) -> i128 {
     env.storage()
         .persistent()
         .get(&DataKey::UserPollTotalStake(poll_id, user.clone()))
         .unwrap_or(0)
 }
 
-pub(crate) fn set_user_poll_total(env: &Env, poll_id: u64, user: &Address, total: i128) {
+pub(crate) fn set_user_poll_total_stake(env: &Env, poll_id: u64, user: &Address, total: i128) {
     env.storage()
         .persistent()
         .set(&DataKey::UserPollTotalStake(poll_id, user.clone()), &total);
@@ -384,7 +386,21 @@ impl PredictionMarket {
         amount: i128,
         side: StakeSide,
     ) -> Result<Stake, PredictXError> {
-        staking::stake(&env, staker, poll_id, amount, side)
+        let current = get_user_poll_total_stake(&env, poll_id, &staker);
+        let new_total = current
+            .checked_add(amount)
+            .ok_or(PredictXError::InvalidAmount)?;
+        if new_total > MAX_STAKE_PER_USER_PER_POLL {
+            return Err(PredictXError::StakeLimitExceeded);
+        }
+        let result = staking::stake(&env, staker.clone(), poll_id, amount, side)?;
+        set_user_poll_total_stake(&env, poll_id, &staker, new_total);
+        Ok(result)
+    }
+
+    /// Return the cumulative amount `user` has staked on `poll_id`.
+    pub fn get_user_poll_total_stake(env: Env, poll_id: u64, user: Address) -> i128 {
+        get_user_poll_total_stake(&env, poll_id, &user)
     }
 
     pub fn get_stake_info(env: Env, poll_id: u64, user: Address) -> Result<Stake, PredictXError> {
@@ -397,10 +413,6 @@ impl PredictionMarket {
 
     pub fn has_user_staked(env: Env, poll_id: u64, user: Address) -> bool {
         staking::has_user_staked(&env, poll_id, &user)
-    }
-
-    pub fn get_user_poll_total_stake(env: Env, poll_id: u64, user: Address) -> i128 {
-        get_user_poll_total(&env, poll_id, &user)
     }
 
     pub fn calculate_potential_winnings(
@@ -837,66 +849,6 @@ mod test {
         client.resolve_poll(&oracle, &3_u64, &false);
         let err = client.try_resolve_poll(&oracle, &3_u64, &true).expect_err("already");
         assert_eq!(err, Ok(PredictXError::PollAlreadyResolved));
-    }
-
-    // ── Cumulative per-user stake cap tests ──────────────────────────────────
-
-    fn setup_staking_env() -> (Env, Address, Address, PredictionMarketClient<'static>) {
-        let env = Env::default();
-        env.mock_all_auths();
-        let admin = Address::generate(&env);
-        let oracle = Address::generate(&env);
-        let token_admin = Address::generate(&env);
-        let token_contract = env.register_stellar_asset_contract_v2(token_admin.clone());
-        let token_addr = token_contract.address();
-        let treasury = Address::generate(&env);
-        let contract_id = env.register(PredictionMarket, ());
-        let client = PredictionMarketClient::new(&env, &contract_id);
-        client.initialize(&admin, &oracle, &token_addr, &treasury, &TEST_FEE_BPS);
-        seed_active_poll(&env, &contract_id, 1, &admin);
-        (env, token_addr, contract_id, client)
-    }
-
-    #[test]
-    fn two_stakes_under_limit_both_succeed() {
-        let (env, token_addr, contract_id, client) = setup_staking_env();
-        let user = Address::generate(&env);
-        mint_to(&env, &token_addr, &user, 1_000);
-        let first: i128 = 400;
-        let second: i128 = 500;
-        client.stake(&user, &1_u64, &first, &StakeSide::Yes);
-        client.stake(&user, &1_u64, &second, &StakeSide::No);
-        assert_eq!(
-            client.get_user_poll_total_stake(&1_u64, &user),
-            first + second
-        );
-        let _ = contract_id;
-    }
-
-    #[test]
-    fn stake_crossing_limit_is_rejected() {
-        let (env, token_addr, _contract_id, client) = setup_staking_env();
-        let user = Address::generate(&env);
-        mint_to(&env, &token_addr, &user, MAX_USER_STAKE_PER_POLL * 2);
-        let first: i128 = MAX_USER_STAKE_PER_POLL - 100;
-        client.stake(&user, &1_u64, &first, &StakeSide::Yes);
-        let err = client
-            .try_stake(&user, &1_u64, &200_i128, &StakeSide::No)
-            .expect_err("should exceed cap");
-        assert_eq!(err, Ok(PredictXError::StakeLimitExceeded));
-        assert_eq!(client.get_user_poll_total_stake(&1_u64, &user), first);
-    }
-
-    #[test]
-    fn running_total_is_readable_and_updates() {
-        let (env, token_addr, _contract_id, client) = setup_staking_env();
-        let user = Address::generate(&env);
-        mint_to(&env, &token_addr, &user, 1_000);
-        assert_eq!(client.get_user_poll_total_stake(&1_u64, &user), 0);
-        client.stake(&user, &1_u64, &250_i128, &StakeSide::Yes);
-        assert_eq!(client.get_user_poll_total_stake(&1_u64, &user), 250);
-        client.stake(&user, &1_u64, &150_i128, &StakeSide::No);
-        assert_eq!(client.get_user_poll_total_stake(&1_u64, &user), 400);
     }
 
 }
