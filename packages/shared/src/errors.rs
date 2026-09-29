@@ -80,4 +80,10 @@ pub enum PredictXError {
     OutcomeNotAvailable = 37,
     /// The reward amount must not be negative.
     InvalidRewardAmount = 38,
+    /// No pending parameter proposal exists for this key.
+    ProposalNotFound = 39,
+    /// The timelock delay has not elapsed yet — too early to execute.
+    ProposalNotReady = 40,
+    /// A pending proposal already exists for this parameter key.
+    ProposalAlreadyExists = 41,
 }

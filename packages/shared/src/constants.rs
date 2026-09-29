@@ -33,3 +33,11 @@ pub const EMERGENCY_TIMEOUT_SECS: u64 = 604_800;
 
 /// Minimum stake amount in token base units. `10_000_000` = 10 tokens (7 decimal places).
 pub const MIN_STAKE_AMOUNT: i128 = 10_000_000;
+
+/// Delay (in seconds) between proposing a parameter change and being able to execute it.
+///
+/// Set to 24 hours (`86_400` seconds).  The goal is visibility, not friction: any user who
+/// watches contract events or polls `get_param_proposal` has a full day to react before the
+/// new value takes effect.  A longer window (e.g. 7 days) would be more appropriate for a
+/// fully decentralised protocol but adds unnecessary friction during the current MVP phase.
+pub const PARAM_TIMELOCK_DELAY: u64 = 86_400;

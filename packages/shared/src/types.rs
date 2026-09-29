@@ -174,3 +174,40 @@ pub struct UserStats {
     pub votes_cast: u32,
     pub voting_rewards_earned: i128,
 }
+
+// ── Parameter timelock types ──────────────────────────────────────────────────
+
+/// Identifies a platform parameter that can be changed via the timelock mechanism.
+///
+/// Each variant maps to a concrete storage key + apply logic inside `execute_param`.
+/// Adding a new settable parameter only requires adding a variant here and a match
+/// arm in `execute_param` — no other contract plumbing changes.
+#[contracttype]
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum ParamKey {
+    /// Platform fee expressed in basis points (e.g. `500` = 5 %).
+    PlatformFeeBps = 0,
+}
+
+/// A pending proposal to change a platform parameter after a timelock delay.
+///
+/// Created by `propose_param`, readable via `get_param_proposal`, applied by
+/// `execute_param` (only after `execute_after` has passed), and discarded by
+/// `cancel_param`.
+#[contracttype]
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct ParamProposal {
+    /// Which parameter this proposal targets.
+    pub key: ParamKey,
+    /// The new value to apply, encoded as `u64`.
+    ///
+    /// All currently supported parameters fit comfortably in `u64`.  If a future
+    /// parameter needs a different type it can be added as a separate entry point.
+    pub value: u64,
+    /// Unix timestamp after which `execute_param` is permitted.
+    pub execute_after: u64,
+    /// Unix timestamp when this proposal was created.
+    pub proposed_at: u64,
+    /// Admin address that submitted the proposal.
+    pub proposer: Address,
+}

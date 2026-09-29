@@ -5,8 +5,8 @@ mod staking;
 pub(crate) mod token_utils;
 
 use predictx_shared::{
-    Match, PlatformStats, Poll, PollCategory, PollStatus, PredictXError, Stake, StakeSide,
-    MAX_POLLS_PER_MATCH,
+    Match, ParamKey, ParamProposal, PlatformStats, Poll, PollCategory, PollStatus, PredictXError,
+    Stake, StakeSide, MAX_POLLS_PER_MATCH, PARAM_TIMELOCK_DELAY,
 };
 use soroban_sdk::{contract, contractimpl, contracttype, Address, Env, String, Symbol, Vec};
 
@@ -52,6 +52,9 @@ pub enum DataKey {
     Poll(u64),
     UserStakes(Address),
     HasStaked(u64, Address),
+    // ── parameter timelock keys ───────────────────────────────────────────────
+    /// Stores a pending `ParamProposal` for a given `ParamKey`.
+    ParamProposal(ParamKey),
 }
 
 /// Pool state returned by `get_pool_info`.
@@ -411,6 +414,141 @@ impl PredictionMarket {
 
     pub fn get_platform_fee_bps(env: Env) -> u32 {
         token_utils::get_platform_fee_bps(&env)
+    }
+
+    // ── Parameter timelock ────────────────────────────────────────────────────
+
+    /// Propose a change to a platform parameter, subject to a 24-hour timelock.
+    ///
+    /// Only the admin can call this.  If a proposal for the same `key` is already
+    /// pending it must be cancelled first (`cancel_param`) before a new one can be
+    /// submitted — this prevents accidental overwriting of a live proposal.
+    ///
+    /// Emits a `ParamProposed` event so that off-chain observers (and users) can
+    /// detect the upcoming change and decide whether to exit before it takes effect.
+    pub fn propose_param(
+        env: Env,
+        admin: Address,
+        key: ParamKey,
+        value: u64,
+    ) -> Result<ParamProposal, PredictXError> {
+        let stored_admin = get_admin(&env)?;
+        if admin != stored_admin {
+            return Err(PredictXError::Unauthorized);
+        }
+        admin.require_auth();
+
+        // Reject if a proposal for this key is already pending.
+        if env
+            .storage()
+            .instance()
+            .has(&DataKey::ParamProposal(key))
+        {
+            return Err(PredictXError::ProposalAlreadyExists);
+        }
+
+        let now = env.ledger().timestamp();
+        let proposal = ParamProposal {
+            key,
+            value,
+            execute_after: now + PARAM_TIMELOCK_DELAY,
+            proposed_at: now,
+            proposer: admin.clone(),
+        };
+
+        env.storage()
+            .instance()
+            .set(&DataKey::ParamProposal(key), &proposal);
+
+        env.events().publish(
+            (Symbol::new(&env, "ParamProposed"), key as u32),
+            (value, proposal.execute_after),
+        );
+
+        Ok(proposal)
+    }
+
+    /// Execute a pending parameter change once the 24-hour delay has elapsed.
+    ///
+    /// Anyone can call this after the delay — there is no auth requirement on
+    /// execution because the proposal was already authorised by the admin at
+    /// proposal time, and the timelock itself is the safety mechanism.
+    ///
+    /// Emits a `ParamExecuted` event and removes the proposal from storage.
+    pub fn execute_param(env: Env, key: ParamKey) -> Result<(), PredictXError> {
+        let proposal: ParamProposal = env
+            .storage()
+            .instance()
+            .get(&DataKey::ParamProposal(key))
+            .ok_or(PredictXError::ProposalNotFound)?;
+
+        if env.ledger().timestamp() < proposal.execute_after {
+            return Err(PredictXError::ProposalNotReady);
+        }
+
+        // Apply the parameter change.
+        match key {
+            ParamKey::PlatformFeeBps => {
+                // value is stored as u64 for a uniform proposal type; cast down to u32
+                // which is what the rest of the contract expects for fee BPS.
+                let new_fee = proposal.value as u32;
+                env.storage()
+                    .instance()
+                    .set(&DataKey::PlatformFeeBps, &new_fee);
+            }
+        }
+
+        // Remove the proposal so a new one can be submitted later.
+        env.storage()
+            .instance()
+            .remove(&DataKey::ParamProposal(key));
+
+        env.events().publish(
+            (Symbol::new(&env, "ParamExecuted"), key as u32),
+            proposal.value,
+        );
+
+        Ok(())
+    }
+
+    /// Cancel a pending parameter proposal before it is executed.
+    ///
+    /// Only the admin can cancel.  Emits a `ParamCancelled` event.
+    pub fn cancel_param(env: Env, admin: Address, key: ParamKey) -> Result<(), PredictXError> {
+        let stored_admin = get_admin(&env)?;
+        if admin != stored_admin {
+            return Err(PredictXError::Unauthorized);
+        }
+        admin.require_auth();
+
+        if !env
+            .storage()
+            .instance()
+            .has(&DataKey::ParamProposal(key))
+        {
+            return Err(PredictXError::ProposalNotFound);
+        }
+
+        env.storage()
+            .instance()
+            .remove(&DataKey::ParamProposal(key));
+
+        env.events().publish(
+            (Symbol::new(&env, "ParamCancelled"), key as u32),
+            (),
+        );
+
+        Ok(())
+    }
+
+    /// Return the pending proposal for `key`, or an error if none exists.
+    ///
+    /// Intended for users and front-ends to surface upcoming parameter changes.
+    pub fn get_param_proposal(env: Env, key: ParamKey) -> Result<ParamProposal, PredictXError> {
+        env.storage()
+            .instance()
+            .get(&DataKey::ParamProposal(key))
+            .ok_or(PredictXError::ProposalNotFound)
     }
 
     pub fn get_contract_balance(env: Env) -> Result<i128, PredictXError> {
@@ -816,6 +954,112 @@ mod test {
         client.resolve_poll(&oracle, &3_u64, &false);
         let err = client.try_resolve_poll(&oracle, &3_u64, &true).expect_err("already");
         assert_eq!(err, Ok(PredictXError::PollAlreadyResolved));
+    }
+
+    // ── Parameter timelock tests ──────────────────────────────────────────────
+
+    /// Helper: initialize a fresh contract and return (env, client, admin).
+    fn setup_param_env() -> (Env, PredictionMarketClient<'static>, Address) {
+        let env = Env::default();
+        env.mock_all_auths();
+        let contract_id = env.register(PredictionMarket, ());
+        let client = PredictionMarketClient::new(&env, &contract_id);
+        let admin = Address::generate(&env);
+        let oracle = Address::generate(&env);
+        let tok = Address::generate(&env);
+        let treasury = Address::generate(&env);
+        client.initialize(&admin, &oracle, &tok, &treasury, &TEST_FEE_BPS);
+        (env, client, admin)
+    }
+
+    /// Criterion: execution before the delay elapses is rejected.
+    #[test]
+    fn param_execute_rejected_before_delay() {
+        let (env, client, admin) = setup_param_env();
+
+        // Propose at t = 1_000
+        env.ledger().set_timestamp(1_000);
+        client.propose_param(&admin, &ParamKey::PlatformFeeBps, &300_u64);
+
+        // Try to execute 1 second before the window opens
+        env.ledger().set_timestamp(1_000 + predictx_shared::PARAM_TIMELOCK_DELAY - 1);
+        let err = client
+            .try_execute_param(&ParamKey::PlatformFeeBps)
+            .expect_err("should be rejected before delay");
+        assert_eq!(err, Ok(PredictXError::ProposalNotReady));
+
+        // Fee must not have changed
+        assert_eq!(client.get_platform_fee_bps(), TEST_FEE_BPS);
+    }
+
+    /// Criterion: execution after the delay applies the new value.
+    #[test]
+    fn param_execute_applies_value_after_delay() {
+        let (env, client, admin) = setup_param_env();
+        let new_fee: u64 = 300; // 3%
+
+        // Propose at t = 0
+        env.ledger().set_timestamp(0);
+        let proposal = client.propose_param(&admin, &ParamKey::PlatformFeeBps, &new_fee);
+        assert_eq!(proposal.execute_after, predictx_shared::PARAM_TIMELOCK_DELAY);
+
+        // Execute exactly at the boundary (execute_after itself is allowed)
+        env.ledger().set_timestamp(predictx_shared::PARAM_TIMELOCK_DELAY);
+        client.execute_param(&ParamKey::PlatformFeeBps);
+
+        assert_eq!(client.get_platform_fee_bps(), new_fee as u32);
+
+        // Proposal must have been removed from storage
+        let err = client
+            .try_get_param_proposal(&ParamKey::PlatformFeeBps)
+            .expect_err("proposal should be gone after execution");
+        assert_eq!(err, Ok(PredictXError::ProposalNotFound));
+    }
+
+    /// Criterion: a pending proposal is readable so users can see what is coming.
+    #[test]
+    fn param_proposal_is_readable_while_pending() {
+        let (env, client, admin) = setup_param_env();
+
+        env.ledger().set_timestamp(5_000);
+        let proposal = client.propose_param(&admin, &ParamKey::PlatformFeeBps, &200_u64);
+
+        // Proposal must be retrievable before the delay elapses
+        env.ledger().set_timestamp(5_001);
+        let fetched = client.get_param_proposal(&ParamKey::PlatformFeeBps);
+
+        assert_eq!(fetched.key, ParamKey::PlatformFeeBps);
+        assert_eq!(fetched.value, 200_u64);
+        assert_eq!(fetched.proposed_at, 5_000);
+        assert_eq!(fetched.execute_after, 5_000 + predictx_shared::PARAM_TIMELOCK_DELAY);
+        assert_eq!(fetched.proposer, proposal.proposer);
+    }
+
+    /// Criterion: the admin can cancel a pending proposal.
+    #[test]
+    fn param_admin_can_cancel_proposal() {
+        let (env, client, admin) = setup_param_env();
+
+        env.ledger().set_timestamp(1_000);
+        client.propose_param(&admin, &ParamKey::PlatformFeeBps, &100_u64);
+
+        // Cancel before the delay has elapsed
+        env.ledger().set_timestamp(2_000);
+        client.cancel_param(&admin, &ParamKey::PlatformFeeBps);
+
+        // Proposal must no longer exist
+        let err = client
+            .try_get_param_proposal(&ParamKey::PlatformFeeBps)
+            .expect_err("cancelled proposal should be gone");
+        assert_eq!(err, Ok(PredictXError::ProposalNotFound));
+
+        // Fee must not have changed
+        assert_eq!(client.get_platform_fee_bps(), TEST_FEE_BPS);
+
+        // A fresh proposal can now be created for the same key
+        env.ledger().set_timestamp(2_000);
+        let new_proposal = client.propose_param(&admin, &ParamKey::PlatformFeeBps, &400_u64);
+        assert_eq!(new_proposal.value, 400_u64);
     }
 
 }
