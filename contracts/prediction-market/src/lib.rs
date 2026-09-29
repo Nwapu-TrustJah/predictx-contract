@@ -52,6 +52,8 @@ pub enum DataKey {
     Poll(u64),
     UserStakes(Address),
     HasStaked(u64, Address),
+    MaxStakePerUser,
+    UserPollStakeTotal(u64, Address),
 }
 
 /// Pool state returned by `get_pool_info`.
@@ -172,6 +174,21 @@ impl PredictionMarket {
     }
 
     pub fn is_paused(env: Env) -> bool { is_paused(&env) }
+
+    /// Set the maximum cumulative stake a single address may hold on a single poll.
+    pub fn set_max_stake_per_user(env: Env, admin: Address, max: i128) -> Result<(), PredictXError> {
+        ensure_not_paused(&env)?;
+        let stored_admin = get_admin(&env)?;
+        if admin != stored_admin { return Err(PredictXError::Unauthorized); }
+        admin.require_auth();
+        env.storage().instance().set(&DataKey::MaxStakePerUser, &max);
+        Ok(())
+    }
+
+    /// Read the configured maximum cumulative stake per user per poll.
+    pub fn get_max_stake_per_user(env: Env) -> i128 {
+        env.storage().instance().get(&DataKey::MaxStakePerUser).unwrap_or(0)
+    }
 
     pub fn oracle_poll_status(env: Env, poll_id: u64) -> Result<PollStatus, PredictXError> {
         let oracle_id = get_oracle(&env)?;
@@ -367,7 +384,35 @@ impl PredictionMarket {
         amount: i128,
         side: StakeSide,
     ) -> Result<Stake, PredictXError> {
-        staking::stake(&env, staker, poll_id, amount, side)
+        let max: i128 = env
+            .storage()
+            .instance()
+            .get(&DataKey::MaxStakePerUser)
+            .unwrap_or(0);
+        let current: i128 = env
+            .storage()
+            .persistent()
+            .get(&DataKey::UserPollStakeTotal(poll_id, staker.clone()))
+            .unwrap_or(0);
+        let new_total = current
+            .checked_add(amount)
+            .ok_or(PredictXError::InvalidAmount)?;
+        if max > 0 && new_total > max {
+            return Err(PredictXError::StakeLimitExceeded);
+        }
+        let result = staking::stake(&env, staker.clone(), poll_id, amount, side)?;
+        env.storage()
+            .persistent()
+            .set(&DataKey::UserPollStakeTotal(poll_id, staker.clone()), &new_total);
+        Ok(result)
+    }
+
+    /// Read the running cumulative stake total for a user on a poll.
+    pub fn get_user_poll_stake_total(env: Env, poll_id: u64, user: Address) -> i128 {
+        env.storage()
+            .persistent()
+            .get(&DataKey::UserPollStakeTotal(poll_id, user))
+            .unwrap_or(0)
     }
 
     pub fn get_stake_info(env: Env, poll_id: u64, user: Address) -> Result<Stake, PredictXError> {
