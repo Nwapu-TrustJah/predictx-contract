@@ -5,6 +5,28 @@ use predictx_shared::{
 };
 use crate::{DataKey, get_platform_stats, set_platform_stats, token_utils};
 
+/// Load a user's stats, defaulting to zeroed stats if none exist yet.
+fn get_user_stats(env: &Env, user: &Address) -> UserStats {
+    env.storage()
+        .persistent()
+        .get(&DataKey::UserStats(user.clone()))
+        .unwrap_or(UserStats {
+            user: user.clone(),
+            total_staked: 0,
+            total_won: 0,
+            total_lost: 0,
+            polls_participated: 0,
+            polls_won: 0,
+            polls_lost: 0,
+        })
+}
+
+fn set_user_stats(env: &Env, stats: &UserStats) {
+    env.storage()
+        .persistent()
+        .set(&DataKey::UserStats(stats.user.clone()), stats);
+}
+
 /// Resolve a poll using the configured admin and record its final outcome.
 pub fn resolve_poll(
     env: &Env,
@@ -66,13 +88,6 @@ pub fn resolve_poll(
 ///
 /// **This is the one place `NotOnWinningSide` must NOT be returned.**
 /// Returning it here would lock funds in the contract with no recovery path.
-///
-/// ## Stats accounting
-/// `UserStats.total_won` records **net profit** (payout minus the original
-/// stake), not gross payout.  A user who stakes 100 and receives 190 back
-/// gains 90 toward `total_won`, which is what makes win-rate and ROI numbers
-/// meaningful.  `total_lost` records the full stake for a losing position.
-/// Refunds on cancelled/empty-pool polls count as neither a win nor a loss.
 pub fn claim_winnings(
     env: &Env,
     claimant: Address,
@@ -112,7 +127,15 @@ pub fn claim_winnings(
     let winning_pool: i128 = if outcome_yes { poll.yes_pool } else { poll.no_pool };
     let total_pool: i128 = poll.yes_pool + poll.no_pool;
 
-    let mut is_refund: bool = false;
+    // Tracks whether this claim is a win, a loss, or a neutral refund so the
+    // user's stats can be updated after the transfer succeeds.
+    //
+    // `total_won` records NET PROFIT (payout minus the original stake), not the
+    // gross payout.  Recording gross would inflate win-rate/profit figures
+    // because the staker's own capital would be counted as winnings.
+    let mut is_win = false;
+    let mut is_loss = false;
+
     let payout: i128 = if winning_pool == 0 {
         // ── Empty winning-pool: full stake refund, no fee ─────────────────────
         //
@@ -122,7 +145,9 @@ pub fn claim_winnings(
         //
         // NOTE: we deliberately skip the `NotOnWinningSide` check here.
         // Returning that error would leave all funds permanently stranded.
-        is_refund = true;
+        //
+        // A refund on a cancelled/empty poll counts as neither a win nor a
+        // loss, so `is_win`/`is_loss` stay false.
         stake.amount
     } else {
         // ── Normal winning-side claim ─────────────────────────────────────────
@@ -133,8 +158,10 @@ pub fn claim_winnings(
         };
 
         if !staker_on_winning_side {
+            is_loss = true;
             return Err(PredictXError::NotOnWinningSide);
         }
+        is_win = true;
 
         // Proportional share of total pool, after platform fee.
         //
@@ -169,32 +196,27 @@ pub fn claim_winnings(
 
     token_utils::transfer_from_contract(env, &claimant, payout)?;
 
-    // ── Update user stats ─────────────────────────────────────────────────────
-    //
-    // Refunds (empty winning-pool path) count as neither a win nor a loss.
-    // A winning claim adds the *net profit* (payout - stake) to `total_won`
-    // and increments `polls_won`.  A losing position is unreachable here
-    // because `NotOnWinningSide` is returned above, so we only ever record
-    // wins and refunds on this path.
-    if !is_refund {
-        let mut user_stats: UserStats = env
-            .storage()
-            .persistent()
-            .get(&DataKey::UserStats(claimant.clone()))
-            .unwrap_or_default();
-        user_stats.polls_won += 1;
-        user_stats.total_won += payout - stake.amount;
-        env.storage()
-            .persistent()
-            .set(&DataKey::UserStats(claimant.clone()), &user_stats);
-    }
-
     // ── Update platform stats ─────────────────────────────────────────────────
 
     let mut stats = get_platform_stats(env);
     stats.total_value_locked = stats.total_value_locked.saturating_sub(payout);
     stats.total_payouts += payout;
     set_platform_stats(env, &stats);
+
+    // ── Update user stats ─────────────────────────────────────────────────────
+    //
+    // `total_won` is NET PROFIT: the payout minus the staker's original stake.
+    // `total_lost` records the full stake for a losing position.  Refunds on
+    // cancelled/empty polls touch neither counter.
+    let mut user_stats = get_user_stats(env, &claimant);
+    if is_win {
+        user_stats.polls_won += 1;
+        user_stats.total_won += payout - stake.amount;
+    } else if is_loss {
+        user_stats.polls_lost += 1;
+        user_stats.total_lost += stake.amount;
+    }
+    set_user_stats(env, &user_stats);
 
     // ── Emit event ────────────────────────────────────────────────────────────
 
@@ -204,30 +226,6 @@ pub fn claim_winnings(
     );
 
     Ok(payout)
-}
-
-/// Record a losing position's stake against the user's stats.
-///
-/// Called when a poll resolves against a staker.  The full stake is added to
-/// `total_lost` and `polls_lost` is incremented.  This is a separate helper
-/// because the current `claim_winnings` path rejects losers with
-/// `NotOnWinningSide`; a future "forfeit" or "settle loss" entry point can
-/// invoke this helper directly.
-pub fn record_loss(
-    env: &Env,
-    user: Address,
-    stake_amount: i128,
-) {
-    let mut user_stats: UserStats = env
-        .storage()
-        .persistent()
-        .get(&DataKey::UserStats(user.clone()))
-        .unwrap_or_default();
-    user_stats.polls_lost += 1;
-    user_stats.total_lost += stake_amount;
-    env.storage()
-        .persistent()
-        .set(&DataKey::UserStats(user.clone()), &user_stats);
 }
 
 /// Calculate a resolved poll's payout for a user without transferring tokens.

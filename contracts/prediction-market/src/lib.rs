@@ -43,7 +43,6 @@ pub enum DataKey {
     Stake(u64, Address),
     EmergencyClaimed(u64, Address),
     PlatformStats,
-    UserStats(Address),
     // ── match management keys ─────────────────────────────────────────────────
     Initialized,
     NextMatchId,
@@ -54,6 +53,7 @@ pub enum DataKey {
     Poll(u64),
     UserStakes(Address),
     HasStaked(u64, Address),
+    UserStats(Address),
 }
 
 /// Pool state returned by `get_pool_info`.
@@ -100,6 +100,33 @@ pub(crate) fn get_platform_stats(env: &Env) -> PlatformStats {
 
 pub(crate) fn set_platform_stats(env: &Env, stats: &PlatformStats) {
     env.storage().instance().set(&DataKey::PlatformStats, stats);
+}
+
+/// Per-user aggregate statistics.
+///
+/// `total_won` is NET PROFIT — the payout minus the original stake (i.e. the
+/// amount the user actually gained).  `total_lost` records the full stake of a
+/// losing position.  Refunds on cancelled polls touch neither field.
+#[contracttype]
+#[derive(Clone, Debug, Eq, PartialEq, Default)]
+pub struct UserStats {
+    pub total_won: i128,
+    pub total_lost: i128,
+    pub polls_won: u32,
+    pub polls_lost: u32,
+}
+
+pub(crate) fn get_user_stats(env: &Env, user: &Address) -> UserStats {
+    env.storage()
+        .persistent()
+        .get(&DataKey::UserStats(user.clone()))
+        .unwrap_or_default()
+}
+
+pub(crate) fn set_user_stats(env: &Env, user: &Address, stats: &UserStats) {
+    env.storage()
+        .persistent()
+        .set(&DataKey::UserStats(user.clone()), stats);
 }
 
 fn load_stake(env: &Env, poll_id: u64, user: &Address) -> Option<Stake> {
@@ -399,6 +426,10 @@ impl PredictionMarket {
 
     pub fn get_platform_stats(env: Env) -> PlatformStats {
         get_platform_stats(&env)
+    }
+
+    pub fn get_user_stats(env: Env, user: Address) -> UserStats {
+        get_user_stats(&env, &user)
     }
 
     // ── Token view functions ──────────────────────────────────────────────────
