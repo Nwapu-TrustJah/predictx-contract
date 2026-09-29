@@ -1,9 +1,10 @@
-use soroban_sdk::{Address, Env, Symbol, Vec};
-use predictx_shared::{
-    Poll, PollStatus, Stake, StakeSide, PredictXError,
-    MIN_STAKE_AMOUNT, BPS_DENOMINATOR,
+use crate::{
+    ensure_not_paused, get_platform_stats, set_platform_stats, token_utils, DataKey, PoolInfo,
 };
-use crate::{DataKey, PoolInfo, get_platform_stats, set_platform_stats, ensure_not_paused, token_utils};
+use predictx_shared::{
+    Poll, PollStatus, PredictXError, Stake, StakeSide, BPS_DENOMINATOR, MIN_STAKE_AMOUNT,
+};
+use soroban_sdk::{Address, Env, Symbol, Vec};
 
 // ── Stake placement ───────────────────────────────────────────────────────────
 
@@ -209,12 +210,12 @@ pub fn get_pool_info(env: &Env, poll_id: u64) -> Result<PoolInfo, PredictXError>
 mod test {
     extern crate std;
 
+    use crate::{DataKey, PredictionMarket, PredictionMarketClient};
+    use predictx_shared::{Poll, PollCategory, PollStatus, PredictXError, StakeSide};
     use soroban_sdk::{
         testutils::{Address as _, Ledger},
         token, Address, Env, String,
     };
-    use predictx_shared::{PollCategory, PollStatus, PredictXError, StakeSide, Poll};
-    use crate::{DataKey, PredictionMarket, PredictionMarketClient};
 
     // ── Helpers ───────────────────────────────────────────────────────────────
 
@@ -253,7 +254,14 @@ mod test {
         // Set ledger timestamp
         env.ledger().with_mut(|l| l.timestamp = 1_000_000);
 
-        TestSetup { env, admin, oracle_id, token_addr, contract_id, client }
+        TestSetup {
+            env,
+            admin,
+            oracle_id,
+            token_addr,
+            contract_id,
+            client,
+        }
     }
 
     /// Create a test match + poll with the given lock_time.  Returns poll_id.
@@ -326,10 +334,17 @@ mod test {
 
         // Manually set poll status to Locked
         s.env.as_contract(&s.contract_id, || {
-            let mut poll: Poll =
-                s.env.storage().persistent().get(&DataKey::Poll(poll_id)).unwrap();
+            let mut poll: Poll = s
+                .env
+                .storage()
+                .persistent()
+                .get(&DataKey::Poll(poll_id))
+                .unwrap();
             poll.status = PollStatus::Locked;
-            s.env.storage().persistent().set(&DataKey::Poll(poll_id), &poll);
+            s.env
+                .storage()
+                .persistent()
+                .set(&DataKey::Poll(poll_id), &poll);
         });
 
         let user = Address::generate(&s.env);
@@ -368,7 +383,8 @@ mod test {
         let user = Address::generate(&s.env);
         mint_tokens(&s, &user, 100_000_000);
 
-        s.client.stake(&user, &poll_id, &50_000_000_i128, &StakeSide::Yes);
+        s.client
+            .stake(&user, &poll_id, &50_000_000_i128, &StakeSide::Yes);
 
         let err = s
             .client
@@ -439,9 +455,24 @@ mod test {
         }
 
         // Two yes stakers, one no staker
-        s.client.stake(&users.get(0).unwrap(), &poll_id, &amounts[0], &StakeSide::Yes);
-        s.client.stake(&users.get(1).unwrap(), &poll_id, &amounts[1], &StakeSide::No);
-        s.client.stake(&users.get(2).unwrap(), &poll_id, &amounts[2], &StakeSide::Yes);
+        s.client.stake(
+            &users.get(0).unwrap(),
+            &poll_id,
+            &amounts[0],
+            &StakeSide::Yes,
+        );
+        s.client.stake(
+            &users.get(1).unwrap(),
+            &poll_id,
+            &amounts[1],
+            &StakeSide::No,
+        );
+        s.client.stake(
+            &users.get(2).unwrap(),
+            &poll_id,
+            &amounts[2],
+            &StakeSide::Yes,
+        );
 
         let pool = s.client.get_pool_info(&poll_id);
         assert_eq!(pool.yes_pool, amounts[0] + amounts[2]);
@@ -593,22 +624,21 @@ mod test {
         mint_tokens(&s, &yes_user, yes_amount);
         mint_tokens(&s, &no_user, no_amount);
 
-        s.client.stake(&yes_user, &poll_id, &yes_amount, &StakeSide::Yes);
-        s.client.stake(&no_user, &poll_id, &no_amount, &StakeSide::No);
+        s.client
+            .stake(&yes_user, &poll_id, &yes_amount, &StakeSide::Yes);
+        s.client
+            .stake(&no_user, &poll_id, &no_amount, &StakeSide::No);
 
         // Simulate a new 700-token yes stake (7_000_000_000 base units)
         let new_stake: i128 = 7_000_000_000;
-        let winnings = s.client.calculate_potential_winnings(
-            &poll_id,
-            &StakeSide::Yes,
-            &new_stake,
-        );
+        let winnings = s
+            .client
+            .calculate_potential_winnings(&poll_id, &StakeSide::Yes, &new_stake);
 
         // pool_on_side_after = 70B + 7B = 77B = 77_000_000_000
         // total_pool_after   = 77B + 30B = 107B = 107_000_000_000
         // winnings = 7B * 107B * 9500 / (77B * 10000)
-        let expected = new_stake * 107_000_000_000_i128 * 9500
-            / (77_000_000_000_i128 * 10_000);
+        let expected = new_stake * 107_000_000_000_i128 * 9500 / (77_000_000_000_i128 * 10_000);
         assert_eq!(winnings, expected);
         assert!(winnings > 0);
 
@@ -622,11 +652,9 @@ mod test {
         let poll_id = create_test_poll(&s, 2_000_000);
 
         let amount: i128 = 100_000_000;
-        let winnings = s.client.calculate_potential_winnings(
-            &poll_id,
-            &StakeSide::Yes,
-            &amount,
-        );
+        let winnings = s
+            .client
+            .calculate_potential_winnings(&poll_id, &StakeSide::Yes, &amount);
 
         // First staker: pool_on_side_after = amount, total_pool_after = amount
         // winnings = amount * amount * 9500 / (amount * 10000) = amount * 9500 / 10000
@@ -677,7 +705,11 @@ mod test {
     fn get_treasury_address_returns_stored_address() {
         let s = setup();
         let treasury: Address = s.env.as_contract(&s.contract_id, || {
-            s.env.storage().instance().get(&DataKey::TreasuryAddress).unwrap()
+            s.env
+                .storage()
+                .instance()
+                .get(&DataKey::TreasuryAddress)
+                .unwrap()
         });
         assert_eq!(s.client.get_treasury_address(), treasury);
     }
@@ -697,7 +729,8 @@ mod test {
         mint_tokens(&s, &user, deposit);
 
         let stake_amount: i128 = 150_000_000;
-        s.client.stake(&user, &poll_id, &stake_amount, &StakeSide::Yes);
+        s.client
+            .stake(&user, &poll_id, &stake_amount, &StakeSide::Yes);
 
         // User should have deposit - stake_amount left
         assert_eq!(token_balance(&s, &user), deposit - stake_amount);
@@ -716,7 +749,11 @@ mod test {
             let u = Address::generate(&s.env);
             let amt = base * i;
             mint_tokens(&s, &u, amt);
-            let side = if i % 2 == 0 { StakeSide::No } else { StakeSide::Yes };
+            let side = if i % 2 == 0 {
+                StakeSide::No
+            } else {
+                StakeSide::Yes
+            };
             s.client.stake(&u, &poll_id, &amt, &side);
             total += amt;
         }
