@@ -6,6 +6,8 @@ mod voting;
 use predictx_shared::{PollStatus, PredictXError, VoteChoice, VoteTally};
 use soroban_sdk::{contract, contractimpl, Address, Env, Vec};
 use storage::{get_admin, read_poll_status, read_poll_status_updated_at, DataKey, StoredPollStatus};
+use predictx_shared::{PollStatus, PredictXError, VoteChoice, VoteTally, VOTING_WINDOW_SECS};
+use soroban_sdk::{contract, contractimpl, contracttype, Address, Env, Vec};
 
 /// Maximum number of admins that may be registered at once.
 ///
@@ -16,6 +18,62 @@ pub const MAX_VOTERS: u32 = 64;
 
 #[contract]
 pub struct VotingOracle;
+
+#[contracttype]
+#[derive(Clone)]
+struct StoredPollStatus {
+    status: PollStatus,
+    updated_at: u64,
+}
+
+#[contracttype]
+#[derive(Clone)]
+enum DataKey {
+    Admin,
+    /// Registered admins `Vec<Address>`. (Instance)
+    AdminList,
+    PollStatus(u64),
+    /// `poll_id` → vote tally. (Temporary — only needed during the voting window)
+    VoteTally(u64),
+    /// `poll_id` → automatically resolved outcome.
+    PollOutcome(u64),
+    /// `poll_id` → persistent roster of voters who cast a vote.
+    Voters(u64),
+    /// `(poll_id, voter)` → `bool` — has this voter cast a vote? (Temporary)
+    HasVoted(u64, Address),
+    /// `(poll_id, voter)` → the choice the voter recorded. (Persistent)
+    VoterChoice(u64, Address),
+    /// `poll_id` → voter reward reserve (unclaimed incentive pool). (Persistent)
+    RewardPool(u64),
+    /// `(poll_id, voter)` → `i128` reward paid to an eligible voter. (Persistent)
+    VoterReward(u64, Address),
+    /// `(poll_id, voter)` → `bool` — has the voter claimed their reward? (Persistent)
+    RewardClaimed(u64, Address),
+}
+
+fn get_admin(env: &Env) -> Result<Address, PredictXError> {
+    env.storage()
+        .instance()
+        .get(&DataKey::Admin)
+        .ok_or(PredictXError::NotInitialized)
+}
+
+pub(crate) fn read_poll_status(env: &Env, poll_id: u64) -> PollStatus {
+    let stored: Option<StoredPollStatus> = env
+        .storage()
+        .persistent()
+        .get(&DataKey::PollStatus(poll_id));
+
+    stored.map(|s| s.status).unwrap_or(PollStatus::Active)
+}
+
+pub(crate) fn read_poll_status_updated_at(env: &Env, poll_id: u64) -> u64 {
+    env.storage()
+        .persistent()
+        .get::<DataKey, StoredPollStatus>(&DataKey::PollStatus(poll_id))
+        .map(|stored| stored.updated_at)
+        .unwrap_or(0)
+}
 
 #[contractimpl]
 impl VotingOracle {
@@ -139,6 +197,47 @@ impl VotingOracle {
         storage::read_voters(&env, poll_id)
     }
 
+    /// Returns whether `voter` has already voted on a known poll.
+    pub fn has_voted(env: Env, poll_id: u64, voter: Address) -> bool {
+        if !env
+            .storage()
+            .persistent()
+            .has(&DataKey::PollStatus(poll_id))
+        {
+            return false;
+        }
+
+        storage::has_voted(&env, poll_id, &voter)
+            || storage::read_voters(&env, poll_id).contains(voter)
+    }
+
+    /// Returns whether `voter` can cast a vote on `poll_id` right now.
+    ///
+    /// Unknown polls, polls outside the voting window, repeat voters, and polls
+    /// at the voter limit are ineligible. Staker exclusion is handled separately.
+    pub fn can_vote(env: Env, poll_id: u64, voter: Address) -> bool {
+        if !env
+            .storage()
+            .persistent()
+            .has(&DataKey::PollStatus(poll_id))
+            || read_poll_status(&env, poll_id) != PollStatus::Voting
+        {
+            return false;
+        }
+
+        let voting_end_time = read_poll_status_updated_at(&env, poll_id)
+            .checked_add(VOTING_WINDOW_SECS)
+            .unwrap_or(0);
+        if env.ledger().timestamp() >= voting_end_time
+            || Self::has_voted(env.clone(), poll_id, voter)
+            || storage::read_voters(&env, poll_id).len() >= MAX_VOTERS
+        {
+            return false;
+        }
+
+        true
+    }
+
     /// Record a voter's choice on a poll.
     pub fn cast_vote(
         env: Env,
@@ -158,6 +257,43 @@ impl VotingOracle {
             .persistent()
             .get(&DataKey::PollOutcome(poll_id))
             .ok_or(PredictXError::PollNotFound)
+    }
+
+    /// Set (fund) the voter reward reserve for `poll_id`. Admin only.
+    ///
+    /// The policy for how large the reserve should be is deliberately out of
+    /// scope here; this only records the amount that `claim_reward` divides
+    /// among the eligible (winning) voters.
+    pub fn set_reward_pool(
+        env: Env,
+        caller: Address,
+        poll_id: u64,
+        amount: i128,
+    ) -> Result<(), PredictXError> {
+        voting::set_reward_pool(&env, caller, poll_id, amount)
+    }
+
+    /// Claim the caller's voter reward for `poll_id`.
+    ///
+    /// Only voters who backed the resolved winning outcome may claim; the pool
+    /// is split evenly across those eligible voters.
+    pub fn claim_reward(env: Env, voter: Address, poll_id: u64) -> Result<i128, PredictXError> {
+        voting::claim_reward(&env, voter, poll_id)
+    }
+
+    /// The choice `voter` recorded on `poll_id`, if they voted.
+    pub fn get_voter_choice(env: Env, poll_id: u64, voter: Address) -> Option<VoteChoice> {
+        storage::read_vote_choice(&env, poll_id, &voter)
+    }
+
+    /// The voter reward reserve set for `poll_id` (0 when unset).
+    pub fn get_reward_pool(env: Env, poll_id: u64) -> i128 {
+        storage::read_reward_pool(&env, poll_id)
+    }
+
+    /// Whether `voter` has already claimed their `poll_id` reward.
+    pub fn has_claimed_reward(env: Env, poll_id: u64, voter: Address) -> bool {
+        storage::has_claimed_reward(&env, poll_id, &voter)
     }
 }
 
@@ -182,6 +318,44 @@ mod test {
 
         client.set_poll_status(&42_u64, &PollStatus::Resolved);
         assert_eq!(client.get_poll_status(&42_u64), PollStatus::Resolved);
+    }
+
+    #[test]
+    fn voting_views_return_false_for_unknown_poll() {
+        let (env, _admin, client) = setup();
+        let voter = Address::generate(&env);
+
+        assert!(!client.has_voted(&99_u64, &voter));
+        assert!(!client.can_vote(&99_u64, &voter));
+    }
+
+    #[test]
+    fn voting_views_track_vote_and_duplicate_eligibility() {
+        let (env, _admin, client) = setup();
+        let voter = Address::generate(&env);
+        client.set_poll_status(&1_u64, &PollStatus::Voting);
+
+        assert!(!client.has_voted(&1_u64, &voter));
+        assert!(client.can_vote(&1_u64, &voter));
+
+        client.cast_vote(&voter, &1_u64, &VoteChoice::Yes);
+
+        assert!(client.has_voted(&1_u64, &voter));
+        assert!(!client.can_vote(&1_u64, &voter));
+    }
+
+    #[test]
+    fn can_vote_rejects_unopened_and_expired_polls() {
+        let (env, _admin, client) = setup();
+        let voter = Address::generate(&env);
+
+        client.set_poll_status(&2_u64, &PollStatus::Active);
+        assert!(!client.can_vote(&2_u64, &voter));
+
+        client.set_poll_status(&3_u64, &PollStatus::Voting);
+        env.ledger()
+            .with_mut(|ledger| ledger.timestamp += VOTING_WINDOW_SECS);
+        assert!(!client.can_vote(&3_u64, &voter));
     }
 
     fn setup() -> (Env, Address, VotingOracleClient<'static>) {
