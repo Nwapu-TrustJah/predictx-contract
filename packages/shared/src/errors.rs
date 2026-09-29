@@ -46,7 +46,7 @@ pub enum PredictXError {
     DisputeFeeRequired = 20,
     /// Poll category value is invalid.
     InvalidPollCategory = 21,
-    /// Lock/kickoff time must be in the future.
+    /// Lock/kickoff time must be in the future and not after the match kickoff.
     InvalidLockTime = 22,
     /// Match does not exist.
     MatchNotFound = 23,
