@@ -37,7 +37,7 @@ fn get_balance(env: &Env, who: &Address) -> i128 {
         .unwrap_or(0_i128)
 }
 
-fn is_paused_internal(env: &Env) -> bool {
+fn is_paused(env: &Env) -> bool {
     env.storage()
         .instance()
         .get(&DataKey::Paused)
@@ -60,12 +60,12 @@ impl Treasury {
         get_admin(&env)
     }
 
-    /// Returns whether the treasury is currently paused.
-    pub fn is_paused(env: Env) -> bool {
-        is_paused_internal(&env)
+    /// Returns the registered market address, if set.
+    pub fn market(env: Env) -> Result<Address, PredictXError> {
+        get_market(&env)
     }
 
-    /// Admin-gated pause of value-moving entry points.
+    /// Admin-gated pause of value-moving treasury operations.
     pub fn pause(env: Env, admin: Address) -> Result<(), PredictXError> {
         let stored_admin = get_admin(&env)?;
         if admin != stored_admin {
@@ -76,7 +76,7 @@ impl Treasury {
         Ok(())
     }
 
-    /// Admin-gated unpause of value-moving entry points.
+    /// Admin-gated unpause of value-moving treasury operations.
     pub fn unpause(env: Env, admin: Address) -> Result<(), PredictXError> {
         let stored_admin = get_admin(&env)?;
         if admin != stored_admin {
@@ -87,9 +87,9 @@ impl Treasury {
         Ok(())
     }
 
-    /// Returns the registered market address, if set.
-    pub fn market(env: Env) -> Result<Address, PredictXError> {
-        get_market(&env)
+    /// Returns whether the treasury is currently paused.
+    pub fn is_paused(env: Env) -> bool {
+        is_paused(&env)
     }
 
     /// Admin-gated setter for the registered market address.
@@ -127,7 +127,7 @@ impl Treasury {
         if amount <= 0 {
             return Err(PredictXError::StakeAmountZero);
         }
-        if is_paused_internal(&env) {
+        if is_paused(&env) {
             return Err(PredictXError::ContractPaused);
         }
         if !env.storage().instance().has(&DataKey::Admin) {
@@ -149,7 +149,7 @@ impl Treasury {
         if amount <= 0 {
             return Err(PredictXError::StakeAmountZero);
         }
-        if is_paused_internal(&env) {
+        if is_paused(&env) {
             return Err(PredictXError::ContractPaused);
         }
         if !env.storage().instance().has(&DataKey::Admin) {
@@ -183,7 +183,7 @@ impl Treasury {
         }
         admin.require_auth();
 
-        if is_paused_internal(&env) {
+        if is_paused(&env) {
             return Err(PredictXError::ContractPaused);
         }
 
@@ -361,39 +361,26 @@ mod test {
         assert_eq!(token_client.balance(&contract_id), 175_i128);
     }
 
-    // ── pause / unpause tests ──────────────────────────────────────────────
-
     #[test]
     fn pause_blocks_deposits_and_withdrawals() {
         let (env, contract_id, client, admin, token_address) = setup();
         let user = Address::generate(&env);
         let recipient = Address::generate(&env);
         let asset = token::StellarAssetClient::new(&env, &token_address);
-        asset.mint(&contract_id, &100_i128);
+        asset.mint(&contract_id, &250_i128);
 
         client.pause(&admin);
         assert!(client.is_paused());
 
         let err = client
             .try_deposit(&user, &10_i128)
-            .expect_err("deposit must be blocked while paused");
+            .expect_err("deposits must be blocked while paused");
         assert_eq!(err, Ok(PredictXError::ContractPaused));
 
         let err = client
             .try_withdraw_fees(&admin, &recipient, &10_i128)
-            .expect_err("withdrawal must be blocked while paused");
+            .expect_err("withdrawals must be blocked while paused");
         assert_eq!(err, Ok(PredictXError::ContractPaused));
-    }
-
-    #[test]
-    fn unpause_restores_deposits_and_views_still_work() {
-        let (env, _, client, admin, _) = setup();
-        let user = Address::generate(&env);
-
-        client.pause(&admin);
-        assert!(client.is_paused());
-        assert_eq!(client.balance(&user), 0_i128);
-        assert_eq!(client.admin(), admin);
 
         client.unpause(&admin);
         assert!(!client.is_paused());
@@ -401,7 +388,7 @@ mod test {
     }
 
     #[test]
-    fn pause_rejects_non_admin() {
+    fn pause_only_callable_by_admin() {
         let (env, _, client, _, _) = setup();
         let non_admin = Address::generate(&env);
 
@@ -414,5 +401,17 @@ mod test {
             .try_unpause(&non_admin)
             .expect_err("non-admin unpause must be rejected");
         assert_eq!(err, Ok(PredictXError::Unauthorized));
+    }
+
+    #[test]
+    fn read_only_views_work_while_paused() {
+        let (env, _, client, admin, _) = setup();
+        let user = Address::generate(&env);
+        client.deposit(&user, &42_i128);
+
+        client.pause(&admin);
+        assert!(client.is_paused());
+        assert_eq!(client.balance(&user), 42_i128);
+        assert_eq!(client.admin(), admin);
     }
 }
