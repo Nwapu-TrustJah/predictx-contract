@@ -1,6 +1,6 @@
 use soroban_sdk::{Address, Env, Symbol};
 use predictx_shared::{
-    Poll, PollStatus, Stake, StakeSide, PredictXError,
+    Poll, PollStatus, Stake, StakeSide, PredictXError, UserStats,
     BPS_DENOMINATOR,
 };
 use crate::{DataKey, get_platform_stats, set_platform_stats, token_utils};
@@ -66,6 +66,15 @@ pub fn resolve_poll(
 ///
 /// **This is the one place `NotOnWinningSide` must NOT be returned.**
 /// Returning it here would lock funds in the contract with no recovery path.
+///
+/// ## User stats
+/// On a successful claim we update the claimant's `UserStats`:
+/// - Winning claim (normal path): `polls_won += 1`, `total_won += net_profit`
+///   where `net_profit = payout - stake.amount` (i.e. `total_won` is **net
+///   profit**, not gross payout — this is the number that makes win-rate
+///   meaningful).
+/// - Losing position: `polls_lost += 1`, `total_lost += stake.amount`.
+/// - Refund on a cancelled/empty-winning-pool poll: neither counter moves.
 pub fn claim_winnings(
     env: &Env,
     claimant: Address,
@@ -159,6 +168,33 @@ pub fn claim_winnings(
     // ── Transfer payout to claimant ───────────────────────────────────────────
 
     token_utils::transfer_from_contract(env, &claimant, payout)?;
+
+    // ── Update user stats ─────────────────────────────────────────────────────
+    //
+    // `total_won` records **net profit** (payout minus original stake), not
+    // gross payout.  Recording gross would inflate win-rate and misrepresent
+    // how much a user actually gained.
+    //
+    // A refund (empty winning-pool path) counts as neither a win nor a loss:
+    // the user got their money back, so their record should not change.
+    let is_refund = winning_pool == 0;
+    if !is_refund {
+        let mut user_stats: UserStats = env
+            .storage()
+            .persistent()
+            .get(&DataKey::UserStats(claimant.clone()))
+            .unwrap_or(UserStats {
+                total_won: 0,
+                total_lost: 0,
+                polls_won: 0,
+                polls_lost: 0,
+            });
+        user_stats.polls_won += 1;
+        user_stats.total_won += payout - stake.amount;
+        env.storage()
+            .persistent()
+            .set(&DataKey::UserStats(claimant.clone()), &user_stats);
+    }
 
     // ── Update platform stats ─────────────────────────────────────────────────
 

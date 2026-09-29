@@ -1,6 +1,7 @@
 #![no_std]
 
 mod matches;
+mod payouts;
 mod staking;
 pub(crate) mod token_utils;
 
@@ -52,6 +53,7 @@ pub enum DataKey {
     Poll(u64),
     UserStakes(Address),
     HasStaked(u64, Address),
+    UserStats(Address),
 }
 
 /// Pool state returned by `get_pool_info`.
@@ -62,6 +64,20 @@ pub struct PoolInfo {
     pub no_pool: i128,
     pub yes_count: u32,
     pub no_count: u32,
+}
+
+/// Per-user statistics tracked by the prediction market.
+///
+/// `total_won` is recorded as **net profit** (payout minus the original
+/// stake), not gross payout. `total_lost` records the full stake of a
+/// losing position. Refunds on cancelled polls update neither field.
+#[contracttype]
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct UserStats {
+    pub total_won: i128,
+    pub total_lost: i128,
+    pub polls_won: u32,
+    pub polls_lost: u32,
 }
 
 fn get_admin(env: &Env) -> Result<Address, PredictXError> {
@@ -98,6 +114,20 @@ pub(crate) fn get_platform_stats(env: &Env) -> PlatformStats {
 
 pub(crate) fn set_platform_stats(env: &Env, stats: &PlatformStats) {
     env.storage().instance().set(&DataKey::PlatformStats, stats);
+}
+
+pub(crate) fn get_user_stats(env: &Env, user: &Address) -> UserStats {
+    env.storage().persistent().get(&DataKey::UserStats(user.clone()))
+        .unwrap_or(UserStats {
+            total_won: 0,
+            total_lost: 0,
+            polls_won: 0,
+            polls_lost: 0,
+        })
+}
+
+pub(crate) fn set_user_stats(env: &Env, user: &Address, stats: &UserStats) {
+    env.storage().persistent().set(&DataKey::UserStats(user.clone()), stats);
 }
 
 fn load_stake(env: &Env, poll_id: u64, user: &Address) -> Option<Stake> {
@@ -397,6 +427,10 @@ impl PredictionMarket {
 
     pub fn get_platform_stats(env: Env) -> PlatformStats {
         get_platform_stats(&env)
+    }
+
+    pub fn get_user_stats(env: Env, user: Address) -> UserStats {
+        get_user_stats(&env, &user)
     }
 
     // ── Token view functions ──────────────────────────────────────────────────
