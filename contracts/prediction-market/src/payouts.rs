@@ -67,14 +67,12 @@ pub fn resolve_poll(
 /// **This is the one place `NotOnWinningSide` must NOT be returned.**
 /// Returning it here would lock funds in the contract with no recovery path.
 ///
-/// ## User stats
-/// On a successful claim we update the claimant's `UserStats`:
-/// - Winning claim (normal path): `polls_won += 1`, `total_won += net_profit`
-///   where `net_profit = payout - stake.amount` (i.e. `total_won` is **net
-///   profit**, not gross payout — this is the number that makes win-rate
-///   meaningful).
-/// - Losing position: `polls_lost += 1`, `total_lost += stake.amount`.
-/// - Refund on a cancelled/empty-winning-pool poll: neither counter moves.
+/// ## Stats accounting
+/// `UserStats.total_won` records **net profit** (payout minus the original
+/// stake), not gross payout.  A user who stakes 100 and receives 190 back
+/// gains 90 toward `total_won`, which is what makes win-rate and ROI numbers
+/// meaningful.  `total_lost` records the full stake for a losing position.
+/// Refunds on cancelled/empty-pool polls count as neither a win nor a loss.
 pub fn claim_winnings(
     env: &Env,
     claimant: Address,
@@ -114,6 +112,7 @@ pub fn claim_winnings(
     let winning_pool: i128 = if outcome_yes { poll.yes_pool } else { poll.no_pool };
     let total_pool: i128 = poll.yes_pool + poll.no_pool;
 
+    let mut is_refund: bool = false;
     let payout: i128 = if winning_pool == 0 {
         // ── Empty winning-pool: full stake refund, no fee ─────────────────────
         //
@@ -123,6 +122,7 @@ pub fn claim_winnings(
         //
         // NOTE: we deliberately skip the `NotOnWinningSide` check here.
         // Returning that error would leave all funds permanently stranded.
+        is_refund = true;
         stake.amount
     } else {
         // ── Normal winning-side claim ─────────────────────────────────────────
@@ -171,24 +171,17 @@ pub fn claim_winnings(
 
     // ── Update user stats ─────────────────────────────────────────────────────
     //
-    // `total_won` records **net profit** (payout minus original stake), not
-    // gross payout.  Recording gross would inflate win-rate and misrepresent
-    // how much a user actually gained.
-    //
-    // A refund (empty winning-pool path) counts as neither a win nor a loss:
-    // the user got their money back, so their record should not change.
-    let is_refund = winning_pool == 0;
+    // Refunds (empty winning-pool path) count as neither a win nor a loss.
+    // A winning claim adds the *net profit* (payout - stake) to `total_won`
+    // and increments `polls_won`.  A losing position is unreachable here
+    // because `NotOnWinningSide` is returned above, so we only ever record
+    // wins and refunds on this path.
     if !is_refund {
         let mut user_stats: UserStats = env
             .storage()
             .persistent()
             .get(&DataKey::UserStats(claimant.clone()))
-            .unwrap_or(UserStats {
-                total_won: 0,
-                total_lost: 0,
-                polls_won: 0,
-                polls_lost: 0,
-            });
+            .unwrap_or_default();
         user_stats.polls_won += 1;
         user_stats.total_won += payout - stake.amount;
         env.storage()
@@ -211,6 +204,30 @@ pub fn claim_winnings(
     );
 
     Ok(payout)
+}
+
+/// Record a losing position's stake against the user's stats.
+///
+/// Called when a poll resolves against a staker.  The full stake is added to
+/// `total_lost` and `polls_lost` is incremented.  This is a separate helper
+/// because the current `claim_winnings` path rejects losers with
+/// `NotOnWinningSide`; a future "forfeit" or "settle loss" entry point can
+/// invoke this helper directly.
+pub fn record_loss(
+    env: &Env,
+    user: Address,
+    stake_amount: i128,
+) {
+    let mut user_stats: UserStats = env
+        .storage()
+        .persistent()
+        .get(&DataKey::UserStats(user.clone()))
+        .unwrap_or_default();
+    user_stats.polls_lost += 1;
+    user_stats.total_lost += stake_amount;
+    env.storage()
+        .persistent()
+        .set(&DataKey::UserStats(user.clone()), &user_stats);
 }
 
 /// Calculate a resolved poll's payout for a user without transferring tokens.
