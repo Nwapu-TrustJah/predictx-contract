@@ -68,7 +68,9 @@ pub enum PredictXError {
     EmergencyWithdrawNotAllowed = 31,
     /// Token transfer failed.
     TransferFailed = 32,
-    /// Contract is paused — value-moving entry points are blocked.
+    /// Contract is paused.
+    ContractPaused = 33,
+    /// Contract is paused.
     ContractPaused = 33,
     /// Stake amount is below the minimum required.
     StakeBelowMinimum = 34,

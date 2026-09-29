@@ -37,7 +37,7 @@ fn get_balance(env: &Env, who: &Address) -> i128 {
         .unwrap_or(0_i128)
 }
 
-fn is_paused(env: &Env) -> bool {
+fn is_paused_internal(env: &Env) -> bool {
     env.storage()
         .instance()
         .get(&DataKey::Paused)
@@ -60,6 +60,11 @@ impl Treasury {
         get_admin(&env)
     }
 
+    /// Returns whether the treasury is currently paused.
+    pub fn is_paused(env: Env) -> bool {
+        is_paused_internal(&env)
+    }
+
     /// Admin-gated pause of value-moving entry points.
     pub fn pause(env: Env, admin: Address) -> Result<(), PredictXError> {
         let stored_admin = get_admin(&env)?;
@@ -80,11 +85,6 @@ impl Treasury {
         admin.require_auth();
         env.storage().instance().set(&DataKey::Paused, &false);
         Ok(())
-    }
-
-    /// Read-only view of the pause flag.
-    pub fn is_paused(env: Env) -> bool {
-        is_paused(&env)
     }
 
     /// Returns the registered market address, if set.
@@ -127,11 +127,11 @@ impl Treasury {
         if amount <= 0 {
             return Err(PredictXError::StakeAmountZero);
         }
+        if is_paused_internal(&env) {
+            return Err(PredictXError::ContractPaused);
+        }
         if !env.storage().instance().has(&DataKey::Admin) {
             return Err(PredictXError::NotInitialized);
-        }
-        if is_paused(&env) {
-            return Err(PredictXError::ContractPaused);
         }
         from.require_auth();
 
@@ -149,11 +149,11 @@ impl Treasury {
         if amount <= 0 {
             return Err(PredictXError::StakeAmountZero);
         }
+        if is_paused_internal(&env) {
+            return Err(PredictXError::ContractPaused);
+        }
         if !env.storage().instance().has(&DataKey::Admin) {
             return Err(PredictXError::NotInitialized);
-        }
-        if is_paused(&env) {
-            return Err(PredictXError::ContractPaused);
         }
 
         let registered_market = get_market(&env)?;
@@ -183,7 +183,7 @@ impl Treasury {
         }
         admin.require_auth();
 
-        if is_paused(&env) {
+        if is_paused_internal(&env) {
             return Err(PredictXError::ContractPaused);
         }
 
@@ -359,5 +359,60 @@ mod test {
 
         assert_eq!(token_client.balance(&recipient), 75_i128);
         assert_eq!(token_client.balance(&contract_id), 175_i128);
+    }
+
+    // ── pause / unpause tests ──────────────────────────────────────────────
+
+    #[test]
+    fn pause_blocks_deposits_and_withdrawals() {
+        let (env, contract_id, client, admin, token_address) = setup();
+        let user = Address::generate(&env);
+        let recipient = Address::generate(&env);
+        let asset = token::StellarAssetClient::new(&env, &token_address);
+        asset.mint(&contract_id, &100_i128);
+
+        client.pause(&admin);
+        assert!(client.is_paused());
+
+        let err = client
+            .try_deposit(&user, &10_i128)
+            .expect_err("deposit must be blocked while paused");
+        assert_eq!(err, Ok(PredictXError::ContractPaused));
+
+        let err = client
+            .try_withdraw_fees(&admin, &recipient, &10_i128)
+            .expect_err("withdrawal must be blocked while paused");
+        assert_eq!(err, Ok(PredictXError::ContractPaused));
+    }
+
+    #[test]
+    fn unpause_restores_deposits_and_views_still_work() {
+        let (env, _, client, admin, _) = setup();
+        let user = Address::generate(&env);
+
+        client.pause(&admin);
+        assert!(client.is_paused());
+        assert_eq!(client.balance(&user), 0_i128);
+        assert_eq!(client.admin(), admin);
+
+        client.unpause(&admin);
+        assert!(!client.is_paused());
+        assert_eq!(client.deposit(&user, &10_i128), 10_i128);
+    }
+
+    #[test]
+    fn pause_rejects_non_admin() {
+        let (env, _, client, _, _) = setup();
+        let non_admin = Address::generate(&env);
+
+        let err = client
+            .try_pause(&non_admin)
+            .expect_err("non-admin pause must be rejected");
+        assert_eq!(err, Ok(PredictXError::Unauthorized));
+
+        let err = client
+            .try_unpause(&non_admin)
+            .expect_err("non-admin unpause must be rejected");
+        assert_eq!(err, Ok(PredictXError::Unauthorized));
     }
 }
