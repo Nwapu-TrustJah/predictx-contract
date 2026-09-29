@@ -80,4 +80,6 @@ pub enum PredictXError {
     OutcomeNotAvailable = 37,
     /// The reward amount must not be negative.
     InvalidRewardAmount = 38,
+    /// The token address cannot be changed while the contract holds a balance.
+    ContractBalanceNotZero = 39,
 }

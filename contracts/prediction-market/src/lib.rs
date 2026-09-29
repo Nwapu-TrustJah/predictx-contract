@@ -153,6 +153,57 @@ impl PredictionMarket {
         Ok(())
     }
 
+    /// Point the platform-fee sink at a new treasury address.
+    ///
+    /// Admin-gated, and safe to call at any time: it only redirects *future*
+    /// distributions, it never moves tokens. `set_oracle` is the same shape,
+    /// except the admin is passed explicitly so an unauthorised caller is
+    /// rejected outright rather than relying on `require_auth` against the
+    /// stored address.
+    pub fn set_treasury_address(
+        env: Env,
+        admin: Address,
+        treasury_address: Address,
+    ) -> Result<(), PredictXError> {
+        ensure_not_paused(&env)?;
+        let stored_admin = get_admin(&env)?;
+        if admin != stored_admin {
+            return Err(PredictXError::Unauthorized);
+        }
+        admin.require_auth();
+        env.storage()
+            .instance()
+            .set(&DataKey::TreasuryAddress, &treasury_address);
+        Ok(())
+    }
+
+    /// Point the market at a new stake/payout token.
+    ///
+    /// Admin-gated, and refused while the contract still holds a balance of the
+    /// current token: swapping the token out from under live stakes would
+    /// strand every staker's funds, since the contract would no longer be able
+    /// to transfer the old token out. Existing balances must be drained (or
+    /// claimed) first.
+    pub fn set_token_address(
+        env: Env,
+        admin: Address,
+        token_address: Address,
+    ) -> Result<(), PredictXError> {
+        ensure_not_paused(&env)?;
+        let stored_admin = get_admin(&env)?;
+        if admin != stored_admin {
+            return Err(PredictXError::Unauthorized);
+        }
+        admin.require_auth();
+        if token_utils::get_balance(&env)? != 0 {
+            return Err(PredictXError::ContractBalanceNotZero);
+        }
+        env.storage()
+            .instance()
+            .set(&DataKey::TokenAddress, &token_address);
+        Ok(())
+    }
+
     pub fn pause(env: Env, admin: Address) -> Result<(), PredictXError> {
         let stored_admin = get_admin(&env)?;
         if admin != stored_admin { return Err(PredictXError::Unauthorized); }
@@ -816,6 +867,183 @@ mod test {
         client.resolve_poll(&oracle, &3_u64, &false);
         let err = client.try_resolve_poll(&oracle, &3_u64, &true).expect_err("already");
         assert_eq!(err, Ok(PredictXError::PollAlreadyResolved));
+    }
+
+    // ── Admin address setters (issue #137) ────────────────────────────────────
+
+    struct SetterSetup {
+        env: Env,
+        admin: Address,
+        token: Address,
+        treasury: Address,
+        contract_id: Address,
+        client: PredictionMarketClient<'static>,
+    }
+
+    /// Initialise the market with a real Stellar-asset token and a distinct
+    /// treasury address, so setter behaviour can be observed end to end.
+    fn setup_setter_env() -> SetterSetup {
+        let env = Env::default();
+        env.mock_all_auths();
+        env.ledger().set_timestamp(1_000_000);
+
+        let admin = Address::generate(&env);
+        let oracle = Address::generate(&env);
+        let treasury = Address::generate(&env);
+        let token = deploy_token(&env);
+
+        let contract_id = env.register(PredictionMarket, ());
+        let client = PredictionMarketClient::new(&env, &contract_id);
+        client.initialize(&admin, &oracle, &token, &treasury, &TEST_FEE_BPS);
+
+        SetterSetup { env, admin, token, treasury, contract_id, client }
+    }
+
+    /// Deploy a fresh Stellar-asset contract and return its address.
+    fn deploy_token(env: &Env) -> Address {
+        env.register_stellar_asset_contract_v2(Address::generate(env)).address()
+    }
+
+    fn mint(env: &Env, token_addr: &Address, to: &Address, amount: i128) {
+        token::StellarAssetClient::new(env, token_addr).mint(to, &amount);
+    }
+
+    /// Register a match (kickoff at `2_000_000`) and an active poll on it.
+    fn create_poll_for(s: &SetterSetup, lock_time: u64) -> u64 {
+        let match_id = s.client.create_match(
+            &s.admin,
+            &String::from_str(&s.env, "Arsenal"),
+            &String::from_str(&s.env, "Chelsea"),
+            &String::from_str(&s.env, "Premier League"),
+            &String::from_str(&s.env, "Emirates"),
+            &2_000_000,
+        );
+        s.client.create_poll(
+            &s.admin,
+            &match_id,
+            &String::from_str(&s.env, "Will Arsenal win?"),
+            &PollCategory::TeamEvent,
+            &lock_time,
+        )
+    }
+
+    #[test]
+    fn address_setters_reject_non_admin_callers() {
+        let s = setup_setter_env();
+        let stranger = Address::generate(&s.env);
+
+        let err = s
+            .client
+            .try_set_treasury_address(&stranger, &Address::generate(&s.env))
+            .unwrap_err()
+            .unwrap();
+        assert_eq!(err, PredictXError::Unauthorized);
+
+        let err = s
+            .client
+            .try_set_token_address(&stranger, &deploy_token(&s.env))
+            .unwrap_err()
+            .unwrap();
+        assert_eq!(err, PredictXError::Unauthorized);
+    }
+
+    #[test]
+    fn set_token_address_rejected_while_contract_holds_balance() {
+        let s = setup_setter_env();
+        let poll_id = create_poll_for(&s, 1_500_000);
+
+        let staker = Address::generate(&s.env);
+        let amount: i128 = 100_000_000;
+        mint(&s.env, &s.token, &staker, amount);
+        s.client.stake(&staker, &poll_id, &amount, &StakeSide::Yes);
+        assert_eq!(s.client.get_contract_balance(), amount);
+
+        let err = s
+            .client
+            .try_set_token_address(&s.admin, &deploy_token(&s.env))
+            .unwrap_err()
+            .unwrap();
+        assert_eq!(err, PredictXError::ContractBalanceNotZero);
+
+        // The stored token is left untouched.
+        assert_eq!(s.client.get_token_address(), s.token);
+    }
+
+    #[test]
+    fn set_token_address_is_used_by_subsequent_transfers() {
+        let s = setup_setter_env();
+        let replacement = deploy_token(&s.env);
+
+        s.client.set_token_address(&s.admin, &replacement);
+        assert_eq!(s.client.get_token_address(), replacement);
+
+        let poll_id = create_poll_for(&s, 1_500_000);
+        let staker = Address::generate(&s.env);
+        let amount: i128 = 50_000_000;
+        mint(&s.env, &replacement, &staker, amount);
+        s.client.stake(&staker, &poll_id, &amount, &StakeSide::Yes);
+
+        // The stake was pulled in the *new* token, not the old one.
+        assert_eq!(s.client.get_contract_balance(), amount);
+        assert_eq!(token::Client::new(&s.env, &s.token).balance(&s.contract_id), 0);
+    }
+
+    #[test]
+    fn set_treasury_address_is_used_by_subsequent_transfers() {
+        let s = setup_setter_env();
+        let new_treasury = Address::generate(&s.env);
+        s.client.set_treasury_address(&s.admin, &new_treasury);
+        assert_eq!(s.client.get_treasury_address(), new_treasury);
+
+        // Seed a resolved poll with one winning staker so the claim path routes
+        // the platform fee to whichever treasury is stored at that moment.
+        let poll_id: u64 = 900;
+        let yes_pool: i128 = 100_000_000;
+        let no_pool: i128 = 100_000_000;
+        let winner = Address::generate(&s.env);
+        mint(&s.env, &s.token, &s.contract_id, yes_pool + no_pool);
+
+        s.env.as_contract(&s.contract_id, || {
+            let poll = Poll {
+                poll_id,
+                match_id: 1,
+                creator: s.admin.clone(),
+                question: String::from_str(&s.env, "Will Arsenal win?"),
+                category: PollCategory::TeamEvent,
+                lock_time: 1_500_000,
+                yes_pool,
+                no_pool,
+                yes_count: 1,
+                no_count: 1,
+                status: PollStatus::Resolved,
+                outcome: Some(true),
+                resolution_time: 1_900_000,
+                created_at: 1_400_000,
+            };
+            s.env.storage().persistent().set(&DataKey::Poll(poll_id), &poll);
+
+            let stake = Stake {
+                user: winner.clone(),
+                poll_id,
+                amount: yes_pool,
+                side: StakeSide::Yes,
+                claimed: false,
+                staked_at: 1_400_000,
+            };
+            s.env
+                .storage()
+                .persistent()
+                .set(&DataKey::Stake(poll_id, winner.clone()), &stake);
+        });
+
+        // gross = 100M * 200M / 100M = 200M; net = 200M * 9500 / 10000 = 190M,
+        // so the platform fee is the remaining 10M.
+        let payout = s.client.claim_winnings(&winner, &poll_id);
+        assert_eq!(payout, 190_000_000);
+
+        let tok = token::Client::new(&s.env, &s.token);
+        assert_eq!(tok.balance(&new_treasury), 10_000_000);
+        assert_eq!(tok.balance(&s.treasury), 0);
     }
 
 }
