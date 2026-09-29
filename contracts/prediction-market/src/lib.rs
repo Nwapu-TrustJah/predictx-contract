@@ -1,13 +1,12 @@
 #![no_std]
 
 mod matches;
-mod payouts;
 mod staking;
 pub(crate) mod token_utils;
 
 use predictx_shared::{
     Match, PlatformStats, Poll, PollCategory, PollStatus, PredictXError, Stake, StakeSide,
-    MAX_POLLS_PER_MATCH,
+    UserStats, MAX_POLLS_PER_MATCH,
 };
 use soroban_sdk::{contract, contractimpl, contracttype, Address, Env, String, Symbol, Vec};
 
@@ -102,25 +101,20 @@ pub(crate) fn set_platform_stats(env: &Env, stats: &PlatformStats) {
     env.storage().instance().set(&DataKey::PlatformStats, stats);
 }
 
-/// Per-user aggregate statistics.
-///
-/// `total_won` is NET PROFIT — the payout minus the original stake (i.e. the
-/// amount the user actually gained).  `total_lost` records the full stake of a
-/// losing position.  Refunds on cancelled polls touch neither field.
-#[contracttype]
-#[derive(Clone, Debug, Eq, PartialEq, Default)]
-pub struct UserStats {
-    pub total_won: i128,
-    pub total_lost: i128,
-    pub polls_won: u32,
-    pub polls_lost: u32,
+fn load_stake(env: &Env, poll_id: u64, user: &Address) -> Option<Stake> {
+    env.storage().persistent().get(&DataKey::Stake(poll_id, user.clone()))
 }
 
 pub(crate) fn get_user_stats(env: &Env, user: &Address) -> UserStats {
     env.storage()
         .persistent()
         .get(&DataKey::UserStats(user.clone()))
-        .unwrap_or_default()
+        .unwrap_or(UserStats {
+            total_won: 0,
+            total_lost: 0,
+            polls_won: 0,
+            polls_lost: 0,
+        })
 }
 
 pub(crate) fn set_user_stats(env: &Env, user: &Address, stats: &UserStats) {
@@ -129,8 +123,30 @@ pub(crate) fn set_user_stats(env: &Env, user: &Address, stats: &UserStats) {
         .set(&DataKey::UserStats(user.clone()), stats);
 }
 
-fn load_stake(env: &Env, poll_id: u64, user: &Address) -> Option<Stake> {
-    env.storage().persistent().get(&DataKey::Stake(poll_id, user.clone()))
+/// Record the outcome of a claim against a user's lifetime stats.
+///
+/// `total_won` is tracked as **net profit** (payout minus the original stake),
+/// not gross payout. This keeps win-rate and ROI numbers meaningful: a user who
+/// stakes 100 and receives 150 back has won 50, not 150.
+///
+/// `total_lost` records the full stake for a losing position. A refund on a
+/// cancelled poll is neither a win nor a loss and must not call this helper.
+pub(crate) fn record_claim_outcome(
+    env: &Env,
+    user: &Address,
+    stake_amount: i128,
+    payout: i128,
+    won: bool,
+) {
+    let mut stats = get_user_stats(env, user);
+    if won {
+        stats.polls_won += 1;
+        stats.total_won += payout.saturating_sub(stake_amount);
+    } else {
+        stats.polls_lost += 1;
+        stats.total_lost += stake_amount;
+    }
+    set_user_stats(env, user, &stats);
 }
 
 fn has_emergency_claimed(env: &Env, poll_id: u64, user: &Address) -> bool {
@@ -426,10 +442,6 @@ impl PredictionMarket {
 
     pub fn get_platform_stats(env: Env) -> PlatformStats {
         get_platform_stats(&env)
-    }
-
-    pub fn get_user_stats(env: Env, user: Address) -> UserStats {
-        get_user_stats(&env, &user)
     }
 
     // ── Token view functions ──────────────────────────────────────────────────
