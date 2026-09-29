@@ -1,6 +1,5 @@
 use soroban_sdk::{token, Address, Env};
-use predictx_shared::PredictXError;
-use crate::DataKey;
+use predictx_shared::{DataKey, PredictXError};
 
 // ── Helpers ───────────────────────────────────────────────────────────────────
 
@@ -16,7 +15,7 @@ pub fn get_token_address(env: &Env) -> Result<Address, PredictXError> {
 pub fn get_treasury_address(env: &Env) -> Result<Address, PredictXError> {
     env.storage()
         .instance()
-        .get(&DataKey::TreasuryAddress)
+        .get(&DataKey::MarketTreasuryAddress)
         .ok_or(PredictXError::NotInitialized)
 }
 

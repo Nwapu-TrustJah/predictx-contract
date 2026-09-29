@@ -1,19 +1,10 @@
 #![no_std]
 
-use predictx_shared::PredictXError;
-use soroban_sdk::{contract, contractimpl, contracttype, token, Address, Env};
+use predictx_shared::{DataKey, PredictXError};
+use soroban_sdk::{contract, contractimpl, token, Address, Env};
 
 #[contract]
 pub struct Treasury;
-
-#[contracttype]
-#[derive(Clone)]
-enum DataKey {
-    Admin,
-    Market,
-    TokenAddress,
-    Balance(Address),
-}
 
 fn get_admin(env: &Env) -> Result<Address, PredictXError> {
     env.storage()
@@ -25,14 +16,14 @@ fn get_admin(env: &Env) -> Result<Address, PredictXError> {
 fn get_market(env: &Env) -> Result<Address, PredictXError> {
     env.storage()
         .instance()
-        .get(&DataKey::Market)
+        .get(&DataKey::TreasuryMarket)
         .ok_or(PredictXError::NotInitialized)
 }
 
 fn get_balance(env: &Env, who: &Address) -> i128 {
     env.storage()
         .persistent()
-        .get(&DataKey::Balance(who.clone()))
+        .get(&DataKey::TreasuryDepositorBalance(who.clone()))
         .unwrap_or(0_i128)
 }
 
@@ -64,7 +55,7 @@ impl Treasury {
             return Err(PredictXError::Unauthorized);
         }
         admin.require_auth();
-        env.storage().instance().set(&DataKey::Market, &market);
+        env.storage().instance().set(&DataKey::TreasuryMarket, &market);
         Ok(())
     }
 
@@ -100,7 +91,7 @@ impl Treasury {
         let new_balance = get_balance(&env, &from) + amount;
         env.storage()
             .persistent()
-            .set(&DataKey::Balance(from), &new_balance);
+            .set(&DataKey::TreasuryDepositorBalance(from), &new_balance);
         Ok(new_balance)
     }
 
@@ -125,7 +116,7 @@ impl Treasury {
         let new_balance = get_balance(&env, &from) + amount;
         env.storage()
             .persistent()
-            .set(&DataKey::Balance(from), &new_balance);
+            .set(&DataKey::TreasuryDepositorBalance(from), &new_balance);
         Ok(new_balance)
     }
 

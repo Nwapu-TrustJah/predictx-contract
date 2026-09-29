@@ -3,7 +3,8 @@ use predictx_shared::{
     Poll, PollStatus, Stake, StakeSide, PredictXError,
     MIN_STAKE_AMOUNT, BPS_DENOMINATOR,
 };
-use crate::{DataKey, PoolInfo, get_platform_stats, set_platform_stats, ensure_not_paused, token_utils};
+use crate::{PoolInfo, get_platform_stats, set_platform_stats, ensure_not_paused, token_utils};
+use predictx_shared::DataKey;
 
 // ── Stake placement ───────────────────────────────────────────────────────────
 
@@ -677,7 +678,7 @@ mod test {
     fn get_treasury_address_returns_stored_address() {
         let s = setup();
         let treasury: Address = s.env.as_contract(&s.contract_id, || {
-            s.env.storage().instance().get(&DataKey::TreasuryAddress).unwrap()
+            s.env.storage().instance().get(&DataKey::MarketTreasuryAddress).unwrap()
         });
         assert_eq!(s.client.get_treasury_address(), treasury);
     }

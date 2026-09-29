@@ -5,8 +5,8 @@ mod staking;
 pub(crate) mod token_utils;
 
 use predictx_shared::{
-    Match, PlatformStats, Poll, PollCategory, PollStatus, PredictXError, Stake, StakeSide,
-    MAX_POLLS_PER_MATCH,
+    DataKey, Match, PlatformStats, Poll, PollCategory, PollStatus, PredictXError, Stake,
+    StakeSide, MAX_POLLS_PER_MATCH,
 };
 use soroban_sdk::{contract, contractimpl, contracttype, Address, Env, String, Symbol, Vec};
 
@@ -29,31 +29,6 @@ fn map_oracle_poll_status(status: voting_oracle::PollStatus) -> PollStatus {
 #[contract]
 pub struct PredictionMarket;
 
-#[contracttype]
-#[derive(Clone)]
-pub enum DataKey {
-    // ── oracle / admin keys ───────────────────────────────────────────────────
-    Admin,
-    VotingOracle,
-    Paused,
-    TokenAddress,
-    TreasuryAddress,
-    PlatformFeeBps,
-    Stake(u64, Address),
-    EmergencyClaimed(u64, Address),
-    PlatformStats,
-    // ── match management keys ─────────────────────────────────────────────────
-    Initialized,
-    NextMatchId,
-    NextPollId,
-    Match(u64),
-    MatchPolls(u64),
-    // ── poll & staking keys ───────────────────────────────────────────────────
-    Poll(u64),
-    UserStakes(Address),
-    HasStaked(u64, Address),
-}
-
 /// Pool state returned by `get_pool_info`.
 #[contracttype]
 #[derive(Clone, Debug, Eq, PartialEq)]
@@ -70,12 +45,12 @@ fn get_admin(env: &Env) -> Result<Address, PredictXError> {
 }
 
 fn get_oracle(env: &Env) -> Result<Address, PredictXError> {
-    env.storage().instance().get(&DataKey::VotingOracle)
+    env.storage().instance().get(&DataKey::MarketVotingOracle)
         .ok_or(PredictXError::NotInitialized)
 }
 
 fn is_paused(env: &Env) -> bool {
-    env.storage().instance().get(&DataKey::Paused).unwrap_or(false)
+    env.storage().instance().get(&DataKey::MarketPaused).unwrap_or(false)
 }
 
 pub(crate) fn ensure_not_paused(env: &Env) -> Result<(), PredictXError> {
@@ -132,9 +107,9 @@ impl PredictionMarket {
         }
         admin.require_auth();
         env.storage().instance().set(&DataKey::Admin, &admin);
-        env.storage().instance().set(&DataKey::VotingOracle, &voting_oracle);
+        env.storage().instance().set(&DataKey::MarketVotingOracle, &voting_oracle);
         env.storage().instance().set(&DataKey::TokenAddress, &token_address);
-        env.storage().instance().set(&DataKey::TreasuryAddress, &treasury_address);
+        env.storage().instance().set(&DataKey::MarketTreasuryAddress, &treasury_address);
         env.storage().instance().set(&DataKey::PlatformFeeBps, &platform_fee_bps);
         env.storage().instance().set(&DataKey::NextMatchId, &1u64);
         env.storage().instance().set(&DataKey::NextPollId, &1u64);
@@ -149,7 +124,7 @@ impl PredictionMarket {
         ensure_not_paused(&env)?;
         let admin = get_admin(&env)?;
         admin.require_auth();
-        env.storage().instance().set(&DataKey::VotingOracle, &voting_oracle);
+        env.storage().instance().set(&DataKey::MarketVotingOracle, &voting_oracle);
         Ok(())
     }
 
@@ -157,7 +132,7 @@ impl PredictionMarket {
         let stored_admin = get_admin(&env)?;
         if admin != stored_admin { return Err(PredictXError::Unauthorized); }
         admin.require_auth();
-        env.storage().instance().set(&DataKey::Paused, &true);
+        env.storage().instance().set(&DataKey::MarketPaused, &true);
         env.events().publish((Symbol::new(&env, "ContractPaused"),), true);
         Ok(())
     }
@@ -166,7 +141,7 @@ impl PredictionMarket {
         let stored_admin = get_admin(&env)?;
         if admin != stored_admin { return Err(PredictXError::Unauthorized); }
         admin.require_auth();
-        env.storage().instance().set(&DataKey::Paused, &false);
+        env.storage().instance().set(&DataKey::MarketPaused, &false);
         env.events().publish((Symbol::new(&env, "ContractUnpaused"),), true);
         Ok(())
     }

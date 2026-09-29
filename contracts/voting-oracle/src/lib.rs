@@ -3,7 +3,9 @@
 mod storage;
 mod voting;
 
-use predictx_shared::{PollStatus, PredictXError, VoteChoice, VoteTally, VOTING_WINDOW_SECS};
+use predictx_shared::{
+    DataKey, PollStatus, PredictXError, VoteChoice, VoteTally, VOTING_WINDOW_SECS,
+};
 use soroban_sdk::{contract, contractimpl, contracttype, Address, Env, Vec};
 
 /// Maximum number of admins that may be registered at once.
@@ -23,31 +25,6 @@ struct StoredPollStatus {
     updated_at: u64,
 }
 
-#[contracttype]
-#[derive(Clone)]
-enum DataKey {
-    Admin,
-    /// Registered admins `Vec<Address>`. (Instance)
-    AdminList,
-    PollStatus(u64),
-    /// `poll_id` → vote tally. (Temporary — only needed during the voting window)
-    VoteTally(u64),
-    /// `poll_id` → automatically resolved outcome.
-    PollOutcome(u64),
-    /// `poll_id` → persistent roster of voters who cast a vote.
-    Voters(u64),
-    /// `(poll_id, voter)` → `bool` — has this voter cast a vote? (Temporary)
-    HasVoted(u64, Address),
-    /// `(poll_id, voter)` → the choice the voter recorded. (Persistent)
-    VoterChoice(u64, Address),
-    /// `poll_id` → voter reward reserve (unclaimed incentive pool). (Persistent)
-    RewardPool(u64),
-    /// `(poll_id, voter)` → `i128` reward paid to an eligible voter. (Persistent)
-    VoterReward(u64, Address),
-    /// `(poll_id, voter)` → `bool` — has the voter claimed their reward? (Persistent)
-    RewardClaimed(u64, Address),
-}
-
 fn get_admin(env: &Env) -> Result<Address, PredictXError> {
     env.storage()
         .instance()
@@ -59,7 +36,7 @@ pub(crate) fn read_poll_status(env: &Env, poll_id: u64) -> PollStatus {
     let stored: Option<StoredPollStatus> = env
         .storage()
         .persistent()
-        .get(&DataKey::PollStatus(poll_id));
+        .get(&DataKey::OraclePollStatus(poll_id));
 
     stored.map(|s| s.status).unwrap_or(PollStatus::Active)
 }
@@ -67,7 +44,7 @@ pub(crate) fn read_poll_status(env: &Env, poll_id: u64) -> PollStatus {
 pub(crate) fn read_poll_status_updated_at(env: &Env, poll_id: u64) -> u64 {
     env.storage()
         .persistent()
-        .get::<DataKey, StoredPollStatus>(&DataKey::PollStatus(poll_id))
+        .get::<DataKey, StoredPollStatus>(&DataKey::OraclePollStatus(poll_id))
         .map(|stored| stored.updated_at)
         .unwrap_or(0)
 }
@@ -176,7 +153,7 @@ impl VotingOracle {
 
         env.storage()
             .persistent()
-            .set(&DataKey::PollStatus(poll_id), &stored);
+            .set(&DataKey::OraclePollStatus(poll_id), &stored);
         Ok(())
     }
 
@@ -199,7 +176,7 @@ impl VotingOracle {
         if !env
             .storage()
             .persistent()
-            .has(&DataKey::PollStatus(poll_id))
+            .has(&DataKey::OraclePollStatus(poll_id))
         {
             return false;
         }
@@ -216,7 +193,7 @@ impl VotingOracle {
         if !env
             .storage()
             .persistent()
-            .has(&DataKey::PollStatus(poll_id))
+            .has(&DataKey::OraclePollStatus(poll_id))
             || read_poll_status(&env, poll_id) != PollStatus::Voting
         {
             return false;
@@ -252,7 +229,7 @@ impl VotingOracle {
     pub fn get_poll_outcome(env: Env, poll_id: u64) -> Result<VoteChoice, PredictXError> {
         env.storage()
             .persistent()
-            .get(&DataKey::PollOutcome(poll_id))
+            .get(&DataKey::OraclePollOutcome(poll_id))
             .ok_or(PredictXError::PollNotFound)
     }
 
@@ -300,7 +277,7 @@ extern crate std;
 #[cfg(test)]
 mod test {
     use super::*;
-    use soroban_sdk::testutils::Address as _;
+    use soroban_sdk::testutils::{Address as _, Ledger as _};
 
     #[test]
     fn set_and_get_status() {

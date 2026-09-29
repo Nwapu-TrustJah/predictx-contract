@@ -1,7 +1,7 @@
-use crate::{storage, DataKey, MAX_VOTERS};
+use crate::{storage, MAX_VOTERS};
 use predictx_shared::{
-    PollStatus, PredictXError, VoteChoice, VoteTally, AUTO_RESOLVE_THRESHOLD_BPS, BPS_DENOMINATOR,
-    VOTING_WINDOW_SECS,
+    DataKey, PollStatus, PredictXError, VoteChoice, VoteTally, AUTO_RESOLVE_THRESHOLD_BPS,
+    BPS_DENOMINATOR, VOTING_WINDOW_SECS,
 };
 use soroban_sdk::{Address, Env, Symbol};
 
@@ -31,7 +31,7 @@ pub fn cast_vote(
     if !env
         .storage()
         .persistent()
-        .has(&DataKey::PollStatus(poll_id))
+        .has(&DataKey::OraclePollStatus(poll_id))
     {
         return Err(PredictXError::PollNotFound);
     }
@@ -101,7 +101,7 @@ pub fn set_reward_pool(
     if !env
         .storage()
         .persistent()
-        .has(&DataKey::PollStatus(poll_id))
+        .has(&DataKey::OraclePollStatus(poll_id))
     {
         return Err(PredictXError::PollNotFound);
     }
@@ -123,7 +123,7 @@ pub fn claim_reward(env: &Env, voter: Address, poll_id: u64) -> Result<i128, Pre
     if !env
         .storage()
         .persistent()
-        .has(&DataKey::PollStatus(poll_id))
+        .has(&DataKey::OraclePollStatus(poll_id))
     {
         return Err(PredictXError::PollNotFound);
     }
@@ -132,7 +132,7 @@ pub fn claim_reward(env: &Env, voter: Address, poll_id: u64) -> Result<i128, Pre
     let outcome: VoteChoice = env
         .storage()
         .persistent()
-        .get(&DataKey::PollOutcome(poll_id))
+        .get(&DataKey::OraclePollOutcome(poll_id))
         .ok_or(PredictXError::OutcomeNotAvailable)?;
     if outcome == VoteChoice::Unclear {
         return Err(PredictXError::OutcomeNotAvailable);
@@ -193,7 +193,7 @@ pub fn auto_resolve(env: &Env, poll_id: u64) -> Result<VoteChoice, PredictXError
     if !env
         .storage()
         .persistent()
-        .has(&DataKey::PollStatus(poll_id))
+        .has(&DataKey::OraclePollStatus(poll_id))
     {
         return Err(PredictXError::PollNotFound);
     }
@@ -233,10 +233,10 @@ pub fn auto_resolve(env: &Env, poll_id: u64) -> Result<VoteChoice, PredictXError
     };
     env.storage()
         .persistent()
-        .set(&DataKey::PollStatus(poll_id), &stored_status);
+        .set(&DataKey::OraclePollStatus(poll_id), &stored_status);
     env.storage()
         .persistent()
-        .set(&DataKey::PollOutcome(poll_id), &outcome);
+        .set(&DataKey::OraclePollOutcome(poll_id), &outcome);
 
     env.events().publish(
         (Symbol::new(env, "AutoResolved"), poll_id, outcome),

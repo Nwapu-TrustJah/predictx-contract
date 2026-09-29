@@ -3,7 +3,8 @@ use predictx_shared::{
     Poll, PollStatus, Stake, StakeSide, PredictXError,
     BPS_DENOMINATOR,
 };
-use crate::{DataKey, get_platform_stats, set_platform_stats, token_utils};
+use crate::{get_platform_stats, set_platform_stats, token_utils};
+use predictx_shared::DataKey;
 
 /// Resolve a poll using the configured admin and record its final outcome.
 pub fn resolve_poll(

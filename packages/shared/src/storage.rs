@@ -33,6 +33,15 @@ pub enum DataKey {
     PlatformStats,
     /// Treasury token balance `i128`. (Instance)
     TreasuryBalance,
+    /// Registered PredictionMarket contract `Address` allowed to deposit fees
+    /// into the treasury. (Instance)
+    TreasuryMarket,
+    /// VotingOracle contract `Address` wired to the prediction market. (Instance)
+    MarketVotingOracle,
+    /// Emergency-pause flag for the prediction market. (Instance)
+    MarketPaused,
+    /// Treasury contract `Address` receiving platform fees. (Instance)
+    MarketTreasuryAddress,
 
     // ── Persistent storage ────────────────────────────────────────────────────
     /// `match_id` → `Match`. (Persistent)
@@ -55,6 +64,22 @@ pub enum DataKey {
     UserStats(Address),
     /// `(poll_id, voter)` → `i128` unclaimed voter reward. (Persistent)
     VoterReward(u64, Address),
+    /// `(poll_id, depositor)` → `i128` recorded treasury deposit balance. (Persistent)
+    TreasuryDepositorBalance(Address),
+    /// `(poll_id, user)` → `bool` — emergency withdrawal already claimed. (Persistent)
+    EmergencyClaimed(u64, Address),
+    /// `poll_id` → `StoredPollStatus` (status + last update time). (Persistent)
+    OraclePollStatus(u64),
+    /// `poll_id` → automatically resolved outcome. (Persistent)
+    OraclePollOutcome(u64),
+    /// `poll_id` → persistent roster of voters who cast a vote. (Persistent)
+    OracleVoters(u64),
+    /// `(poll_id, voter)` → the choice the voter recorded. (Persistent)
+    VoterChoice(u64, Address),
+    /// `poll_id` → voter reward reserve (unclaimed incentive pool). (Persistent)
+    VoterRewardPool(u64),
+    /// `(poll_id, voter)` → `bool` — has the voter claimed their reward? (Persistent)
+    VoterRewardClaimed(u64, Address),
 
     // ── Temporary storage ─────────────────────────────────────────────────────
     /// `poll_id` → `VoteTally`. (Temporary — only needed during voting window)
