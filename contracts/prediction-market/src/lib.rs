@@ -80,7 +80,7 @@ fn is_paused(env: &Env) -> bool {
 
 pub(crate) fn ensure_not_paused(env: &Env) -> Result<(), PredictXError> {
     if is_paused(env) {
-        return Err(PredictXError::EmergencyWithdrawNotAllowed);
+        return Err(PredictXError::ContractPaused);
     }
     Ok(())
 }
@@ -578,9 +578,29 @@ mod test {
         client.pause(&admin);
         assert_eq!(client.is_paused(), true);
         let err = client.try_set_oracle(&oracle).expect_err("should be blocked");
-        assert_eq!(err, Ok(PredictXError::EmergencyWithdrawNotAllowed));
+        assert_eq!(err, Ok(PredictXError::ContractPaused));
         client.unpause(&admin);
         assert_eq!(client.is_paused(), false);
+    }
+
+    #[test]
+    fn ensure_not_paused_returns_contract_paused_when_paused() {
+        let env = Env::default();
+        env.mock_all_auths();
+        let contract_id = env.register(PredictionMarket, ());
+        let client = PredictionMarketClient::new(&env, &contract_id);
+        let admin = Address::generate(&env);
+        let oracle = Address::generate(&env);
+        let tok = Address::generate(&env);
+        let treasury = Address::generate(&env);
+        client.initialize(&admin, &oracle, &tok, &treasury, &TEST_FEE_BPS);
+        client.pause(&admin);
+        // Regression test for issue #120: a paused contract must surface
+        // ContractPaused (33), not EmergencyWithdrawNotAllowed (31).
+        let err = client
+            .try_set_oracle(&oracle)
+            .expect_err("paused contract should reject calls");
+        assert_eq!(err, Ok(PredictXError::ContractPaused));
     }
 
     #[test]
