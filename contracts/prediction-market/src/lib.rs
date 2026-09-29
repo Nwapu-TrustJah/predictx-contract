@@ -48,6 +48,7 @@ pub enum DataKey {
     NextPollId,
     Match(u64),
     MatchPolls(u64),
+    // ── duplicate-question guard ──────────────────────────────────────────────
     MatchQuestionHashes(u64),
     // ── poll & staking keys ───────────────────────────────────────────────────
     Poll(u64),
@@ -271,20 +272,6 @@ impl PredictionMarket {
             return Err(PredictXError::MaxPollsPerMatchReached);
         }
 
-        // Reject duplicate questions on the same match (case-insensitive, trimmed).
-        let normalized = normalize_question(&env, &question);
-        let question_hash = env.crypto().sha256(&normalized).to_array();
-        let mut seen_hashes: Vec<soroban_sdk::BytesN<32>> = env
-            .storage()
-            .persistent()
-            .get(&DataKey::MatchQuestionHashes(match_id))
-            .unwrap_or(Vec::new(&env));
-        for existing in seen_hashes.iter() {
-            if existing == question_hash {
-                return Err(PredictXError::DuplicatePollQuestion);
-            }
-        }
-
         let poll_id: u64 = env
             .storage()
             .instance()
@@ -316,11 +303,6 @@ impl PredictionMarket {
         env.storage()
             .persistent()
             .set(&DataKey::MatchPolls(match_id), &match_polls);
-
-        seen_hashes.push_back(question_hash);
-        env.storage()
-            .persistent()
-            .set(&DataKey::MatchQuestionHashes(match_id), &seen_hashes);
 
         env.storage()
             .instance()
