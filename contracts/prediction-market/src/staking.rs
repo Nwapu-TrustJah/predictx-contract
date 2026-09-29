@@ -5,9 +5,6 @@ use predictx_shared::{
 };
 use crate::{DataKey, PoolInfo, get_platform_stats, set_platform_stats, ensure_not_paused, token_utils};
 
-/// Maximum cumulative stake a single address may hold on a single poll.
-pub const MAX_CUMULATIVE_STAKE_PER_POLL: i128 = 1_000_000_000_000;
-
 // ── Stake placement ───────────────────────────────────────────────────────────
 
 /// Place a stake on a poll outcome. Follows Checks-Effects-Interactions pattern.
@@ -49,21 +46,19 @@ pub fn stake(
         return Err(PredictXError::PollLocked);
     }
 
-    if env
-        .storage()
-        .persistent()
-        .has(&DataKey::HasStaked(poll_id, staker.clone()))
-    {
-        return Err(PredictXError::AlreadyStaked);
-    }
-
-    // Enforce cumulative per-user, per-poll cap.
+    // Track cumulative stake per user per poll.  The previous guard rejected
+    // any second stake outright; that guard is relaxed here so a user may
+    // top up their position as long as the running total stays within the
+    // per-poll cap.
     let existing_total: i128 = env
         .storage()
         .persistent()
         .get(&DataKey::UserPollStakeTotal(poll_id, staker.clone()))
         .unwrap_or(0);
-    if existing_total + amount > MAX_CUMULATIVE_STAKE_PER_POLL {
+    let new_total = existing_total
+        .checked_add(amount)
+        .ok_or(PredictXError::StakeAmountZero)?;
+    if new_total > MAX_CUMULATIVE_STAKE_PER_POLL {
         return Err(PredictXError::StakeLimitExceeded);
     }
 
@@ -76,22 +71,19 @@ pub fn stake(
     let stake_record = Stake {
         user: staker.clone(),
         poll_id,
-        amount,
+        amount: new_total,
         side,
         claimed: false,
         staked_at: env.ledger().timestamp(),
     };
 
-    // Store stake record + flag
+    // Store stake record + running total
     env.storage()
         .persistent()
         .set(&DataKey::Stake(poll_id, staker.clone()), &stake_record);
     env.storage()
         .persistent()
-        .set(&DataKey::HasStaked(poll_id, staker.clone()), &true);
-    env.storage()
-        .persistent()
-        .set(&DataKey::UserPollStakeTotal(poll_id, staker.clone()), &(existing_total + amount));
+        .set(&DataKey::UserPollStakeTotal(poll_id, staker.clone()), &new_total);
 
     // Update pool totals
     match side {
@@ -114,7 +106,9 @@ pub fn stake(
         .persistent()
         .get(&DataKey::UserStakes(staker.clone()))
         .unwrap_or(Vec::new(env));
-    user_stakes.push_back(poll_id);
+    if !user_stakes.iter().any(|id| id == poll_id) {
+        user_stakes.push_back(poll_id);
+    }
     env.storage()
         .persistent()
         .set(&DataKey::UserStakes(staker.clone()), &user_stakes);
@@ -159,7 +153,7 @@ pub fn has_user_staked(env: &Env, poll_id: u64, user: &Address) -> bool {
         .has(&DataKey::HasStaked(poll_id, user.clone()))
 }
 
-/// Return the cumulative amount a user has staked on a given poll.
+/// Return the cumulative amount a user has staked on a poll so far.
 pub fn get_user_poll_stake_total(env: &Env, poll_id: u64, user: &Address) -> i128 {
     env.storage()
         .persistent()
