@@ -17,6 +17,12 @@ use predictx_shared::{Dispute, PollStatus, PredictXError, VoteChoice, VoteTally}
 use soroban_sdk::{contract, contractimpl, contracttype, Address, Env, String, Vec};
 use predictx_shared::{PollStatus, PredictXError, VoteChoice, VoteTally, VOTING_WINDOW_SECS};
 use soroban_sdk::{contract, contractimpl, contracttype, Address, Env, Vec};
+mod dispute;
+mod storage;
+mod voting;
+
+use predictx_shared::{PollStatus, PredictXError, VoteChoice, VoteTally};
+use soroban_sdk::{contract, contractimpl, contracttype, Address, Env, String, Vec};
 
 mod voting;
 
@@ -94,6 +100,12 @@ pub(crate) enum DataKey {
     TokenAddress,
     /// `(poll_id, voter)` → `bool` — has this voter claimed their reward? (Persistent)
     RewardClaimed(u64, Address),
+    /// Soroban token contract used for payouts. (Instance)
+    TokenAddress,
+    /// Treasury address that receives forfeited dispute fees. (Instance)
+    TreasuryAddress,
+    /// `poll_id` → `Dispute`. (Persistent)
+    Dispute(u64),
 }
 
 fn get_admin(env: &Env) -> Result<Address, PredictXError> {
@@ -246,6 +258,7 @@ impl VotingOracle {
     }
 
     /// Admin-gated setter for the token contract used to pay voter rewards.
+    /// Admin-gated setter for the token contract used for payouts.
     pub fn set_token_address(
         env: Env,
         admin: Address,
@@ -260,10 +273,33 @@ impl VotingOracle {
     }
 
     /// Returns the stored voter-reward token address.
+    /// Returns the stored payout token address.
     pub fn get_token_address(env: Env) -> Result<Address, PredictXError> {
         env.storage()
             .instance()
             .get(&DataKey::TokenAddress)
+            .ok_or(PredictXError::NotInitialized)
+    }
+
+    /// Admin-gated setter for the treasury that collects forfeited dispute fees.
+    pub fn set_treasury_address(
+        env: Env,
+        admin: Address,
+        treasury_address: Address,
+    ) -> Result<(), PredictXError> {
+        storage::require_admin(&env, &admin)?;
+        admin.require_auth();
+        env.storage()
+            .instance()
+            .set(&DataKey::TreasuryAddress, &treasury_address);
+        Ok(())
+    }
+
+    /// Returns the stored treasury address.
+    pub fn get_treasury_address(env: Env) -> Result<Address, PredictXError> {
+        env.storage()
+            .instance()
+            .get(&DataKey::TreasuryAddress)
             .ok_or(PredictXError::NotInitialized)
     }
 
@@ -431,6 +467,7 @@ impl VotingOracle {
     /// The initiator must transfer the fixed dispute fee into the contract.
     /// A `Dispute` record is persisted and the poll status transitions to
     /// `Disputed`.
+    /// Open a dispute against a settled poll, escrowing `dispute_fee`.
     pub fn initiate_dispute(
         env: Env,
         initiator: Address,
@@ -580,6 +617,19 @@ impl VotingOracle {
     /// can show a claimable amount before the claim is attempted.
     pub fn get_voter_reward(env: Env, poll_id: u64, voter: Address) -> i128 {
         voting::get_voter_reward(&env, poll_id, &voter)
+        dispute_fee: i128,
+    ) -> Result<(), PredictXError> {
+        dispute::initiate_dispute(&env, initiator, poll_id, evidence_hash, dispute_fee)
+    }
+
+    /// Rule on an open dispute, refunding or forfeiting the escrowed fee.
+    pub fn resolve_dispute(
+        env: Env,
+        admin: Address,
+        poll_id: u64,
+        final_outcome: VoteChoice,
+    ) -> Result<(), PredictXError> {
+        dispute::resolve_dispute(&env, admin, poll_id, final_outcome)
     }
 }
 
