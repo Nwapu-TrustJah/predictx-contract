@@ -1,6 +1,7 @@
 use soroban_sdk::{Address, Env, String, Symbol, Vec};
 use predictx_shared::{Match, PredictXError};
 use crate::DataKey;   // ← uses prediction-market's local DataKey, not shared one
+use crate::ensure_not_paused;
 
 // ── Internal helper ───────────────────────────────────────────────────────────
 
@@ -79,6 +80,7 @@ pub fn create_match(
     venue: String,
     kickoff_time: u64,
 ) -> Result<u64, PredictXError> {
+    ensure_not_paused(env)?;
     require_admin(env, &admin)?;
 
     let now = env.ledger().timestamp();
@@ -128,6 +130,7 @@ pub fn update_match(
     venue: Option<String>,
     kickoff_time: Option<u64>,
 ) -> Result<Match, PredictXError> {
+    ensure_not_paused(env)?;
     require_admin(env, &admin)?;
 
     let mut m: Match = env
@@ -165,6 +168,7 @@ pub fn finish_match(
     admin: Address,
     match_id: u64,
 ) -> Result<(), PredictXError> {
+    ensure_not_paused(env)?;
     require_admin(env, &admin)?;
 
     let mut m: Match = env

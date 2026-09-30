@@ -49,6 +49,7 @@ use predictx_shared::{
     BPS_DENOMINATOR,
 };
 use crate::{DataKey, get_oracle, get_platform_stats, set_platform_stats, token_utils};
+use crate::{DataKey, get_platform_stats, set_platform_stats, token_utils, ensure_not_paused};
 
 /// Resolve a poll using the registered oracle and record its final outcome.
 ///
@@ -63,6 +64,14 @@ pub fn resolve_poll(
     caller.require_auth();
     let oracle = get_oracle(env)?;
     if caller != oracle {
+    ensure_not_paused(env)?;
+    admin.require_auth();
+    let stored_admin: Address = env
+        .storage()
+        .instance()
+        .get(&DataKey::Admin)
+        .ok_or(PredictXError::NotInitialized)?;
+    if admin != stored_admin {
         return Err(PredictXError::Unauthorized);
     }
 
@@ -154,6 +163,8 @@ pub fn claim_winnings(
     poll_id: u64,
 ) -> Result<i128, PredictXError> {
     user.require_auth();
+    ensure_not_paused(env)?;
+    claimant.require_auth();
 
     // ── Checks ────────────────────────────────────────────────────────────────
 
@@ -261,6 +272,33 @@ pub fn claim_winnings(
 
             net
         }
+        // If there is no losing pool (one-sided), refund at par with no fee.
+        let losing_pool = if outcome_yes { poll.no_pool } else { poll.yes_pool };
+        if losing_pool <= 0 {
+            stake.amount
+        } else {
+            // Proportional share of total pool, after platform fee.
+        //
+        // payout = stake_amount * total_pool * (BPS_DENOMINATOR - fee_bps)
+        //          / (winning_pool * BPS_DENOMINATOR)
+        //
+        // Integer division rounds down; any dust remains in the contract.
+        let fee_bps = token_utils::get_platform_fee_bps(env);
+        let fee_factor = (BPS_DENOMINATOR - fee_bps) as i128;
+        let bps = BPS_DENOMINATOR as i128;
+
+        let gross = stake.amount * total_pool / winning_pool;
+        let net = gross * fee_factor / bps;
+        let fee = gross - net;
+
+        // Send platform fee to treasury
+        if fee > 0 {
+            token_utils::transfer_to_treasury(env, fee)?;
+        }
+
+        net
+        }
+
     };
 
     if payout == 0 {
@@ -442,6 +480,8 @@ mod test {
     //   share_of_losers = 100 * 190 / 300    =  63  (truncated)
     //   payout          = 100 + 63           = 163
     /// Mint tokens to a fresh user and stake them through the real staking flow.
+    /// Helper that creates a user, mints tokens and places a stake through the
+    /// normal staking flow. Returns the user address.
     fn stake_user(s: &TestSetup, poll_id: u64, side: StakeSide, amount: i128) -> Address {
         let user = Address::generate(&s.env);
         mint_tokens(s, &user, amount);
