@@ -1031,6 +1031,20 @@ impl PredictionMarket {
         // letting someone stake on an event they have already watched happen.
         if lock_time > match_info.kickoff_time {
             return Err(PredictXError::InvalidLockTime);
+        // Reject empty or whitespace-only questions
+        if question.is_empty() {
+            return Err(PredictXError::EmptyQuestion);
+        }
+        let mut has_non_whitespace = false;
+        for i in 0..question.len() {
+            let b = question.get(i).unwrap();
+            if b != b' ' && b != b'\t' && b != b'\n' && b != b'\r' {
+                has_non_whitespace = true;
+                break;
+            }
+        }
+        if !has_non_whitespace {
+            return Err(PredictXError::EmptyQuestion);
         }
 
         // Check max polls per match
