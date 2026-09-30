@@ -5,6 +5,7 @@ mod payouts;
 mod polls;
 mod staking;
 mod payouts;
+pub(crate) mod payouts;
 pub(crate) mod token_utils;
 
 #[cfg(test)]
