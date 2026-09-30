@@ -410,9 +410,32 @@ impl PredictionMarket {
         let stored_admin = get_admin(&env)?;
         if admin != stored_admin { return Err(PredictXError::Unauthorized); }
         admin.require_auth();
+
+        let mut poll: Poll = env
+            .storage()
+            .persistent()
+            .get(&DataKey::Poll(poll_id))
+            .ok_or(PredictXError::PollNotFound)?;
+        if poll.status == PollStatus::Resolved
+            || poll.status == PollStatus::Cancelled
+            || poll.outcome.is_some()
+        {
+            return Err(PredictXError::PollAlreadyResolved);
+        }
+
         let oracle_id = get_oracle(&env)?;
         let client = voting_oracle::Client::new(&env, &oracle_id);
+        let oracle_status = client.get_poll_status(&poll_id);
+        if oracle_status == voting_oracle::PollStatus::Resolved
+            || oracle_status == voting_oracle::PollStatus::Cancelled
+        {
+            return Err(PredictXError::PollAlreadyResolved);
+        }
         client.set_poll_status(&poll_id, &voting_oracle::PollStatus::Cancelled);
+        poll.status = PollStatus::Cancelled;
+        env.storage()
+            .persistent()
+            .set(&DataKey::Poll(poll_id), &poll);
         env.events().publish((Symbol::new(&env, "PollCancelled"),), poll_id);
         Ok(())
     }
@@ -773,6 +796,30 @@ mod test {
     /// Default platform fee BPS for tests (5%).
     const TEST_FEE_BPS: u32 = 500;
 
+    fn seed_active_poll(env: &Env, contract_id: &Address, poll_id: u64) {
+        let poll = Poll {
+            poll_id,
+            match_id: 1,
+            creator: Address::generate(env),
+            question: String::from_str(env, "Will the home team win?"),
+            category: PollCategory::TeamEvent,
+            lock_time: env.ledger().timestamp() + 3_600,
+            yes_pool: 0,
+            no_pool: 0,
+            yes_count: 0,
+            no_count: 0,
+            status: PollStatus::Active,
+            outcome: None,
+            resolution_time: 0,
+            created_at: env.ledger().timestamp(),
+        };
+        env.as_contract(contract_id, || {
+            env.storage()
+                .persistent()
+                .set(&DataKey::Poll(poll_id), &poll);
+        });
+    }
+
     #[test]
     fn initialize_sets_admin_and_oracle() {
         let env = Env::default();
@@ -870,8 +917,22 @@ mod test {
         let client = PredictionMarketClient::new(&env, &contract_id);
         let treasury = Address::generate(&env);
         client.initialize(&admin, &oracle_id, &tok, &treasury, &TEST_FEE_BPS);
+        seed_active_poll(&env, &contract_id, 1);
         client.cancel_poll(&admin, &1_u64);
+        assert_eq!(client.get_poll(&1_u64).status, PollStatus::Cancelled);
         assert_eq!(oracle_client.get_poll_status(&1_u64), voting_oracle::PollStatus::Cancelled);
+        assert_eq!(client.oracle_poll_status(&1_u64), PollStatus::Cancelled);
+
+        let staker = Address::generate(&env);
+        let err = client
+            .try_stake(&staker, &1_u64, &50_i128, &StakeSide::Yes)
+            .expect_err("cancelled polls must not accept stakes");
+        assert_eq!(err, Ok(PredictXError::PollNotActive));
+
+        let err = client
+            .try_cancel_poll(&admin, &1_u64)
+            .expect_err("terminal polls cannot be cancelled again");
+        assert_eq!(err, Ok(PredictXError::PollAlreadyResolved));
     }
 
     // Helper to set up a real-token environment for emergency withdrawal tests
@@ -921,6 +982,7 @@ mod test {
         env.as_contract(&contract_id, || {
             env.storage().persistent().set(&DataKey::Stake(10, user.clone()), &stake);
         });
+        seed_active_poll(&env, &contract_id, 10);
         client.cancel_poll(&admin, &10_u64);
         let refunded = client.emergency_withdraw(&user, &10_u64);
         assert_eq!(refunded, amount);
