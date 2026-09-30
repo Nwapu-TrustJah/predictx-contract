@@ -855,7 +855,7 @@ impl PredictionMarket {
         creator.require_auth();
 
         // Validate match exists
-        let _m: Match = env
+        let match_info: Match = env
             .storage()
             .persistent()
             .get(&DataKey::Match(match_id))
@@ -873,6 +873,11 @@ impl PredictionMarket {
             .count();
         if question_char_count > MAX_QUESTION_LENGTH as usize {
             return Err(PredictXError::PollQuestionTooLong);
+        // Stakes must close no later than kickoff. Without this a poll could be
+        // created with a lock_time after the match started — or after it ended —
+        // letting someone stake on an event they have already watched happen.
+        if lock_time > match_info.kickoff_time {
+            return Err(PredictXError::InvalidLockTime);
         }
 
         // Check max polls per match
@@ -1368,6 +1373,8 @@ mod test {
             .unwrap();
         assert_eq!(error, PredictXError::PollQuestionTooLong);
     }
+    /// Kickoff timestamp used by the `create_poll` lock-time tests.
+    const TEST_KICKOFF: u64 = 1_003_600;
 
     #[test]
     fn initialize_sets_admin_and_oracle() {
@@ -2115,6 +2122,17 @@ mod test {
     fn poll_read_extends_ttl() {
         let env = Env::default();
         env.mock_all_auths();
+    // ── create_poll lock-time window (issue #133) ─────────────────────────────
+
+    /// Initialise the contract at `TEST_KICKOFF - 3_600` and register a single
+    /// match that kicks off at `TEST_KICKOFF`.
+    ///
+    /// Returns `(env, client, admin, match_id)`.
+    fn setup_poll_env() -> (Env, PredictionMarketClient<'static>, Address, u64) {
+        let env = Env::default();
+        env.mock_all_auths();
+        env.ledger().set_timestamp(TEST_KICKOFF - 3_600);
+
         let contract_id = env.register(PredictionMarket, ());
         let client = PredictionMarketClient::new(&env, &contract_id);
         let admin = Address::generate(&env);
@@ -2995,6 +3013,63 @@ mod test {
         });
         
         assert!(ttl >= super::TTL_EXTEND_TO_LEDGERS);
+        let token = Address::generate(&env);
+        let treasury = Address::generate(&env);
+        client.initialize(&admin, &oracle, &token, &treasury, &TEST_FEE_BPS);
+
+        let match_id = client.create_match(
+            &admin,
+            &String::from_str(&env, "Arsenal"),
+            &String::from_str(&env, "Chelsea"),
+            &String::from_str(&env, "Premier League"),
+            &String::from_str(&env, "Emirates"),
+            &TEST_KICKOFF,
+        );
+
+        (env, client, admin, match_id)
+    }
+
+    #[test]
+    fn create_poll_rejects_lock_time_after_kickoff() {
+        let (env, client, admin, match_id) = setup_poll_env();
+        let err = client
+            .try_create_poll(
+                &admin,
+                &match_id,
+                &String::from_str(&env, "Will Arsenal win?"),
+                &PollCategory::TeamEvent,
+                &(TEST_KICKOFF + 1),
+            )
+            .unwrap_err()
+            .unwrap();
+        assert_eq!(err, PredictXError::InvalidLockTime);
+    }
+
+    #[test]
+    fn create_poll_accepts_lock_time_at_kickoff() {
+        let (env, client, admin, match_id) = setup_poll_env();
+        let poll_id = client.create_poll(
+            &admin,
+            &match_id,
+            &String::from_str(&env, "Will Arsenal win?"),
+            &PollCategory::TeamEvent,
+            &TEST_KICKOFF,
+        );
+        assert_eq!(client.get_poll(&poll_id).lock_time, TEST_KICKOFF);
+    }
+
+    #[test]
+    fn create_poll_accepts_lock_time_before_kickoff() {
+        let (env, client, admin, match_id) = setup_poll_env();
+        let lock_time = TEST_KICKOFF - 1;
+        let poll_id = client.create_poll(
+            &admin,
+            &match_id,
+            &String::from_str(&env, "Will Arsenal win?"),
+            &PollCategory::TeamEvent,
+            &lock_time,
+        );
+        assert_eq!(client.get_poll(&poll_id).lock_time, lock_time);
     }
 
 }
