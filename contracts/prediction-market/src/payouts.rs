@@ -91,6 +91,7 @@ use crate::{get_platform_stats, set_platform_stats, token_utils, DataKey};
 use predictx_shared::{Poll, PollStatus, PredictXError, Stake, StakeSide, BPS_DENOMINATOR};
 use soroban_sdk::{Address, Env, Symbol};
 use crate::{DataKey, get_platform_stats, set_platform_stats, polls, token_utils};
+use crate::{DataKey, get_platform_stats, set_platform_stats, token_utils, load_poll, store_poll, load_stake, store_stake};
 
 /// Resolve a poll using the registered oracle and record its final outcome.
 ///
@@ -153,6 +154,7 @@ fn load_resolved_poll(env: &Env, poll_id: u64) -> Result<Poll, PredictXError> {
         .storage()
         .persistent()
         .get(&DataKey::Poll(poll_id))
+    let mut poll: Poll = load_poll(env, poll_id)
         .ok_or(PredictXError::PollNotFound)?;
     if poll.status != PollStatus::Resolved {
         return Err(PredictXError::InvalidStateTransition);
@@ -269,6 +271,7 @@ pub(crate) fn record_poll_resolution(
         .set(&DataKey::Poll(poll.poll_id), poll);
         .set(&DataKey::Poll(poll_id), &poll);
     polls::transition_status(&env, poll_id, PollStatus::Resolved)?;
+    store_poll(env, &poll);
 
     let total_pool = poll.yes_pool + poll.no_pool;
     let fee = total_pool * token_utils::get_platform_fee_bps(env) as i128 / BPS_DENOMINATOR as i128;
@@ -334,10 +337,7 @@ pub fn claim_winnings(env: &Env, claimant: Address, poll_id: u64) -> Result<i128
 
     // ── Checks ────────────────────────────────────────────────────────────────
 
-    let poll: Poll = env
-        .storage()
-        .persistent()
-        .get(&DataKey::Poll(poll_id))
+    let poll: Poll = load_poll(env, poll_id)
         .ok_or(PredictXError::PollNotFound)?;
 /// ## Payouts that truncate to zero
 /// Returns [`PredictXError::PayoutRoundsToZero`] rather than transferring a
@@ -349,10 +349,7 @@ pub fn claim_winnings(env: &Env, claimant: Address, poll_id: u64) -> Result<i128
 
     let poll = load_resolved_poll(env, poll_id)?;
 
-    let mut stake: Stake = env
-        .storage()
-        .persistent()
-        .get(&DataKey::Stake(poll_id, claimant.clone()))
+    let mut stake: Stake = load_stake(env, poll_id, &claimant)
         .ok_or(PredictXError::NotStaker)?;
 
     if stake.claimed || has_emergency_claimed(env, poll_id, &claimant) {
@@ -525,9 +522,7 @@ pub fn claim_winnings(env: &Env, claimant: Address, poll_id: u64) -> Result<i128
     // ── Mark claimed & persist ───────────────────────────────────────────────
 
     stake.claimed = true;
-    env.storage()
-        .persistent()
-        .set(&DataKey::Stake(poll_id, claimant.clone()), &stake);
+    store_stake(env, poll_id, &stake);
 
     // ── Transfer the platform fee, then the payout ──────────────────────────
 
@@ -613,11 +608,14 @@ pub fn calculate_winnings(env: &Env, poll_id: u64, user: Address) -> Result<i128
         .storage()
         .persistent()
         .get(&DataKey::Poll(poll_id))
+pub fn calculate_winnings(
+    env: &Env,
+    poll_id: u64,
+    user: Address,
+) -> Result<i128, PredictXError> {
+    let poll: Poll = load_poll(env, poll_id)
         .ok_or(PredictXError::PollNotFound)?;
-    let stake: Stake = env
-        .storage()
-        .persistent()
-        .get(&DataKey::Stake(poll_id, user))
+    let stake: Stake = load_stake(env, poll_id, &user)
         .ok_or(PredictXError::NotStaker)?;
     if poll.status != PollStatus::Resolved {
         return Err(PredictXError::PollNotLocked);

@@ -20,6 +20,7 @@ use predictx_shared::{
     Poll, PollStatus, PredictXError, Stake, StakeSide, BPS_DENOMINATOR, MIN_STAKE_AMOUNT,
 };
 use soroban_sdk::{Address, Env, Symbol, Vec};
+use crate::{DataKey, PoolInfo, get_platform_stats, set_platform_stats, ensure_not_paused, token_utils, load_poll, store_poll, store_stake};
 
 // ── Stake placement ───────────────────────────────────────────────────────────
 
@@ -55,10 +56,7 @@ pub fn stake(
         return Err(PredictXError::StakeAboveMaximum);
     }
 
-    let mut poll: Poll = env
-        .storage()
-        .persistent()
-        .get(&DataKey::Poll(poll_id))
+    let mut poll: Poll = load_poll(env, poll_id)
         .ok_or(PredictXError::PollNotFound)?;
 
     if poll.status != PollStatus::Active {
@@ -102,9 +100,7 @@ pub fn stake(
     };
 
     // Store stake record + flag
-    env.storage()
-        .persistent()
-        .set(&DataKey::Stake(poll_id, staker.clone()), &stake_record);
+    store_stake(env, poll_id, &stake_record);
     env.storage()
         .persistent()
         .set(&DataKey::HasStaked(poll_id, staker.clone()), &true);
@@ -134,9 +130,7 @@ pub fn stake(
             poll.no_count += 1;
         }
     }
-    env.storage()
-        .persistent()
-        .set(&DataKey::Poll(poll_id), &poll);
+    store_poll(env, &poll);
 
     // Track user's staked polls
     let mut user_stakes: Vec<u64> = env
@@ -168,9 +162,8 @@ pub fn stake(
 
 /// Retrieve a user's stake record for a poll.
 pub fn get_stake_info(env: &Env, poll_id: u64, user: &Address) -> Result<Stake, PredictXError> {
-    env.storage()
-        .persistent()
-        .get(&DataKey::Stake(poll_id, user.clone()))
+    use crate::load_stake;
+    load_stake(env, poll_id, user)
         .ok_or(PredictXError::NotStaker)
 }
 
@@ -252,10 +245,7 @@ pub fn calculate_potential_winnings(
         return Err(PredictXError::StakeAmountZero);
     }
 
-    let poll: Poll = env
-        .storage()
-        .persistent()
-        .get(&DataKey::Poll(poll_id))
+    let poll: Poll = load_poll(env, poll_id)
         .ok_or(PredictXError::PollNotFound)?;
 
     let pool_on_side = match side {
@@ -278,10 +268,7 @@ pub fn calculate_potential_winnings(
 
 /// Return pool state for a poll.
 pub fn get_pool_info(env: &Env, poll_id: u64) -> Result<PoolInfo, PredictXError> {
-    let poll: Poll = env
-        .storage()
-        .persistent()
-        .get(&DataKey::Poll(poll_id))
+    let poll: Poll = load_poll(env, poll_id)
         .ok_or(PredictXError::PollNotFound)?;
 
     Ok(PoolInfo {

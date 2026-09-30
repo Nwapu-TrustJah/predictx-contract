@@ -307,6 +307,68 @@ fn set_emergency_claimed(env: &Env, poll_id: u64, user: &Address) {
     env.storage()
         .persistent()
         .set(&DataKey::EmergencyClaimed(poll_id, user.clone()), &true);
+    let key = DataKey::Stake(poll_id, user.clone());
+    let result = env.storage().persistent().get(&key);
+    if result.is_some() {
+        env.storage()
+            .persistent()
+            .extend_ttl(&key, TTL_THRESHOLD_LEDGERS, TTL_EXTEND_TO_LEDGERS);
+    }
+    result
+}
+
+fn has_emergency_claimed(env: &Env, poll_id: u64, user: &Address) -> bool {
+    let key = DataKey::EmergencyClaimed(poll_id, user.clone());
+    let result = env.storage().persistent()
+        .get(&key)
+        .unwrap_or(false);
+    if result {
+        env.storage()
+            .persistent()
+            .extend_ttl(&key, TTL_THRESHOLD_LEDGERS, TTL_EXTEND_TO_LEDGERS);
+    }
+    result
+}
+
+fn set_emergency_claimed(env: &Env, poll_id: u64, user: &Address) {
+    let key = DataKey::EmergencyClaimed(poll_id, user.clone());
+    env.storage().persistent()
+        .set(&key, &true);
+    env.storage()
+        .persistent()
+        .extend_ttl(&key, TTL_THRESHOLD_LEDGERS, TTL_EXTEND_TO_LEDGERS);
+}
+
+// ── Poll TTL helpers ──────────────────────────────────────────────────────────
+
+/// Load a poll from persistent storage and extend its TTL.
+pub(crate) fn load_poll(env: &Env, poll_id: u64) -> Option<Poll> {
+    let key = DataKey::Poll(poll_id);
+    let result = env.storage().persistent().get(&key);
+    if result.is_some() {
+        env.storage()
+            .persistent()
+            .extend_ttl(&key, TTL_THRESHOLD_LEDGERS, TTL_EXTEND_TO_LEDGERS);
+    }
+    result
+}
+
+/// Store a poll to persistent storage and extend its TTL.
+pub(crate) fn store_poll(env: &Env, poll: &Poll) {
+    let key = DataKey::Poll(poll.poll_id);
+    env.storage().persistent().set(&key, poll);
+    env.storage()
+        .persistent()
+        .extend_ttl(&key, TTL_THRESHOLD_LEDGERS, TTL_EXTEND_TO_LEDGERS);
+}
+
+/// Store a stake to persistent storage and extend its TTL.
+pub(crate) fn store_stake(env: &Env, poll_id: u64, stake: &Stake) {
+    let key = DataKey::Stake(poll_id, stake.user.clone());
+    env.storage().persistent().set(&key, stake);
+    env.storage()
+        .persistent()
+        .extend_ttl(&key, TTL_THRESHOLD_LEDGERS, TTL_EXTEND_TO_LEDGERS);
 }
 
 /// Extend the TTL of instance storage so the contract's admin, token and
@@ -360,6 +422,23 @@ fn assert_compatible_oracle(env: &Env, oracle_id: &Address) -> Result<(), Predic
         _ => Err(PredictXError::InvalidOracle),
     }
 }
+// ── TTL configuration ─────────────────────────────────────────────────────────
+
+/// Minimum ledger-entries remaining before we extend a persistent entry.
+///
+/// Soroban archives entries whose TTL lapses. We bump the TTL whenever an entry
+/// is read or written and fewer than this many ledgers remain.
+const TTL_THRESHOLD_LEDGERS: u32 = 17_280; // ~1 day at 5s/ledger
+
+/// Target TTL to extend persistent entries to (in ledgers).
+///
+/// Chosen to cover the longest realistic poll lifetime:
+/// • Creation → lock time: up to 7 days
+/// • Lock → resolution: up to 3 days (match + voting window)
+/// • Resolution → emergency deadline: 7 days (EMERGENCY_TIMEOUT_SECS)
+/// Total: ~17 days × 17_280 ledgers/day = 293_760 ledgers.
+/// Add buffer for dispute resolution: 345_600 ledgers (~20 days).
+const TTL_EXTEND_TO_LEDGERS: u32 = 345_600;
 
 #[contractimpl]
 impl PredictionMarket {
@@ -834,6 +913,7 @@ impl PredictionMarket {
             .persistent()
             .set(&DataKey::Poll(poll_id), &poll);
         polls::add_to_index(&env, poll_id, PollStatus::Active);
+        store_poll(&env, &poll);
 
         match_polls.push_back(poll_id);
         env.storage()
@@ -892,6 +972,7 @@ impl PredictionMarket {
             .storage()
             .persistent()
             .get(&DataKey::Poll(poll_id))
+        let mut poll: Poll = load_poll(&env, poll_id)
             .ok_or(PredictXError::PollNotFound)?;
 
         // Lazily self-correct (issue #125): a poll past its lock time whose
@@ -917,6 +998,7 @@ impl PredictionMarket {
             .persistent()
             .set(&DataKey::Poll(poll_id), &poll);
         polls::transition_status(&env, poll_id, PollStatus::Resolved)?;
+        store_poll(&env, &poll);
 
         Ok(())
     }
@@ -934,9 +1016,7 @@ impl PredictionMarket {
 
         poll.status == PollStatus::Active && env.ledger().timestamp() < poll.lock_time
     pub fn get_poll(env: Env, poll_id: u64) -> Result<Poll, PredictXError> {
-        env.storage()
-            .persistent()
-            .get(&DataKey::Poll(poll_id))
+        load_poll(&env, poll_id)
             .ok_or(PredictXError::PollNotFound)
     }
 
@@ -2006,6 +2086,10 @@ mod test {
 
     #[test]
     fn initialize_rejects_duplicate_treasury_and_token() {
+    // ── TTL extension tests ───────────────────────────────────────────────────
+
+    #[test]
+    fn poll_read_extends_ttl() {
         let env = Env::default();
         env.mock_all_auths();
         let contract_id = env.register(PredictionMarket, ());
@@ -2155,6 +2239,25 @@ mod test {
 
     #[test]
     fn initialize_rejects_duplicate_oracle_and_token() {
+        
+        seed_active_poll(&env, &contract_id, 1, &admin);
+        
+        // Read the poll and verify TTL was extended
+        let _poll = client.get_poll(&1_u64);
+        
+        // Check TTL using ledger info
+        let ttl = env.as_contract(&contract_id, || {
+            env.storage()
+                .persistent()
+                .get_ttl(&DataKey::Poll(1))
+        });
+        
+        // TTL should be at least TTL_EXTEND_TO_LEDGERS
+        assert!(ttl >= super::TTL_EXTEND_TO_LEDGERS);
+    }
+
+    #[test]
+    fn poll_write_extends_ttl() {
         let env = Env::default();
         env.mock_all_auths();
         let contract_id = env.register(PredictionMarket, ());
@@ -2795,4 +2898,80 @@ mod test {
             .expect_err("already");
         assert_eq!(err, Ok(PredictXError::PollAlreadyResolved));
     }
+}
+        
+        seed_active_poll(&env, &contract_id, 2, &admin);
+        
+        // Resolve poll (write operation)
+        client.resolve_poll(&oracle, &2_u64, &true);
+        
+        // Check TTL
+        let ttl = env.as_contract(&contract_id, || {
+            env.storage()
+                .persistent()
+                .get_ttl(&DataKey::Poll(2))
+        });
+        
+        assert!(ttl >= super::TTL_EXTEND_TO_LEDGERS);
+    }
+
+    #[test]
+    fn stake_read_extends_ttl() {
+        let env = Env::default();
+        env.mock_all_auths();
+        let admin = Address::generate(&env);
+        
+        let oracle_id = env.register(voting_oracle::WASM, ());
+        let oracle_client = voting_oracle::Client::new(&env, &oracle_id);
+        oracle_client.initialize(&admin);
+        
+        let token_admin = Address::generate(&env);
+        let token_contract = env.register_stellar_asset_contract_v2(token_admin.clone());
+        let token_addr = token_contract.address();
+        
+        let contract_id = env.register(PredictionMarket, ());
+        let client = PredictionMarketClient::new(&env, &contract_id);
+        let treasury = Address::generate(&env);
+        client.initialize(&admin, &oracle_id, &token_addr, &treasury, &TEST_FEE_BPS);
+        
+        env.ledger().with_mut(|l| l.timestamp = 1_000_000);
+        
+        // Create a match and poll
+        let match_id = client.create_match(
+            &admin,
+            &String::from_str(&env, "Team A"),
+            &String::from_str(&env, "Team B"),
+            &String::from_str(&env, "League"),
+            &String::from_str(&env, "Stadium"),
+            &2_000_000,
+        );
+        let poll_id = client.create_poll(
+            &admin,
+            &match_id,
+            &String::from_str(&env, "Question?"),
+            &PollCategory::TeamEvent,
+            &2_000_000,
+        );
+        
+        // Stake
+        let user = Address::generate(&env);
+        let amount: i128 = 50_000_000;
+        let sac = token::StellarAssetClient::new(&env, &token_addr);
+        sac.mint(&user, &amount);
+        
+        client.stake(&user, &poll_id, &amount, &StakeSide::Yes);
+        
+        // Read stake info
+        let _stake = client.get_stake_info(&poll_id, &user);
+        
+        // Check TTL
+        let ttl = env.as_contract(&contract_id, || {
+            env.storage()
+                .persistent()
+                .get_ttl(&DataKey::Stake(poll_id, user.clone()))
+        });
+        
+        assert!(ttl >= super::TTL_EXTEND_TO_LEDGERS);
+    }
+
 }
