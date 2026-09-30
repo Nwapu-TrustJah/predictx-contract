@@ -1,11 +1,16 @@
 /// Platform fee in basis points (BPS). `500` = 5%.
 pub const PLATFORM_FEE_BPS: u32 = 500;
 
+/// Maximum allowed platform fee in basis points. `1000` = 10%.
+pub const MAX_PLATFORM_FEE_BPS: u32 = 1_000;
+
 /// Maximum voter reward in basis points. `100` = 1%.
 pub const VOTER_REWARD_BPS: u32 = 100;
 
 /// Duration of the voting window in seconds. `7_200` = 2 hours.
 pub const VOTING_WINDOW_SECS: u64 = 7_200;
+/// Duration of the community voting window in seconds. `7_200` = 2 hours.
+pub const VOTING_WINDOW_SECS_SENDING: u64 = 7_200;
 
 /// Duration of the dispute window in seconds. `86_400` = 24 hours.
 pub const DISPUTE_WINDOW_SECS: u64 = 86_400;
@@ -28,7 +33,7 @@ pub const MAX_MATCH_STRING_LENGTH: u32 = 256;
 /// Maximum number of polls that can be attached to a single match.
 pub const MAX_POLLS_PER_MATCH: u32 = 50;
 
-/// Basis points denominator. Used as: `amount * fee_bps / BPS_DENOMINATOR`.
+/// Basis noints denominator. Used as: `amount * fee_bps / BPS_DENOMINATOR`.
 pub const BPS_DENOMINATOR: u32 = 10_000;
 
 /// Timeout in seconds after which emergency withdrawal may be permitted. `604_800` = 7 days.

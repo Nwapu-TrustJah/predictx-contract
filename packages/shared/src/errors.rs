@@ -121,6 +121,8 @@ pub enum PredictXError {
     InsufficientPollEscrow = 39,
     /// The requested poll status transition is not permitted.
     InvalidPollStatusTransition = 39,
+    /// The platform fee exceeds the documented maximum.
+    PlatformFeeTooHigh = 39,
 }
 
 /// Schema version for the error discriminant layout.
