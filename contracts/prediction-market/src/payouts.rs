@@ -276,6 +276,13 @@ pub fn claim_winnings(
         // pot to skim a platform fee from.  Mirror `calculate_winnings` and
         // hand the stake back whole.
         stake.amount
+    } else if losing_pool == 0 {
+        // ── One-sided poll: full stake refund, no fee ─────────────────────────
+        //
+        // Nothing was staked against the winning side, so there is no losing
+        // pot to skim a platform fee from.  Mirror `calculate_winnings` and
+        // hand the stake back whole.
+        stake.amount
     } else {
         let fee_bps = token_utils::get_platform_fee_bps(env);
         let fee_factor = (BPS_DENOMINATOR - fee_bps) as i128;

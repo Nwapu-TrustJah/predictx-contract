@@ -6,6 +6,9 @@ mod staking;
 mod payouts;
 pub(crate) mod token_utils;
 
+#[cfg(test)]
+mod e2e;
+
 use predictx_shared::{
     Match, PlatformStats, Poll, PollCategory, PollStatus, PredictXError, Stake, StakeSide,
     UserStats, BPS_DENOMINATOR, MAX_POLLS_PER_MATCH,
@@ -611,6 +614,7 @@ impl PredictionMarket {
         Ok(poll)
         payouts::resolve_poll(&env, caller, poll_id, outcome)
         payouts::record_poll_resolution(&env, &mut poll, outcome)
+        payouts::resolve_poll(&env, caller, poll_id, outcome)
     }
 
     pub fn get_poll(env: Env, poll_id: u64) -> Result<Poll, PredictXError> {
