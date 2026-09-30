@@ -170,6 +170,14 @@ pub struct MatchStats {
     pub poll_count: u32,
     pub total_staked: i128,
     pub distinct_stakers: u64,
+#[contracttype]
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct ContractConfig {
+    pub admin: Address,
+    pub voting_oracle: Address,
+    pub token_address: Address,
+    pub treasury_address: Address,
+    pub platform_fee_bps: u32,
 }
 
 fn get_admin(env: &Env) -> Result<Address, PredictXError> {
@@ -186,6 +194,14 @@ fn get_oracle(env: &Env) -> Result<Address, PredictXError> {
         .instance()
         .get(&DataKey::VotingOracle)
         .ok_or(PredictXError::NotInitialized)
+}
+
+fn require_initialized(env: &Env) -> Result<(), PredictXError> {
+    if env.storage().instance().get::<_, bool>(&DataKey::Initialized).unwrap_or(false) {
+        Ok(())
+    } else {
+        Err(PredictXError::NotInitialized)
+    }
 }
 
 fn is_paused(env: &Env) -> bool {
@@ -452,6 +468,23 @@ impl PredictionMarket {
     /// emitted.
     pub fn set_oracle(env: Env, voting_oracle: Address) -> Result<(), PredictXError> {
         extend_instance_ttl(&env);
+    pub fn is_initialized(env: Env) -> bool {
+        env.storage().instance().get::<_, bool>(&DataKey::Initialized).unwrap_or(false)
+    }
+
+    pub fn get_configuration(env: Env) -> Result<ContractConfig, PredictXError> {
+        require_initialized(&env)?;
+        Ok(ContractConfig {
+            admin: get_admin(&env)?,
+            voting_oracle: get_oracle(&env)?,
+            token_address: token_utils::get_token_address(&env)?,
+            treasury_address: token_utils::get_treasury_address(&env)?,
+            platform_fee_bps: token_utils::get_platform_fee_bps(&env),
+        })
+    }
+
+    pub fn set_oracle(env: Env, voting_oracle: Address) -> Result<(), PredictXError> {
+        require_initialized(&env)?;
         ensure_not_paused(&env)?;
         let admin = get_admin(&env)?;
         admin.require_auth();
@@ -477,6 +510,7 @@ impl PredictionMarket {
 
     pub fn pause(env: Env, admin: Address) -> Result<(), PredictXError> {
         extend_instance_ttl(&env);
+        require_initialized(&env)?;
         let stored_admin = get_admin(&env)?;
         if admin != stored_admin {
             return Err(PredictXError::Unauthorized);
@@ -490,6 +524,7 @@ impl PredictionMarket {
 
     pub fn unpause(env: Env, admin: Address) -> Result<(), PredictXError> {
         extend_instance_ttl(&env);
+        require_initialized(&env)?;
         let stored_admin = get_admin(&env)?;
         if admin != stored_admin {
             return Err(PredictXError::Unauthorized);
@@ -521,6 +556,7 @@ impl PredictionMarket {
     /// cancelling from.
     pub fn cancel_poll(env: Env, admin: Address, poll_id: u64) -> Result<(), PredictXError> {
         extend_instance_ttl(&env);
+        require_initialized(&env)?;
         ensure_not_paused(&env)?;
         let stored_admin = get_admin(&env)?;
         if admin != stored_admin {
@@ -636,6 +672,8 @@ impl PredictionMarket {
         poll_id: u64,
     ) -> Result<i128, PredictXError> {
         extend_instance_ttl(&env);
+    pub fn emergency_withdraw(env: Env, user: Address, poll_id: u64) -> Result<i128, PredictXError> {
+        require_initialized(&env)?;
         user.require_auth();
         let poll: Poll = env.storage().persistent()
             .get(&DataKey::Poll(poll_id))
@@ -699,6 +737,7 @@ impl PredictionMarket {
         lock_time: u64,
     ) -> Result<u64, PredictXError> {
         extend_instance_ttl(&env);
+        require_initialized(&env)?;
         ensure_not_paused(&env)?;
         creator.require_auth();
 
@@ -789,6 +828,7 @@ impl PredictionMarket {
     ) -> Result<(), PredictXError> {
         extend_instance_ttl(&env);
         ensure_not_paused(&env)?;
+        require_initialized(&env)?;
         caller.require_auth();
         let oracle = get_oracle(&env)?;
         if caller != oracle {
@@ -851,6 +891,7 @@ impl PredictionMarket {
         side: StakeSide,
     ) -> Result<Stake, PredictXError> {
         extend_instance_ttl(&env);
+        require_initialized(&env)?;
         staking::stake(&env, staker, poll_id, amount, side)
     }
 
@@ -876,6 +917,7 @@ impl PredictionMarket {
         side: StakeSide,
         amount: i128,
     ) -> Result<i128, PredictXError> {
+        require_initialized(&env)?;
         staking::calculate_potential_winnings(&env, poll_id, side, amount)
     }
 
@@ -946,8 +988,9 @@ impl PredictionMarket {
         token_utils::get_treasury_address(&env)
     }
 
-    pub fn get_platform_fee_bps(env: Env) -> u32 {
-        token_utils::get_platform_fee_bps(&env)
+    pub fn get_platform_fee_bps(env: Env) -> Result<u32, PredictXError> {
+        require_initialized(&env)?;
+        Ok(token_utils::get_platform_fee_bps(&env))
     }
 
     pub fn get_contract_balance(env: Env) -> Result<i128, PredictXError> {
@@ -975,6 +1018,8 @@ impl PredictionMarket {
             venue,
             kickoff_time,
         )
+        require_initialized(&env)?;
+        matches::create_match(&env, admin, home_team, away_team, league, venue, kickoff_time)
     }
 
     pub fn update_match(
@@ -1002,6 +1047,12 @@ impl PredictionMarket {
 
     pub fn finish_match(env: Env, admin: Address, match_id: u64) -> Result<(), PredictXError> {
         extend_instance_ttl(&env);
+        require_initialized(&env)?;
+        matches::update_match(&env, admin, match_id, home_team, away_team, league, venue, kickoff_time)
+    }
+
+    pub fn finish_match(env: Env, admin: Address, match_id: u64) -> Result<(), PredictXError> {
+        require_initialized(&env)?;
         matches::finish_match(&env, admin, match_id)
     }
 
@@ -1052,6 +1103,7 @@ impl PredictionMarket {
         poll_id: u64,
     ) -> Result<i128, PredictXError> {
         extend_instance_ttl(&env);
+        require_initialized(&env)?;
         payouts::claim_winnings(&env, claimant, poll_id)
     }
 
@@ -1061,9 +1113,13 @@ impl PredictionMarket {
         user: Address,
     ) -> Result<i128, PredictXError> {
         extend_instance_ttl(&env);
+        require_initialized(&env)?;
         payouts::calculate_winnings(&env, poll_id, user)
         payouts::resolve_poll(&env, caller, poll_id, outcome)
     }
+
+
+
 }
 
 #[cfg(test)]
@@ -2472,4 +2528,60 @@ mod test {
         assert_eq!(client.get_token_address(), token);
         assert_eq!(client.get_treasury_address(), treasury);
     }
+}
+
+    #[test]
+    fn uninitialized_contract_rejects_mutation_and_fee_queries() {
+        let env = Env::default();
+        env.mock_all_auths();
+
+        let contract_id = env.register(PredictionMarket, ());
+        let client = PredictionMarketClient::new(&env, &contract_id);
+        let oracle = Address::generate(&env);
+
+        assert!(!client.is_initialized());
+
+        let err = client
+            .try_set_oracle(&oracle)
+            .expect_err("uninitialized contract must reject mutation");
+        assert_eq!(err, Ok(PredictXError::NotInitialized));
+
+        let err = client
+            .try_get_platform_fee_bps()
+            .expect_err("uninitialized contract must reject fee query");
+        assert_eq!(err, Ok(PredictXError::NotInitialized));
+
+        let err = client
+            .try_get_configuration()
+            .expect_err("uninitialized contract must reject config query");
+        assert_eq!(err, Ok(PredictXError::NotInitialized));
+    }
+
+    #[test]
+    fn initialization_state_and_configuration_are_exposed() {
+        let env = Env::default();
+        env.mock_all_auths();
+
+        let contract_id = env.register(PredictionMarket, ());
+        let client = PredictionMarketClient::new(&env, &contract_id);
+
+        let admin = Address::generate(&env);
+        let oracle = Address::generate(&env);
+        let token = Address::generate(&env);
+        let treasury = Address::generate(&env);
+
+        assert!(!client.is_initialized());
+
+        client.initialize(&admin, &oracle, &token, &treasury, &TEST_FEE_BPS);
+
+        assert!(client.is_initialized());
+
+        let config = client.get_configuration();
+        assert_eq!(config.admin, admin);
+        assert_eq!(config.voting_oracle, oracle);
+        assert_eq!(config.token_address, token);
+        assert_eq!(config.treasury_address, treasury);
+        assert_eq!(config.platform_fee_bps, TEST_FEE_BPS);
+    }
+
 }
