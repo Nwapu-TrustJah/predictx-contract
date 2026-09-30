@@ -14,7 +14,7 @@ use predictx_shared::{
     DataKey, Match, PlatformStats, Poll, PollCategory, PollStatus, PredictXError, Stake, StakeSide,
     MAX_POLLS_PER_MATCH,
 };
-use soroban_sdk::{contract, contractimpl, contracttype, Address, Env, String, Symbol, Vec};
+use soroban_sdk::{contract, contractimpl, contracttype, token, Address, Env, String, Symbol, Vec};
 
 mod payouts;
 mod voting_oracle {
@@ -334,6 +334,24 @@ impl PredictionMarket {
             return Err(PredictXError::AlreadyInitialized);
         }
         admin.require_auth();
+
+        // Validate that all four addresses are distinct
+        if admin == voting_oracle
+            || admin == token_address
+            || admin == treasury_address
+            || voting_oracle == token_address
+            || voting_oracle == treasury_address
+            || token_address == treasury_address
+        {
+            return Err(PredictXError::DuplicateAddress);
+        }
+
+        // Validate that token_address resolves to a live token contract
+        let token_client = token::Client::new(&env, &token_address);
+        if !matches!(token_client.try_decimals(), Ok(Ok(_))) {
+            return Err(PredictXError::InvalidTokenAddress);
+        }
+
         env.storage().instance().set(&DataKey::Admin, &admin);
         env.storage()
             .instance()
@@ -1069,6 +1087,9 @@ mod test {
                 .persistent()
                 .set(&DataKey::Poll(poll_id), &poll);
         });
+    fn create_test_token(env: &Env) -> Address {
+        let token_admin = Address::generate(env);
+        env.register_stellar_asset_contract_v2(token_admin).address()
     }
 
     #[test]
@@ -1079,7 +1100,7 @@ mod test {
         let client = PredictionMarketClient::new(&env, &contract_id);
         let admin = Address::generate(&env);
         let oracle = Address::generate(&env);
-        let token = Address::generate(&env);
+        let token = create_test_token(&env);
         let treasury = Address::generate(&env);
         client.initialize(&admin, &oracle, &token, &treasury, &TEST_FEE_BPS);
         assert_eq!(client.admin(), admin);
@@ -1094,7 +1115,7 @@ mod test {
         let client = PredictionMarketClient::new(&env, &contract_id);
         let admin = Address::generate(&env);
         let oracle = Address::generate(&env);
-        let tok = Address::generate(&env);
+        let tok = create_test_token(&env);
         let treasury = Address::generate(&env);
         client.initialize(&admin, &oracle, &tok, &treasury, &TEST_FEE_BPS);
         assert_eq!(client.get_token_address(), tok);
@@ -1110,7 +1131,7 @@ mod test {
         let client = PredictionMarketClient::new(&env, &contract_id);
         let admin = Address::generate(&env);
         let oracle = Address::generate(&env);
-        let token = Address::generate(&env);
+        let token = create_test_token(&env);
         let treasury = Address::generate(&env);
         client.initialize(&admin, &oracle, &token, &treasury, &TEST_FEE_BPS);
         let err = client
@@ -1134,6 +1155,8 @@ mod test {
         oracle_client.set_poll_status(&admin, &7_u64, &voting_oracle::PollStatus::Resolved);
         let contract_id = env.register(PredictionMarket, ());
         let client = PredictionMarketClient::new(&env, &contract_id);
+        let tok = create_test_token(&env);
+        let treasury = Address::generate(&env);
         client.initialize(&admin, &oracle_id, &tok, &treasury, &TEST_FEE_BPS);
         let status = client.oracle_poll_status(&7_u64);
         assert_eq!(status, PollStatus::Resolved);
@@ -1147,7 +1170,7 @@ mod test {
         let client = PredictionMarketClient::new(&env, &contract_id);
         let admin = Address::generate(&env);
         let oracle = Address::generate(&env);
-        let tok = Address::generate(&env);
+        let tok = create_test_token(&env);
         let treasury = Address::generate(&env);
         client.initialize(&admin, &oracle, &tok, &treasury, &TEST_FEE_BPS);
         assert_eq!(client.is_paused(), false);
@@ -1172,6 +1195,7 @@ mod test {
         oracle_client.initialize(&admin, &tok);
         let contract_id = env.register(PredictionMarket, ());
         let client = PredictionMarketClient::new(&env, &contract_id);
+        let tok = create_test_token(&env);
         let treasury = Address::generate(&env);
         client.initialize(&admin, &oracle_id, &tok, &treasury, &TEST_FEE_BPS);
         seed_active_poll(&env, &contract_id, 1);
@@ -1567,7 +1591,7 @@ mod test {
         let admin = Address::generate(&env);
         let oracle = Address::generate(&env);
         let stranger = Address::generate(&env);
-        let tok = Address::generate(&env);
+        let tok = create_test_token(&env);
         let treasury = Address::generate(&env);
         client.initialize(&admin, &oracle, &tok, &treasury, &TEST_FEE_BPS);
         seed_active_poll(&env, &contract_id, 1, &admin);
@@ -1586,7 +1610,7 @@ mod test {
         let client = PredictionMarketClient::new(&env, &contract_id);
         let admin = Address::generate(&env);
         let oracle = Address::generate(&env);
-        let tok = Address::generate(&env);
+        let tok = create_test_token(&env);
         let treasury = Address::generate(&env);
         client.initialize(&admin, &oracle, &tok, &treasury, &TEST_FEE_BPS);
         let err = client.try_resolve_poll(&admin, &99_u64, &false).expect_err("missing");
@@ -1606,7 +1630,7 @@ mod test {
         let client = PredictionMarketClient::new(&env, &contract_id);
         let admin = Address::generate(&env);
         let oracle = Address::generate(&env);
-        let tok = Address::generate(&env);
+        let tok = create_test_token(&env);
         let treasury = Address::generate(&env);
         client.initialize(&admin, &oracle, &tok, &treasury, &TEST_FEE_BPS);
         seed_active_poll(&env, &contract_id, 7, &admin);
@@ -1628,7 +1652,7 @@ mod test {
         let client = PredictionMarketClient::new(&env, &contract_id);
         let admin = Address::generate(&env);
         let oracle = Address::generate(&env);
-        let tok = Address::generate(&env);
+        let tok = create_test_token(&env);
         let treasury = Address::generate(&env);
         client.initialize(&admin, &oracle, &tok, &treasury, &TEST_FEE_BPS);
         seed_active_poll(&env, &contract_id, 3, &admin);
@@ -1675,6 +1699,7 @@ mod test {
 
     #[test]
     fn get_poll_status_returns_market_poll_status() {
+    fn initialize_rejects_duplicate_admin_and_treasury() {
         let env = Env::default();
         env.mock_all_auths();
         let contract_id = env.register(PredictionMarket, ());
@@ -1696,6 +1721,15 @@ mod test {
 
     #[test]
     fn proposal_can_be_overwritten_or_cancelled() {
+        let token = create_test_token(&env);
+        let err = client
+            .try_initialize(&admin, &oracle, &token, &admin, &TEST_FEE_BPS)
+            .expect_err("duplicate admin and treasury should fail");
+        assert_eq!(err, Ok(PredictXError::DuplicateAddress));
+    }
+
+    #[test]
+    fn initialize_rejects_duplicate_treasury_and_token() {
         let env = Env::default();
         env.mock_all_auths();
         let contract_id = env.register(PredictionMarket, ());
@@ -1836,6 +1870,15 @@ mod test {
 
     #[test]
     fn is_poll_open_returns_false_for_unknown_poll() {
+        let token = create_test_token(&env);
+        let err = client
+            .try_initialize(&admin, &oracle, &token, &token, &TEST_FEE_BPS)
+            .expect_err("duplicate treasury and token should fail");
+        assert_eq!(err, Ok(PredictXError::DuplicateAddress));
+    }
+
+    #[test]
+    fn initialize_rejects_duplicate_oracle_and_token() {
         let env = Env::default();
         env.mock_all_auths();
         let contract_id = env.register(PredictionMarket, ());
@@ -1900,6 +1943,18 @@ mod test {
         env.mock_all_auths();
         env.ledger().set_timestamp(1_000);
 
+        let token = create_test_token(&env);
+        let treasury = Address::generate(&env);
+        let err = client
+            .try_initialize(&admin, &token, &token, &treasury, &TEST_FEE_BPS)
+            .expect_err("duplicate oracle and token should fail");
+        assert_eq!(err, Ok(PredictXError::DuplicateAddress));
+    }
+
+    #[test]
+    fn initialize_rejects_non_token_address() {
+        let env = Env::default();
+        env.mock_all_auths();
         let contract_id = env.register(PredictionMarket, ());
         let client = PredictionMarketClient::new(&env, &contract_id);
         let admin = Address::generate(&env);
@@ -2249,6 +2304,18 @@ mod test {
         env.mock_all_auths();
         env.ledger().set_timestamp(1_000);
 
+        let non_token = Address::generate(&env);
+        let treasury = Address::generate(&env);
+        let err = client
+            .try_initialize(&admin, &oracle, &non_token, &treasury, &TEST_FEE_BPS)
+            .expect_err("non-token address should fail");
+        assert_eq!(err, Ok(PredictXError::InvalidTokenAddress));
+    }
+
+    #[test]
+    fn initialize_succeeds_with_valid_addresses() {
+        let env = Env::default();
+        env.mock_all_auths();
         let contract_id = env.register(PredictionMarket, ());
         let client = PredictionMarketClient::new(&env, &contract_id);
         let admin = Address::generate(&env);
@@ -2381,5 +2448,13 @@ mod test {
         assert_eq!(poll_id, 1);
         let poll = client.get_poll(&poll_id);
         assert_eq!(poll.creator, creator);
+        let token = create_test_token(&env);
+        let treasury = Address::generate(&env);
+        let res = client.initialize(&admin, &oracle, &token, &treasury, &TEST_FEE_BPS);
+        assert_eq!(res, ());
+        assert_eq!(client.admin(), admin);
+        assert_eq!(client.oracle(), oracle);
+        assert_eq!(client.get_token_address(), token);
+        assert_eq!(client.get_treasury_address(), treasury);
     }
 }

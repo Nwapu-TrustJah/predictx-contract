@@ -102,6 +102,10 @@ pub enum PredictXError {
     StakeAboveMaximum = 40,
     /// The stake is on the winning side but its payout rounds down to zero.
     PayoutRoundsToZero = 41,
+    /// Duplicate address provided among required distinct addresses.
+    DuplicateAddress = 39,
+    /// Address is not a valid token contract.
+    InvalidTokenAddress = 40,
 }
 
 #[cfg(test)]
