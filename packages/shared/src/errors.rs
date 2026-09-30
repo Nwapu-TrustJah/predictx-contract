@@ -106,6 +106,8 @@ pub enum PredictXError {
     DuplicateAddress = 39,
     /// Address is not a valid token contract.
     InvalidTokenAddress = 40,
+    /// The token address cannot be changed while the contract holds a balance.
+    ContractBalanceNotZero = 39,
 }
 
 #[cfg(test)]
