@@ -8,7 +8,7 @@ pub(crate) mod token_utils;
 
 use predictx_shared::{
     Match, PlatformStats, Poll, PollCategory, PollStatus, PredictXError, Stake, StakeSide,
-    MAX_POLLS_PER_MATCH,
+    UserStats, BPS_DENOMINATOR, MAX_POLLS_PER_MATCH,
 };
 use soroban_sdk::{contract, contractimpl, contracttype, Address, Env, String, Symbol, Vec};
 
@@ -109,6 +109,9 @@ pub enum DataKey {
     Poll(u64),
     UserStakes(Address),
     HasStaked(u64, Address),
+    /// `user` → `UserStats` — activity totals returned by the stats views. (Persistent)
+    /// Appended last so the discriminants of the existing keys never shift.
+    UserStats(Address),
 }
 
 /// Pool state returned by `get_pool_info`.
@@ -155,6 +158,45 @@ pub(crate) fn get_platform_stats(env: &Env) -> PlatformStats {
 
 pub(crate) fn set_platform_stats(env: &Env, stats: &PlatformStats) {
     env.storage().instance().set(&DataKey::PlatformStats, stats);
+}
+
+/// A `UserStats` record with every counter at zero.
+pub(crate) fn empty_user_stats() -> UserStats {
+    UserStats {
+        total_staked: 0,
+        total_won: 0,
+        total_lost: 0,
+        polls_participated: 0,
+        polls_won: 0,
+        polls_lost: 0,
+        votes_cast: 0,
+        voting_rewards_earned: 0,
+    }
+}
+
+/// Read a user's activity totals.
+///
+/// Users with no recorded activity get a zeroed record rather than an error so
+/// callers never have to special-case a first look-up.
+pub(crate) fn get_user_stats(env: &Env, user: &Address) -> UserStats {
+    env.storage()
+        .persistent()
+        .get(&DataKey::UserStats(user.clone()))
+        .unwrap_or_else(empty_user_stats)
+}
+
+/// A user's win rate in basis points:
+/// `polls_won * BPS_DENOMINATOR / (polls_won + polls_lost)`.
+///
+/// Returns `0` when no polls have settled yet — a brand-new account must not
+/// divide by zero, and an unsettled record has no meaningful ratio.
+pub(crate) fn get_user_win_rate(env: &Env, user: &Address) -> u32 {
+    let stats = get_user_stats(env, user);
+    let settled = stats.polls_won as u64 + stats.polls_lost as u64;
+    if settled == 0 {
+        return 0;
+    }
+    (stats.polls_won as u64 * BPS_DENOMINATOR as u64 / settled) as u32
 }
 
 fn load_stake(env: &Env, poll_id: u64, user: &Address) -> Option<Stake> {
@@ -534,6 +576,20 @@ impl PredictionMarket {
 
     pub fn get_platform_stats(env: Env) -> PlatformStats {
         get_platform_stats(&env)
+    }
+
+    // ── User stats view functions ─────────────────────────────────────────────
+
+    /// Per-user activity totals. Unknown users get a zeroed record.
+    pub fn get_user_stats(env: Env, user: Address) -> UserStats {
+        get_user_stats(&env, &user)
+    }
+
+    /// The user's win rate in basis points (`10_000` = 100%).
+    ///
+    /// Returns `0` for users with no settled polls.
+    pub fn get_user_win_rate(env: Env, user: Address) -> u32 {
+        get_user_win_rate(&env, &user)
     }
 
     // ── Token view functions ──────────────────────────────────────────────────
@@ -991,6 +1047,10 @@ mod test {
 
     #[test]
     fn accept_admin_only_callable_by_candidate() {
+    // ── User stats view tests ─────────────────────────────────────────────────
+
+    /// Register and initialise a market contract for the stats view assertions.
+    fn stats_env() -> (Env, Address, PredictionMarketClient<'static>) {
         let env = Env::default();
         env.mock_all_auths();
         let contract_id = env.register(PredictionMarket, ());
@@ -1184,4 +1244,94 @@ mod test {
         assert_eq!(poll.outcome, Some(false));
     }
 
+        (env, contract_id, client)
+    }
+
+    /// Write a `UserStats` record straight into contract storage.
+    fn seed_user_stats(env: &Env, contract_id: &Address, user: &Address, stats: &UserStats) {
+        env.as_contract(contract_id, || {
+            env.storage()
+                .persistent()
+                .set(&DataKey::UserStats(user.clone()), stats);
+        });
+    }
+
+    /// An unknown user must read back a zeroed record, not an error.
+    #[test]
+    fn get_user_stats_returns_zeros_for_unknown_user() {
+        let (env, _contract_id, client) = stats_env();
+        let stranger = Address::generate(&env);
+
+        assert_eq!(client.get_user_stats(&stranger), empty_user_stats());
+    }
+
+    /// The stored record is exposed verbatim and the win rate is 3/4 = 75%.
+    #[test]
+    fn get_user_stats_exposes_stored_record_and_win_rate() {
+        let (env, contract_id, client) = stats_env();
+        let user = Address::generate(&env);
+        seed_user_stats(
+            &env,
+            &contract_id,
+            &user,
+            &UserStats {
+                total_staked: 200_000_000,
+                total_won: 120_000_000,
+                total_lost: 60_000_000,
+                polls_participated: 4,
+                polls_won: 3,
+                polls_lost: 1,
+                votes_cast: 2,
+                voting_rewards_earned: 5_000_000,
+            },
+        );
+
+        let stats = client.get_user_stats(&user);
+        assert_eq!(stats.total_staked, 200_000_000);
+        assert_eq!(stats.polls_participated, 4);
+        assert_eq!(stats.polls_won, 3);
+        assert_eq!(stats.polls_lost, 1);
+
+        // polls_won * 10_000 / (polls_won + polls_lost) = 3 * 10_000 / 4 = 7_500 bps.
+        assert_eq!(client.get_user_win_rate(&user), 7_500);
+
+        // An unbeaten user sits at 10_000 bps (100%).
+        let unbeaten = Address::generate(&env);
+        seed_user_stats(
+            &env,
+            &contract_id,
+            &unbeaten,
+            &UserStats {
+                total_staked: 100_000_000,
+                polls_participated: 2,
+                polls_won: 2,
+                ..empty_user_stats()
+            },
+        );
+        assert_eq!(client.get_user_win_rate(&unbeaten), 10_000);
+    }
+
+    /// No settled polls means no ratio yet — return 0 instead of dividing by zero.
+    #[test]
+    fn get_user_win_rate_is_zero_without_settled_polls() {
+        let (env, contract_id, client) = stats_env();
+
+        // Never seen before: no record at all.
+        let stranger = Address::generate(&env);
+        assert_eq!(client.get_user_win_rate(&stranger), 0);
+
+        // Has staked, but none of their polls have settled yet.
+        let pending = Address::generate(&env);
+        seed_user_stats(
+            &env,
+            &contract_id,
+            &pending,
+            &UserStats {
+                total_staked: 50_000_000,
+                polls_participated: 3,
+                ..empty_user_stats()
+            },
+        );
+        assert_eq!(client.get_user_win_rate(&pending), 0);
+    }
 }
