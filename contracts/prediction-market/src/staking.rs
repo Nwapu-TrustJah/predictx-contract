@@ -5,6 +5,7 @@ use predictx_shared::{
     MIN_STAKE_AMOUNT, BPS_DENOMINATOR, MAX_USER_STAKES_PAGE_SIZE,
     DataKey, Poll, PollStatus, Stake, StakeSide, PredictXError,
     Poll, PollStatus, Stake, StakeSide, UserStats, PredictXError,
+    Poll, PollStatus, Stake, StakeSide, PredictXError, UserStats,
     MIN_STAKE_AMOUNT, BPS_DENOMINATOR,
 };
 use crate::{
@@ -360,6 +361,53 @@ pub fn get_pool_info(env: &Env, poll_id: u64) -> Result<PoolInfo, PredictXError>
     })
 }
 
+// ── User stats helpers ────────────────────────────────────────────────────────
+
+/// Record the outcome of a claim in the user's `UserStats`.
+///
+/// `total_won` is tracked as **net profit** (payout minus the original stake),
+/// not gross payout.  This keeps win-rate and ROI numbers meaningful: a user
+/// who breaks even on a large stake should not appear to have "won" that stake.
+///
+/// `outcome` semantics:
+/// - `Some(true)`  → winning claim: increments `polls_won`, adds net profit to `total_won`
+/// - `Some(false)` → losing position: increments `polls_lost`, adds stake to `total_lost`
+/// - `None`        → refund on a cancelled poll: counts as neither
+pub fn record_claim_outcome(
+    env: &Env,
+    user: &Address,
+    outcome: Option<bool>,
+    stake_amount: i128,
+    payout: i128,
+) {
+    let mut stats: UserStats = env
+        .storage()
+        .persistent()
+        .get(&DataKey::UserStats(user.clone()))
+        .unwrap_or(UserStats {
+            total_won: 0,
+            total_lost: 0,
+            polls_won: 0,
+            polls_lost: 0,
+        });
+
+    match outcome {
+        Some(true) => {
+            stats.polls_won += 1;
+            stats.total_won += payout - stake_amount;
+        }
+        Some(false) => {
+            stats.polls_lost += 1;
+            stats.total_lost += stake_amount;
+        }
+        None => {}
+    }
+
+    env.storage()
+        .persistent()
+        .set(&DataKey::UserStats(user.clone()), &stats);
+}
+
 // ── Tests ─────────────────────────────────────────────────────────────────────
 
 #[cfg(test)]
@@ -378,6 +426,8 @@ mod test {
     };
     use predictx_shared::{DataKey, PollCategory, PollStatus, PredictXError, StakeSide, Poll};
     use crate::{PredictionMarket, PredictionMarketClient};
+    use predictx_shared::{PollCategory, PollStatus, PredictXError, StakeSide, Poll, UserStats};
+    use crate::{DataKey, PredictionMarket, PredictionMarketClient};
 
     // ── Helpers ───────────────────────────────────────────────────────────────
 
@@ -1318,5 +1368,119 @@ mod test {
 
         // User still holds their original tokens
         assert_eq!(token_balance(&s, &user), mint_amount);
+
+    // ── UserStats on claim ────────────────────────────────────────────────────
+
+    #[test]
+    fn winning_claim_updates_user_stats() {
+        let s = setup();
+        let user = Address::generate(&s.env);
+        let stake_amount: i128 = 100_000_000;
+        let payout: i128 = 150_000_000;
+
+        s.env.as_contract(&s.contract_id, || {
+            crate::staking::record_claim_outcome(
+                &s.env,
+                &user,
+                Some(true),
+                stake_amount,
+                payout,
+            );
+        });
+
+        let stats: UserStats = s.env.as_contract(&s.contract_id, || {
+            s.env
+                .storage()
+                .persistent()
+                .get(&DataKey::UserStats(user.clone()))
+                .unwrap()
+        });
+        assert_eq!(stats.polls_won, 1);
+        assert_eq!(stats.polls_lost, 0);
+        assert_eq!(stats.total_won, payout - stake_amount);
+        assert_eq!(stats.total_lost, 0);
+    }
+
+    #[test]
+    fn losing_claim_updates_user_stats() {
+        let s = setup();
+        let user = Address::generate(&s.env);
+        let stake_amount: i128 = 80_000_000;
+
+        s.env.as_contract(&s.contract_id, || {
+            crate::staking::record_claim_outcome(
+                &s.env,
+                &user,
+                Some(false),
+                stake_amount,
+                0,
+            );
+        });
+
+        let stats: UserStats = s.env.as_contract(&s.contract_id, || {
+            s.env
+                .storage()
+                .persistent()
+                .get(&DataKey::UserStats(user.clone()))
+                .unwrap()
+        });
+        assert_eq!(stats.polls_won, 0);
+        assert_eq!(stats.polls_lost, 1);
+        assert_eq!(stats.total_won, 0);
+        assert_eq!(stats.total_lost, stake_amount);
+    }
+
+    #[test]
+    fn refund_claim_does_not_change_user_stats() {
+        let s = setup();
+        let user = Address::generate(&s.env);
+        let stake_amount: i128 = 60_000_000;
+
+        s.env.as_contract(&s.contract_id, || {
+            crate::staking::record_claim_outcome(
+                &s.env,
+                &user,
+                None,
+                stake_amount,
+                stake_amount,
+            );
+        });
+
+        let stats: UserStats = s.env.as_contract(&s.contract_id, || {
+            s.env
+                .storage()
+                .persistent()
+                .get(&DataKey::UserStats(user.clone()))
+                .unwrap()
+        });
+        assert_eq!(stats.polls_won, 0);
+        assert_eq!(stats.polls_lost, 0);
+        assert_eq!(stats.total_won, 0);
+        assert_eq!(stats.total_lost, 0);
+    }
+
+    #[test]
+    fn multiple_claims_accumulate_user_stats() {
+        let s = setup();
+        let user = Address::generate(&s.env);
+
+        s.env.as_contract(&s.contract_id, || {
+            crate::staking::record_claim_outcome(&s.env, &user, Some(true), 100, 200);
+            crate::staking::record_claim_outcome(&s.env, &user, Some(true), 100, 150);
+            crate::staking::record_claim_outcome(&s.env, &user, Some(false), 50, 0);
+            crate::staking::record_claim_outcome(&s.env, &user, None, 75, 75);
+        });
+
+        let stats: UserStats = s.env.as_contract(&s.contract_id, || {
+            s.env
+                .storage()
+                .persistent()
+                .get(&DataKey::UserStats(user.clone()))
+                .unwrap()
+        });
+        assert_eq!(stats.polls_won, 2);
+        assert_eq!(stats.polls_lost, 1);
+        assert_eq!(stats.total_won, 150);
+        assert_eq!(stats.total_lost, 50);
     }
 }

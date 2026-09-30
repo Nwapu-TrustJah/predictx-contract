@@ -22,6 +22,7 @@ use predictx_shared::{
     UserStats, MAX_POLLS_PER_MATCH,
     DataKey, Match, PlatformStats, Poll, PollCategory, PollStatus, PredictXError, Stake,
     StakeSide, MAX_POLLS_PER_MATCH,
+    UserStats, MAX_POLLS_PER_MATCH,
 };
 use soroban_sdk::{contract, contractimpl, contracttype, token, Address, Env, String, Symbol, Vec};
 
@@ -177,6 +178,7 @@ pub enum DataKey {
     UserStats(Address),
     PollEscrow(u64),
     PollOutflow(u64),
+    UserStats(Address),
 }
 
 /// Current on-chain schema version for stored types. Bump this whenever a
@@ -353,6 +355,51 @@ fn load_stake(env: &Env, poll_id: u64, user: &Address) -> Option<Stake> {
 }
 
 pub(crate) fn has_emergency_claimed(env: &Env, poll_id: u64, user: &Address) -> bool {
+pub(crate) fn get_user_stats(env: &Env, user: &Address) -> UserStats {
+    env.storage()
+        .persistent()
+        .get(&DataKey::UserStats(user.clone()))
+        .unwrap_or(UserStats {
+            total_won: 0,
+            total_lost: 0,
+            polls_won: 0,
+            polls_lost: 0,
+        })
+}
+
+pub(crate) fn set_user_stats(env: &Env, user: &Address, stats: &UserStats) {
+    env.storage()
+        .persistent()
+        .set(&DataKey::UserStats(user.clone()), stats);
+}
+
+/// Record the outcome of a claim against a user's lifetime stats.
+///
+/// `total_won` is tracked as **net profit** (payout minus the original stake),
+/// not gross payout. This keeps win-rate and ROI numbers meaningful: a user who
+/// stakes 100 and receives 150 back has won 50, not 150.
+///
+/// `total_lost` records the full stake for a losing position. A refund on a
+/// cancelled poll is neither a win nor a loss and must not call this helper.
+pub(crate) fn record_claim_outcome(
+    env: &Env,
+    user: &Address,
+    stake_amount: i128,
+    payout: i128,
+    won: bool,
+) {
+    let mut stats = get_user_stats(env, user);
+    if won {
+        stats.polls_won += 1;
+        stats.total_won += payout.saturating_sub(stake_amount);
+    } else {
+        stats.polls_lost += 1;
+        stats.total_lost += stake_amount;
+    }
+    set_user_stats(env, user, &stats);
+}
+
+fn has_emergency_claimed(env: &Env, poll_id: u64, user: &Address) -> bool {
     env.storage().persistent()
 fn has_emergency_claimed(env: &Env, poll_id: u64, user: &Address) -> bool {
     env.storage()

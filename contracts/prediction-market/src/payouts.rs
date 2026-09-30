@@ -119,7 +119,7 @@ pub fn resolve_poll(
     // ── Authorisation: admin or registered oracle ─────────────────────────
 use soroban_sdk::{Address, Env, Symbol};
 use predictx_shared::{
-    Poll, PollStatus, Stake, StakeSide, PredictXError,
+    Poll, PollStatus, Stake, StakeSide, UserStats, PredictXError,
     BPS_DENOMINATOR,
 };
 use crate::{get_platform_stats, set_platform_stats, token_utils};
@@ -487,6 +487,10 @@ pub fn claim_winnings(env: &Env, claimant: Address, poll_id: u64) -> Result<i128
         let net_losing_pool = losing_pool * fee_factor / bps;
         let share_of_losers = stake.amount * net_losing_pool / winning_pool;
         stake.amount + share_of_losers
+/// ## Stats accounting
+/// `total_won` records **net profit** (payout minus original stake), not the
+/// gross payout.  This keeps win-rate and ROI numbers meaningful: a user who
+/// breaks even on a large stake is not credited with a large "win".
 pub fn claim_winnings(
     env: &Env,
     claimant: Address,
@@ -546,6 +550,9 @@ pub fn claim_winnings(
         };
 
         if !staker_on_winning_side {
+            // Record the loss before bailing out: the stake is forfeit and the
+            // user's stats must reflect that they lost this poll.
+            record_loss(env, &claimant, stake.amount);
             return Err(PredictXError::NotOnWinningSide);
         }
 
@@ -682,6 +689,16 @@ pub fn claim_winnings(
 
     token_utils::transfer_from_contract(env, &claimant, payout)?;
 
+    // ── Update user stats ─────────────────────────────────────────────────────
+    //
+    // Refunds (empty winning pool) count as neither a win nor a loss: the
+    // staker simply got their money back, so we skip stats entirely.
+    if winning_pool != 0 {
+        // Net profit = payout - original stake.  `total_won` is NET, not gross.
+        let net_profit = payout - stake.amount;
+        record_win(env, &claimant, net_profit);
+    }
+
     // ── Update platform stats ─────────────────────────────────────────────────
 
     let mut stats = get_platform_stats(env);
@@ -765,6 +782,45 @@ pub fn calculate_winnings(env: &Env, poll_id: u64, user: Address) -> Result<i128
     );
 
     Ok(payout)
+}
+
+// ── User stats helpers ────────────────────────────────────────────────────────
+
+/// Load the caller's `UserStats`, creating a zeroed record on first touch.
+fn load_user_stats(env: &Env, user: &Address) -> UserStats {
+    env.storage()
+        .persistent()
+        .get(&DataKey::UserStats(user.clone()))
+        .unwrap_or(UserStats {
+            total_staked: 0,
+            total_won: 0,
+            total_lost: 0,
+            polls_won: 0,
+            polls_lost: 0,
+        })
+}
+
+fn save_user_stats(env: &Env, user: &Address, stats: &UserStats) {
+    env.storage()
+        .persistent()
+        .set(&DataKey::UserStats(user.clone()), stats);
+}
+
+/// Record a winning claim.  `net_profit` is the payout minus the original
+/// stake — `total_won` tracks **net profit**, never gross payout.
+fn record_win(env: &Env, user: &Address, net_profit: i128) {
+    let mut stats = load_user_stats(env, user);
+    stats.polls_won += 1;
+    stats.total_won += net_profit;
+    save_user_stats(env, user, &stats);
+}
+
+/// Record a losing position: the stake is forfeit and counts as lost.
+fn record_loss(env: &Env, user: &Address, stake_amount: i128) {
+    let mut stats = load_user_stats(env, user);
+    stats.polls_lost += 1;
+    stats.total_lost += stake_amount;
+    save_user_stats(env, user, &stats);
 }
 
 /// Calculate a resolved poll's payout for a user without transferring tokens.
@@ -1739,5 +1795,79 @@ mod test {
             Ok(PredictXError::EmergencyWithdrawNotAllowed)
         );
         assert_eq!(token_balance(&s, &winner), balance_after_claim);
+    // ── Tests: UserStats updates on claim ─────────────────────────────────────
+
+    /// A winning claim increments `polls_won` and adds NET profit to
+    /// `total_won` (payout minus original stake, not gross payout).
+    #[test]
+    fn winning_claim_updates_user_stats_with_net_profit() {
+        let s = setup();
+        let poll_id: u64 = 300;
+        let winner = Address::generate(&s.env);
+        let winning_stake: i128 = 100_000_000;
+        let losing_pool: i128 = 100_000_000;
+
+        mint_tokens(&s, &s.contract_id, winning_stake + losing_pool);
+        inject_resolved_poll(&s, poll_id, true, winning_stake, losing_pool);
+        inject_stake(&s, poll_id, &winner, winning_stake, StakeSide::Yes);
+
+        let payout = s.client.claim_winnings(&winner, &poll_id);
+        // gross = 100M * 200M / 100M = 200M; net = 200M * 9500 / 10000 = 190M
+        assert_eq!(payout, 190_000_000);
+
+        let stats = s.client.get_user_stats(&winner);
+        assert_eq!(stats.polls_won, 1);
+        assert_eq!(stats.polls_lost, 0);
+        // NET profit, not the 190M gross payout.
+        assert_eq!(stats.total_won, payout - winning_stake);
+        assert_eq!(stats.total_lost, 0);
+    }
+
+    /// A losing position increments `polls_lost` and records the stake as lost.
+    #[test]
+    fn losing_claim_updates_user_stats_with_stake_lost() {
+        let s = setup();
+        let poll_id: u64 = 301;
+        let loser = Address::generate(&s.env);
+        let amount: i128 = 75_000_000;
+
+        mint_tokens(&s, &s.contract_id, amount * 2);
+        inject_resolved_poll(&s, poll_id, true, amount, amount);
+        inject_stake(&s, poll_id, &loser, amount, StakeSide::No);
+
+        let err = s
+            .client
+            .try_claim_winnings(&loser, &poll_id)
+            .expect_err("loser should not be able to claim");
+        assert_eq!(err, Ok(PredictXError::NotOnWinningSide));
+
+        let stats = s.client.get_user_stats(&loser);
+        assert_eq!(stats.polls_lost, 1);
+        assert_eq!(stats.polls_won, 0);
+        assert_eq!(stats.total_lost, amount);
+        assert_eq!(stats.total_won, 0);
+    }
+
+    /// A refund on a cancelled poll (empty winning pool) counts as neither a
+    /// win nor a loss.
+    #[test]
+    fn refund_on_cancelled_poll_does_not_touch_user_stats() {
+        let s = setup();
+        let poll_id: u64 = 302;
+        let user = Address::generate(&s.env);
+        let amount: i128 = 200_000_000;
+
+        mint_tokens(&s, &s.contract_id, amount);
+        inject_resolved_poll(&s, poll_id, true, 0, amount);
+        inject_stake(&s, poll_id, &user, amount, StakeSide::No);
+
+        let refund = s.client.claim_winnings(&user, &poll_id);
+        assert_eq!(refund, amount);
+
+        let stats = s.client.get_user_stats(&user);
+        assert_eq!(stats.polls_won, 0);
+        assert_eq!(stats.polls_lost, 0);
+        assert_eq!(stats.total_won, 0);
+        assert_eq!(stats.total_lost, 0);
     }
 }
