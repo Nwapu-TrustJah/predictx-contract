@@ -32,6 +32,8 @@ mod voting;
 pub mod voting;
 mod storage;
 mod voting;
+#[cfg(test)]
+use soroban_sdk::testutils::Ledger;
 
 /// Maximum number of admins that may be registered at once.
 ///
@@ -78,6 +80,7 @@ pub(crate) enum DataKey {
     /// Soroban token contract `Address` used for dispute fees. (Instance)
     TokenAddress,
     Paused,
+    MarketPoll(u64, u64),
     PollStatus(u64),
     Evidence(u64),
     /// `poll_id` → `VoteTally`. (Temporary — only needed during voting window)

@@ -152,7 +152,10 @@ pub fn has_voted(env: &Env, poll_id: u64, voter: &Address) -> bool {
 /// Record that `voter` cast a vote on `poll_id`.
 ///
 /// The marker lives in *temporary* storage so it expires with the tally when
-/// the voting window closes.
+/// the voting window closes. However, the TTL is proactively extended by
+/// `bump_ttl` in `cast_vote` and `auto_resolve` to prevent premature expiry
+/// and ensure the dedup marker survives until the poll is resolved or the
+/// voting window closes naturally.
 pub fn write_voted(env: &Env, poll_id: u64, voter: &Address) {
     env.storage()
         .temporary()
@@ -296,4 +299,20 @@ pub fn write_dispute_approvals(env: &Env, poll_id: u64, outcome: VoteChoice, app
     env.storage()
         .persistent()
         .set(&DataKey::DisputeApprovals(poll_id, outcome), &approvals);
+
+// ── Market poll registration ──────────────────────────────────────────────────
+
+/// Whether a poll is registered with the oracle.
+pub fn is_poll_registered(env: &Env, market_id: u64, poll_id: u64) -> bool {
+    env.storage()
+        .persistent()
+        .get(&DataKey::MarketPoll(market_id, poll_id))
+        .unwrap_or(false)
+}
+
+/// Register a poll with the oracle, associating it with a market owner.
+pub fn register_poll(env: &Env, market_id: u64, poll_id: u64) {
+    env.storage()
+        .persistent()
+        .set(&DataKey::MarketPoll(market_id, poll_id), &true);
 }
