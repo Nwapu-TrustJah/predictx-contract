@@ -479,10 +479,9 @@ pub fn auto_resolve(env: &Env, poll_id: u64) -> Result<VoteChoice, PredictXError
     if tally.total_voters == 0 {
         return Err(PredictXError::ConsensusNotReached);
     }
+    let (leading_is_yes, share_bps) = consensus_bps(&tally);
 
-    let consensus_bps = (u64::from(winning_votes) * u64::from(BPS_DENOMINATOR)
-        / u64::from(tally.total_voters)) as u32;
-    if consensus_bps < AUTO_RESOLVE_THRESHOLD_BPS {
+    if share_bps < AUTO_RESOLVE_THRESHOLD_BPS {
         return Err(PredictXError::ConsensusNotReached);
     }
 
@@ -494,6 +493,11 @@ pub fn auto_resolve(env: &Env, poll_id: u64) -> Result<VoteChoice, PredictXError
     // recomputed.
     tally.reward_pool = voter_reward_reserve(total_pool);
     storage::write_tally(env, &tally);
+    let outcome = if leading_is_yes {
+        VoteChoice::Yes
+    } else {
+        VoteChoice::No
+    };
 
     let now = env.ledger().timestamp();
     let stored_status = crate::StoredPollStatus {
@@ -512,7 +516,7 @@ pub fn auto_resolve(env: &Env, poll_id: u64) -> Result<VoteChoice, PredictXError
 
     env.events().publish(
         (Symbol::new(env, "AutoResolved"), poll_id, outcome),
-        consensus_bps,
+        share_bps,
     );
 
     Ok(outcome)
@@ -540,6 +544,20 @@ pub fn initiate_dispute(
     dispute_fee: i128,
 ) -> Result<Dispute, PredictXError> {
     initiator.require_auth();
+/// - `Unclear` votes are excluded from the denominator: they signal "cannot
+///  judge", not a preference.
+/// - A Yes/No tie resolves to Yes (`true`) at 5000 bps, so the result is
+///  deterministic.
+/// - A tally with no decisive votes (e.g. all `Unclear`) returns `(false, 0)`
+///  instead of dividing by zero.
+///
+/// Pure and side-effect free so the routing thresholds can be unit-tested
+/// against it directly.
+pub(crate) fn consensus_bps(tally: &VoteTally) -> (bool, u32) {
+    let decisive = u64::from(tally.yes_votes) + u64::from(tally.no_votes);
+    if decisive == 0 {
+        return (false, 0);
+    }
 
     // ── Checks ────────────────────────────────────────────────────────────────
 
@@ -2337,3 +2355,4 @@ mod test {
     }
 }
 
+}
