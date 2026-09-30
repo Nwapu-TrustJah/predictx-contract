@@ -36,8 +36,10 @@ pub fn get_platform_fee_bps(env: &Env) -> u32 {
 pub fn transfer_to_contract(env: &Env, from: &Address, amount: i128) -> Result<(), PredictXError> {
     let token_addr = get_token_address(env)?;
     let client = token::Client::new(env, &token_addr);
-    client.transfer(from, &env.current_contract_address(), &amount);
-    Ok(())
+    client
+        .try_transfer(from, &env.current_contract_address(), &amount)
+        .map_err(|_| PredictXError::TransferFailed)?
+        .map_err(|_| PredictXError::TransferFailed)
 }
 
 /// Transfer tokens **from** this contract **to** a recipient.
@@ -46,8 +48,10 @@ pub fn transfer_to_contract(env: &Env, from: &Address, amount: i128) -> Result<(
 pub fn transfer_from_contract(env: &Env, to: &Address, amount: i128) -> Result<(), PredictXError> {
     let token_addr = get_token_address(env)?;
     let client = token::Client::new(env, &token_addr);
-    client.transfer(&env.current_contract_address(), to, &amount);
-    Ok(())
+    client
+        .try_transfer(&env.current_contract_address(), to, &amount)
+        .map_err(|_| PredictXError::TransferFailed)?
+        .map_err(|_| PredictXError::TransferFailed)
 }
 
 /// Transfer tokens **from** this contract **to** the treasury address.
