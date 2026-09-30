@@ -1,45 +1,79 @@
+//! Resolution and payout engine for the prediction market.
+//!
+//! # Rounding policy
+//!
+//! Every amount is an integer number of token base units, so every division
+//! truncates towards zero. The engine splits a winner's gross share into a net
+//! payout and a platform fee:
+//!
+//! ```text
+//! gross = stake.amount * total_pool / winning_pool              (truncates)
+//! net   = gross * (BPS_DENOMINATOR - fee_bps) / BPS_DENOMINATOR  (truncates)
+//! fee   = gross - net                                            (exact)
+//! ```
+//!
+//! Two properties are deliberate:
+//!
+//! * **The fee split is exact.** `net + fee == gross` always holds, so the
+//!   treasury transfer and the claimant transfer can never disagree by a base
+//!   unit — the engine never mints or burns a token.
+//! * **Truncation remainders ("dust") stay in the contract.** They are never
+//!   redistributed to a staker. Handing the remainder to a single claimant
+//!   would require paying out more than the pool holds, and the pool is frozen
+//!   once a poll resolves, so there is no later round to carry it into. The
+//!   remainder therefore remains held by the contract, where the emergency
+//!   withdrawal and cancellation paths can still reach it.
+//!
+//! A winner whose share truncates to **zero** base units is not paid a
+//! zero-value transfer: [`PredictXError::PayoutRoundsToZero`] is returned
+//! instead, so a winner is never told they lost when they backed the winning
+//! side. The read-only quote ([`calculate_winnings`]) and the transfer path
+//! ([`claim_winnings`]) both go through [`payout_for`], so they cannot
+//! disagree — including at rounding edges.
+
+use crate::{
+    get_platform_stats, has_emergency_claimed, set_platform_stats, token_utils,
+    transition_poll_status, DataKey,
+};
+use predictx_shared::{Poll, PollStatus, PredictXError, Stake, StakeSide, BPS_DENOMINATOR};
 use soroban_sdk::{Address, Env, Symbol};
-use predictx_shared::{Poll, PollStatus, Stake, StakeSide, PredictXError, BPS_DENOMINATOR};
-use crate::{DataKey, get_platform_stats, set_platform_stats, token_utils};
 
-// ── Claimable amount view ─────────────────────────────────────────────────────
+/// A resolved poll's payout for a single staker.
+struct Payout {
+    /// Base units transferred to the staker.
+    net: i128,
+    /// Base units routed to the treasury as the platform fee.
+    fee: i128,
+}
 
-/// Return the exact token amount a user would receive from `claim_winnings`
-/// on the given poll, **without mutating any state**.
+/// Resolve a poll and record its final outcome.
 ///
-/// Returns `0` for every ineligible case rather than erroring, so the frontend
-/// can call this safely for any (poll, user) pair:
-///
-/// | Case                              | Returns |
-/// |-----------------------------------|---------|
-/// | Poll not found                    | `0`     |
-/// | Poll not yet resolved             | `0`     |
-/// | User never staked                 | `0`     |
-/// | User staked on the losing side    | `0`     |
-/// | User already claimed their reward | `0`     |
-/// | User is a winner with open claim  | exact payout |
-///
-/// # Payout formula
-///
-/// Winners receive their stake back **plus** a proportional share of the losing
-/// pool after the platform fee is deducted:
-///
-/// ```text
-/// net_losing_pool = losing_pool * (BPS_DENOMINATOR - fee_bps) / BPS_DENOMINATOR
-/// payout = stake + stake * net_losing_pool / winning_pool
-/// ```
-///
-/// Integer division truncates toward zero — any dust stays in the contract.
-pub fn get_claimable_amount(env: &Env, poll_id: u64, user: &Address) -> i128 {
-    // ── 1. Load the poll — return 0 if it doesn't exist ──────────────────────
-    let poll = match env
+/// Callable only by the registered admin or the registered voting oracle —
+/// either address stored at `initialize`.  Legality of the transition is
+/// decided by the state machine in [`crate::transition_status`]: a poll has to
+/// be in `Voting`, `AdminReview` or `Disputed`, so an unresolved or cancelled
+/// poll is rejected with `InvalidStateTransition` before anything is written.
+pub fn resolve_poll(
+    env: &Env,
+    caller: Address,
+    poll_id: u64,
+    outcome: bool,
+) -> Result<(), PredictXError> {
+    caller.require_auth();
+
+    let admin: Address = env
         .storage()
-        .persistent()
-        .get::<_, predictx_shared::Poll>(&DataKey::Poll(poll_id))
-    {
-        Some(p) => p,
-        None => return 0,
-    };
+        .instance()
+        .get(&DataKey::Admin)
+        .ok_or(PredictXError::NotInitialized)?;
+    let oracle: Address = env
+        .storage()
+        .instance()
+        .get(&DataKey::VotingOracle)
+        .ok_or(PredictXError::NotInitialized)?;
+    if caller != admin && caller != oracle {
+        return Err(PredictXError::Unauthorized);
+    }
 
     // ── 2. Only resolved polls have claimable amounts ─────────────────────────
     if poll.status != PollStatus::Resolved {
@@ -81,63 +115,125 @@ pub fn resolve_poll(
         .ok_or(PredictXError::NotInitialized)?;
     if caller != stored_admin && caller != stored_oracle {
         return Err(PredictXError::Unauthorized);
-    }
-
-    // ── 3. An outcome must be set ──────────────────────────────────────────────
-    let yes_won = match poll.outcome {
-        Some(v) => v,
-        None => return 0,
-    };
-
-    // ── 4. Load the user's stake — return 0 if they never staked ─────────────
-    let stake: Stake = match env
+    let mut poll: Poll = env
         .storage()
         .persistent()
-        .get(&DataKey::Stake(poll_id, user.clone()))
-    {
-        Some(s) => s,
-        None => return 0,
-    };
-
-    // ── 5. Already claimed → nothing left to collect ──────────────────────────
-    if stake.claimed {
-        return 0;
+        .get(&DataKey::Poll(poll_id))
+        .ok_or(PredictXError::PollNotFound)?;
+    if poll.outcome.is_some() {
+        return Err(PredictXError::PollAlreadyResolved);
     }
 
-    // ── 6. Must be on the winning side ────────────────────────────────────────
-    let staker_won = match stake.side {
-        StakeSide::Yes => yes_won,
-        StakeSide::No => !yes_won,
-    };
-    if !staker_won {
-        return 0;
-    }
+    poll.outcome = Some(outcome);
+    poll.resolution_time = env.ledger().timestamp();
+    // Validates the edge, persists the new status, and publishes
+    // `PollStatusChanged`.  A rejected transition leaves the poll untouched.
+    transition_poll_status(env, &mut poll, PollStatus::Resolved)?;
 
-    // ── 7. Compute payout ─────────────────────────────────────────────────────
-    let (winning_pool, losing_pool) = if yes_won {
-        (poll.yes_pool, poll.no_pool)
+    let total_pool = poll.yes_pool + poll.no_pool;
+    let fee = total_pool * token_utils::get_platform_fee_bps(env) as i128 / BPS_DENOMINATOR as i128;
+    env.events().publish(
+        (Symbol::new(env, "PollResolved"), poll_id),
+        (outcome, total_pool, fee),
+    );
+    Ok(())
+}
+
+// ── Payout / claim engine ─────────────────────────────────────────────────────
+
+/// Load a poll and require that it has been resolved.
+fn load_resolved_poll(env: &Env, poll_id: u64) -> Result<Poll, PredictXError> {
+    let poll: Poll = env
+        .storage()
+        .persistent()
+        .get(&DataKey::Poll(poll_id))
+        .ok_or(PredictXError::PollNotFound)?;
+    if poll.status != PollStatus::Resolved {
+        return Err(PredictXError::InvalidStateTransition);
+    }
+    Ok(poll)
+}
+
+/// What a resolved poll owes one staker.
+///
+/// The single source of truth behind both [`claim_winnings`] and
+/// [`calculate_winnings`] — see the module docs for the rounding policy.
+///
+/// ## Cases
+/// 1. **Empty winning pool.** Nobody backed the winning side, so there is no
+///    eligible winner to collect the pot. Every staker — on either side —
+///    recovers their stake in full and no fee is charged. `NotOnWinningSide`
+///    must not be returned here: it would strand the pot.
+/// 2. **Losing stake.** A staker on the losing side gets
+///    [`PredictXError::NotOnWinningSide`].
+/// 3. **No losing pool.** Nobody backed the losing side, so there is no profit
+///    to share: winners are refunded at par and the platform takes nothing.
+///    This is a no-contest poll, not a win.
+/// 4. **Normal win.** The winner receives their proportional share of the whole
+///    pool, minus the platform fee.
+fn payout_for(env: &Env, poll: &Poll, stake: &Stake) -> Result<Payout, PredictXError> {
+    // outcome is always Some(_) for a Resolved poll
+    let outcome_yes: bool = poll.outcome.ok_or(PredictXError::InvalidOutcome)?;
+
+    let winning_pool: i128 = if outcome_yes {
+        poll.yes_pool
     } else {
-        (poll.no_pool, poll.yes_pool)
+        poll.no_pool
+    };
+    let losing_pool: i128 = if outcome_yes {
+        poll.no_pool
+    } else {
+        poll.yes_pool
     };
 
-    // Guard against a degenerate pool (no losers → only return stake).
+    // ── Case 1: empty winning pool — full, fee-free refund for everyone ─────
     if winning_pool == 0 {
         return stake.amount;
         .get(&DataKey::Poll(poll_id))
         .ok_or(PredictXError::PollNotFound)?;
     if poll.status == PollStatus::Resolved || poll.outcome.is_some() {
         return Err(PredictXError::PollAlreadyResolved);
+        return Ok(Payout {
+            net: stake.amount,
+            fee: 0,
+        });
     }
 
+    // ── Case 2: losing stake ────────────────────────────────────────────────
+    let staker_on_winning_side = match stake.side {
+        StakeSide::Yes => outcome_yes,
+        StakeSide::No => !outcome_yes,
+    };
+    if !staker_on_winning_side {
+        return Err(PredictXError::NotOnWinningSide);
+    }
+
+    // ── Case 3: no-contest — refund at par, no fee ──────────────────────────
+    //
+    // Every staker is on the winning side here, so the share is 1:1 anyway;
+    // short-circuiting keeps the platform from taking a fee out of a pool
+    // nobody profited from.
+    if losing_pool == 0 {
+        return Ok(Payout {
+            net: stake.amount,
+            fee: 0,
+        });
+    }
+
+    // ── Case 4: proportional share of the pool, minus the platform fee ──────
+    let total_pool: i128 = poll.yes_pool + poll.no_pool;
     let fee_bps = token_utils::get_platform_fee_bps(env);
     let fee_factor = (BPS_DENOMINATOR - fee_bps) as i128;
     let bps = BPS_DENOMINATOR as i128;
 
-    // net_losing_pool = losing_pool * (1 - fee%)
-    // share_of_losers = stake * net_losing_pool / winning_pool
-    // payout          = stake + share_of_losers
-    let net_losing_pool = losing_pool * fee_factor / bps;
-    let share_of_losers = stake.amount * net_losing_pool / winning_pool;
+    let gross = stake.amount * total_pool / winning_pool;
+    let net = gross * fee_factor / bps;
+    if net == 0 {
+        // The staker is on the winning side, so `NotOnWinningSide` would be a
+        // lie. Report the truncation instead and leave the stake unclaimed —
+        // the pool is frozen, so retrying cannot change the result.
+        return Err(PredictXError::PayoutRoundsToZero);
+    }
 
     stake.amount + share_of_losers
 
@@ -171,9 +267,19 @@ pub(crate) fn record_poll_resolution(
 // ── Payout / claim engine ─────────────────────────────────────────────────────
 
 /// Claim winnings for a resolved poll.
+    // Derived, never a second division: net + fee == gross.
+    Ok(Payout {
+        net,
+        fee: gross - net,
+    })
+}
+
+/// Claim winnings (or a full stake refund) after a poll resolves.
 ///
-/// Uses **identical arithmetic** to `get_claimable_amount` so the view always
-/// equals the amount actually transferred.
+/// ## Normal path
+/// The caller must have staked on the winning side.  Their proportional share
+/// of the total pool — minus the platform fee — is transferred to them and the
+/// fee is sent to the treasury.
 ///
 /// Side-effects:
 /// - Marks `stake.claimed = true`
@@ -214,30 +320,29 @@ pub fn claim_winnings(
         .persistent()
         .get(&DataKey::Poll(poll_id))
         .ok_or(PredictXError::PollNotFound)?;
+/// ## Payouts that truncate to zero
+/// Returns [`PredictXError::PayoutRoundsToZero`] rather than transferring a
+/// worthless amount, and leaves the stake unclaimed.
+pub fn claim_winnings(env: &Env, claimant: Address, poll_id: u64) -> Result<i128, PredictXError> {
+    claimant.require_auth();
 
-    if poll.status != PollStatus::Resolved {
-        return Err(PredictXError::PollNotActive);
-    }
+    // ── Load & validate the poll and the stake ───────────────────────────────
 
-    let yes_won = poll.outcome.ok_or(PredictXError::PollNotActive)?;
+    let poll = load_resolved_poll(env, poll_id)?;
 
     let mut stake: Stake = env
         .storage()
         .persistent()
-        .get(&DataKey::Stake(poll_id, user.clone()))
+        .get(&DataKey::Stake(poll_id, claimant.clone()))
         .ok_or(PredictXError::NotStaker)?;
 
     if stake.claimed || has_emergency_claimed(env, poll_id, &claimant) {
         return Err(PredictXError::AlreadyClaimed);
     }
 
-    // Guard against emergency-withdrawn stakes.
-    let emergency_claimed: bool = env
-        .storage()
-        .persistent()
-        .get(&DataKey::EmergencyClaimed(poll_id, user.clone()))
-        .unwrap_or(false);
-    if emergency_claimed {
+    // A stake that was already refunded through the emergency path is spent;
+    // claiming on top of that would pay the same money out twice.
+    if has_emergency_claimed(env, poll_id, &claimant) {
         return Err(PredictXError::AlreadyClaimed);
     }
 
@@ -381,30 +486,93 @@ pub fn claim_winnings(
     if fee > 0 {
         token_utils::transfer_to_treasury(env, fee)?;
     }
+    // ── Determine the payout — identical maths to the quote ──────────────────
 
-    if payout == 0 {
-        return Err(PredictXError::StakeAmountZero);
-    }
+    let payout = payout_for(env, &poll, &stake)?;
 
-    // ── Effects ───────────────────────────────────────────────────────────────
+    // ── Mark claimed & persist ───────────────────────────────────────────────
+
     stake.claimed = true;
     env.storage()
         .persistent()
-        .set(&DataKey::Stake(poll_id, user.clone()), &stake);
+        .set(&DataKey::Stake(poll_id, claimant.clone()), &stake);
 
-    // ── Interactions ──────────────────────────────────────────────────────────
-    token_utils::transfer_from_contract(env, &user, payout)?;
+    // ── Transfer the platform fee, then the payout ──────────────────────────
+
+    if payout.fee > 0 {
+        token_utils::transfer_to_treasury(env, payout.fee)?;
+    }
+    token_utils::transfer_from_contract(env, &claimant, payout.net)?;
+
+    // ── Update platform stats ─────────────────────────────────────────────────
 
     let mut stats = get_platform_stats(env);
-    stats.total_payouts += payout;
+    stats.total_value_locked = stats.total_value_locked.saturating_sub(payout.net);
+    stats.total_payouts += payout.net;
     set_platform_stats(env, &stats);
 
+    // ── Emit event ────────────────────────────────────────────────────────────
+
     env.events().publish(
-        (Symbol::new(env, "WinningsClaimed"), poll_id, user.clone()),
-        payout,
+        (Symbol::new(env, "WinningsClaimed"), poll_id, claimant),
+        payout.net,
     );
 
-    Ok(payout)
+    Ok(payout.net)
+}
+
+/// Quote a resolved poll's payout for a user without transferring tokens.
+///
+/// Shares every guard and every calculation with [`claim_winnings`], so the
+/// two can never report a different amount — or a different error — for the
+/// same stake.  The only differences are that this path does not require
+/// authorisation and does not report whether the payout was already claimed.
+pub fn calculate_winnings(env: &Env, poll_id: u64, user: Address) -> Result<i128, PredictXError> {
+    let poll = load_resolved_poll(env, poll_id)?;
+    let stake: Stake = env
+        .storage()
+        .persistent()
+        .get(&DataKey::Stake(poll_id, user))
+        .ok_or(PredictXError::NotStaker)?;
+    Ok(payout_for(env, &poll, &stake)?.net)
+}
+
+/// Return the amount `claim_winnings` would transfer, without mutating state.
+///
+/// The forgiving sibling of [`calculate_winnings`]: every ineligible case
+/// reports `0` instead of an error, so a frontend can poll it for any
+/// `(poll, user)` pair without handling a failure mode.  It is built on the
+/// same [`payout_for`] as the transfer path, so a non-zero value always equals
+/// what a later claim transfers.
+///
+/// | Case                                     | Returns |
+/// |------------------------------------------|---------|
+/// | Poll not found                           | `0`     |
+/// | Poll not resolved                        | `0`     |
+/// | User never staked                        | `0`     |
+/// | Stake already claimed or emergency-refunded | `0`   |
+/// | User staked on the losing side           | `0`     |
+/// | Payout rounds to zero                    | `0`     |
+/// | Winner with an open claim                | exact payout |
+pub fn get_claimable_amount(env: &Env, poll_id: u64, user: &Address) -> i128 {
+    let poll = match load_resolved_poll(env, poll_id) {
+        Ok(poll) => poll,
+        Err(_) => return 0,
+    };
+    let stake: Stake = match env
+        .storage()
+        .persistent()
+        .get(&DataKey::Stake(poll_id, user.clone()))
+    {
+        Some(stake) => stake,
+        None => return 0,
+    };
+    if stake.claimed || has_emergency_claimed(env, poll_id, user) {
+        return 0;
+    }
+    payout_for(env, &poll, &stake)
+        .map(|payout| payout.net)
+        .unwrap_or(0)
 }
 
 /// Calculate a resolved poll's payout for a user without transferring tokens.
@@ -476,8 +644,6 @@ fn calculate_winnings_for(
 mod test {
     extern crate std;
 
-    use soroban_sdk::{testutils::{Address as _, Ledger}, token, Address, Env, String};
-    use predictx_shared::{Poll, PollCategory, PollStatus, Stake, StakeSide};
     use crate::{DataKey, PredictionMarket, PredictionMarketClient};
     use soroban_sdk::{
         testutils::{Address as _, Ledger},
@@ -485,12 +651,21 @@ mod test {
     };
     use predictx_shared::{DataKey, Poll, PollCategory, PollStatus, PredictXError, Stake, StakeSide};
     use crate::{PredictionMarket, PredictionMarketClient};
+    use predictx_shared::{
+        Poll, PollCategory, PollStatus, PredictXError, Stake, StakeSide, MAX_STAKE_AMOUNT,
+        MIN_STAKE_AMOUNT,
+    };
+    use soroban_sdk::{
+        testutils::{Address as _, Ledger},
+        token, Address, Env, String, Vec,
+    };
 
     // ── Test helpers ──────────────────────────────────────────────────────────
 
     struct TestSetup<'a> {
         env: Env,
         admin: Address,
+        #[allow(dead_code)]
         oracle_id: Address,
         token_addr: Address,
         contract_id: Address,
@@ -516,6 +691,9 @@ mod test {
         let client = PredictionMarketClient::new(&env, &contract_id);
         let treasury = Address::generate(&env);
         client.initialize(&admin, &oracle_id, &token_addr, &treasury, &500_u32);
+        // `cancel_poll` mirrors the cancellation into the oracle, which
+        // authorises the caller against its admin registry.
+        oracle_client.add_admin(&admin, &contract_id);
 
         env.ledger().with_mut(|l| l.timestamp = 1_000_000);
 
@@ -529,8 +707,35 @@ mod test {
         }
     }
 
+    /// Drive a poll to `Voting` through the legal graph, since a poll may only
+    /// be resolved from `Voting`, `AdminReview` or `Disputed`.
+    fn advance_to_voting(s: &TestSetup, poll_id: u64) {
+        for status in [PollStatus::Locked, PollStatus::Voting] {
+            s.env.as_contract(&s.contract_id, || {
+                let mut poll: Poll = s
+                    .env
+                    .storage()
+                    .persistent()
+                    .get(&DataKey::Poll(poll_id))
+                    .unwrap();
+                poll.status = status;
+                s.env
+                    .storage()
+                    .persistent()
+                    .set(&DataKey::Poll(poll_id), &poll);
+            });
+        }
+    }
+
+    /// Resolve a poll the way the state machine demands.
+    fn resolve_via_state_machine(s: &TestSetup, poll_id: u64, outcome_yes: bool) {
+        advance_to_voting(s, poll_id);
+        s.client.resolve_poll(&s.admin, &poll_id, &outcome_yes);
+    }
+
     fn mint_tokens(s: &TestSetup, to: &Address, amount: i128) {
-        token::StellarAssetClient::new(&s.env, &s.token_addr).mint(to, &amount);
+        let sac = token::StellarAssetClient::new(&s.env, &s.token_addr);
+        sac.mint(to, &amount);
     }
 
     fn token_balance(s: &TestSetup, addr: &Address) -> i128 {
@@ -558,7 +763,7 @@ mod test {
             &s.admin,
             &String::from_str(&s.env, "Arsenal"),
             &String::from_str(&s.env, "Chelsea"),
-            &String::from_str(&s.env, "PL"),
+            &String::from_str(&s.env, "Premier League"),
             &String::from_str(&s.env, "Emirates"),
             &(lock_time + 3_600),
         );
@@ -571,51 +776,54 @@ mod test {
         )
     }
 
-    /// Plant a resolved poll with given pool sizes and winning side directly in
-    /// storage, bypassing the staking flow (which would require a live token
-    /// transfer to the contract that has already happened).
-    fn plant_resolved_poll(
+    /// Directly inject a resolved poll with a given outcome into storage.
+    fn inject_resolved_poll(
         s: &TestSetup,
         poll_id: u64,
+        outcome_yes: bool,
         yes_pool: i128,
         no_pool: i128,
-        yes_won: bool,
     ) {
         s.env.as_contract(&s.contract_id, || {
-            let mut poll: Poll = s
-                .env
+            let poll = Poll {
+                poll_id,
+                match_id: 1,
+                creator: s.admin.clone(),
+                question: String::from_str(&s.env, "test"),
+                category: PollCategory::PlayerEvent,
+                lock_time: 500_000,
+                yes_pool,
+                no_pool,
+                yes_count: if yes_pool > 0 { 1 } else { 0 },
+                no_count: if no_pool > 0 { 1 } else { 0 },
+                status: PollStatus::Resolved,
+                outcome: Some(outcome_yes),
+                resolution_time: 1_000_000,
+                created_at: 900_000,
+            };
+            s.env
                 .storage()
                 .persistent()
-                .get(&DataKey::Poll(poll_id))
-                .unwrap();
-            poll.yes_pool = yes_pool;
-            poll.no_pool = no_pool;
-            poll.status = PollStatus::Resolved;
-            poll.outcome = Some(yes_won);
-            s.env.storage().persistent().set(&DataKey::Poll(poll_id), &poll);
+                .set(&DataKey::Poll(poll_id), &poll);
         });
     }
 
-    /// Plant a stake record directly into storage (stake amount is assumed to
-    /// already be held by the contract — we fund the contract separately).
-    fn plant_stake(
-        s: &TestSetup,
-        poll_id: u64,
-        user: &Address,
-        amount: i128,
-        side: StakeSide,
-        claimed: bool,
-    ) {
+    /// Inject a stake record directly (bypasses staking checks — used to set
+    /// up state for claim tests without going through the full staking flow).
+    fn inject_stake(s: &TestSetup, poll_id: u64, user: &Address, amount: i128, side: StakeSide) {
         s.env.as_contract(&s.contract_id, || {
             let stake = Stake {
                 user: user.clone(),
                 poll_id,
                 amount,
                 side,
-                claimed,
-                staked_at: s.env.ledger().timestamp(),
+                claimed: false,
+                staked_at: 900_000,
             };
-            s.env.storage().persistent().set(&DataKey::Stake(poll_id, user.clone()), &stake);
+            s.env
+                .storage()
+                .persistent()
+                .set(&DataKey::Stake(poll_id, user.clone()), &stake);
         });
     }
 
@@ -639,6 +847,7 @@ mod test {
     /// Mint tokens to a fresh user and stake them through the real staking flow.
     /// Helper that creates a user, mints tokens and places a stake through the
     /// normal staking flow. Returns the user address.
+    /// Mint, then stake through the real entry point.  Returns the staker.
     fn stake_user(s: &TestSetup, poll_id: u64, side: StakeSide, amount: i128) -> Address {
         let user = Address::generate(&s.env);
         mint_tokens(s, &user, amount);
@@ -651,171 +860,190 @@ mod test {
     /// A losing staker can recover their original stake when the winning pool
     /// is empty (i.e. nobody staked on the winning side).
     #[test]
-    fn view_output_equals_expected_claim_payout() {
+    fn empty_winning_pool_losing_staker_gets_full_refund() {
         let s = setup();
-        let poll_id = create_poll(&s, 2_000_000);
 
-        let yes_pool: i128 = 300_000_000;
-        let no_pool: i128 = 200_000_000;
-        let user_stake: i128 = 100_000_000;
+        // Poll resolves Yes, but only No stakers exist → yes_pool == 0
+        let poll_id: u64 = 99;
+        let no_stake_amount: i128 = 200_000_000;
 
-        plant_resolved_poll(&s, poll_id, yes_pool, no_pool, true);
-        let user = Address::generate(&s.env);
-        plant_stake(&s, poll_id, &user, user_stake, StakeSide::Yes, false);
+        let no_user = Address::generate(&s.env);
 
-        // Fund contract so it notionally holds the total pool.
-        mint_tokens(&s, &s.contract_id, yes_pool + no_pool);
+        // Seed contract with the pool amount
+        mint_tokens(&s, &s.contract_id, no_stake_amount);
 
-        let claimable = s.client.get_claimable_amount(&poll_id, &user);
+        inject_resolved_poll(&s, poll_id, true, 0, no_stake_amount);
+        inject_stake(&s, poll_id, &no_user, no_stake_amount, StakeSide::No);
 
-        // Hand-compute the expected value.
-        let fee_bps: i128 = 500;
-        let bps: i128 = 10_000;
-        let net_losing = no_pool * (bps - fee_bps) / bps;
-        let expected = user_stake + user_stake * net_losing / yes_pool;
+        let refund = s.client.claim_winnings(&no_user, &poll_id);
 
-        assert_eq!(claimable, expected);
-        assert!(claimable > 0);
-    }
-
-    // ── Test 2: returns 0 for every ineligible case ───────────────────────────
-    //
-    // Covers: unresolved poll, non-staker, losing staker, already-claimed stake.
-    #[test]
-    fn returns_zero_for_all_ineligible_cases() {
-        let s = setup();
-        let poll_id = create_poll(&s, 2_000_000);
-
-        let yes_pool: i128 = 200_000_000;
-        let no_pool: i128 = 100_000_000;
-
-        // ── a) poll still active (not resolved) ───────────────────────────────
-        let user = Address::generate(&s.env);
-        plant_stake(&s, poll_id, &user, 50_000_000, StakeSide::Yes, false);
+        assert_eq!(refund, no_stake_amount, "should refund full stake");
         assert_eq!(
-            s.client.get_claimable_amount(&poll_id, &user),
-            0,
-            "active poll should return 0"
-        );
-
-        // ── b) non-existent poll ID ───────────────────────────────────────────
-        assert_eq!(
-            s.client.get_claimable_amount(&9999_u64, &user),
-            0,
-            "non-existent poll should return 0"
-        );
-
-        // Resolve the poll with Yes winning.
-        plant_resolved_poll(&s, poll_id, yes_pool, no_pool, true);
-
-        // ── c) user who never staked ──────────────────────────────────────────
-        let never_staked = Address::generate(&s.env);
-        assert_eq!(
-            s.client.get_claimable_amount(&poll_id, &never_staked),
-            0,
-            "non-staker should return 0"
-        );
-
-        // ── d) losing staker (staked No, Yes won) ─────────────────────────────
-        let loser = Address::generate(&s.env);
-        plant_stake(&s, poll_id, &loser, 60_000_000, StakeSide::No, false);
-        assert_eq!(
-            s.client.get_claimable_amount(&poll_id, &loser),
-            0,
-            "losing staker should return 0"
-        );
-
-        // ── e) already-claimed winner ─────────────────────────────────────────
-        let already_claimed = Address::generate(&s.env);
-        plant_stake(&s, poll_id, &already_claimed, 50_000_000, StakeSide::Yes, true);
-        assert_eq!(
-            s.client.get_claimable_amount(&poll_id, &already_claimed),
-            0,
-            "already-claimed stake should return 0"
+            token_balance(&s, &no_user),
+            no_stake_amount,
+            "user balance should equal refunded stake"
         );
     }
 
-    // ── Test 3: proportional payouts across multiple winners ──────────────────
-    //
-    // When two users stake different amounts on the winning side their
-    // claimable amounts must be proportional to their stakes.
-    //
-    // Setup:
-    //   Yes pool = winner_a (100) + winner_b (200) = 300 tokens
-    //   No pool  = 150 tokens, fee = 5 %
-    //
-    // For winner_a (100-token stake):
-    //   net_losing = 150 * 9500 / 10000 = 142 (truncated)
-    //   share      = 100 * 142 / 300    =  47 (truncated)
-    //   payout     = 100 + 47           = 147
-    //
-    // For winner_b (200-token stake):
-    //   share      = 200 * 142 / 300    =  94 (truncated)
-    //   payout     = 200 + 94           = 294
+    /// No platform fee is taken in the empty-winning-pool case.
     #[test]
-    fn proportional_payouts_for_multiple_winners() {
+    fn empty_winning_pool_no_platform_fee_deducted() {
         let s = setup();
-        let poll_id = create_poll(&s, 2_000_000);
 
-        let stake_a: i128 = 100_000_000;
-        let stake_b: i128 = 200_000_000;
-        let no_pool: i128  = 150_000_000;
-        let yes_pool = stake_a + stake_b; // 300_000_000
+        // Poll resolves No, but only Yes stakers exist → no_pool == 0
+        let poll_id: u64 = 100;
+        let yes_stake_amount: i128 = 150_000_000;
 
-        plant_resolved_poll(&s, poll_id, yes_pool, no_pool, true);
+        let yes_user = Address::generate(&s.env);
+        mint_tokens(&s, &s.contract_id, yes_stake_amount);
 
-        let winner_a = Address::generate(&s.env);
-        let winner_b = Address::generate(&s.env);
-        plant_stake(&s, poll_id, &winner_a, stake_a, StakeSide::Yes, false);
-        plant_stake(&s, poll_id, &winner_b, stake_b, StakeSide::Yes, false);
+        inject_resolved_poll(&s, poll_id, false, yes_stake_amount, 0);
+        inject_stake(&s, poll_id, &yes_user, yes_stake_amount, StakeSide::Yes);
 
-        let claimable_a = s.client.get_claimable_amount(&poll_id, &winner_a);
-        let claimable_b = s.client.get_claimable_amount(&poll_id, &winner_b);
+        let treasury_before = token_balance(&s, &s.client.get_treasury_address());
+        let refund = s.client.claim_winnings(&yes_user, &poll_id);
 
-        // Hand-compute expected values.
-        let fee_bps: i128 = 500;
-        let bps: i128 = 10_000;
-        let net_losing = no_pool * (bps - fee_bps) / bps;
-        let expected_a = stake_a + stake_a * net_losing / yes_pool;
-        let expected_b = stake_b + stake_b * net_losing / yes_pool;
-
-        assert_eq!(claimable_a, expected_a);
-        assert_eq!(claimable_b, expected_b);
-
-        // winner_b staked 2× winner_a so the combined claims should respect
-        // that ratio (within integer rounding of ±1 token unit).
-        assert!(
-            (claimable_b - 2 * claimable_a).abs() <= 1,
-            "claimable_b ({claimable_b}) should be ~2× claimable_a ({claimable_a})"
+        // Exact stake returned — no fee
+        assert_eq!(refund, yes_stake_amount);
+        // Treasury unchanged
+        assert_eq!(
+            token_balance(&s, &s.client.get_treasury_address()),
+            treasury_before,
+            "treasury must not receive any fee in empty-pool refund"
         );
     }
 
-    // ── Test 4: view output equals actual claim_winnings transfer ─────────────
-    //
-    // The primary AC for this issue: get_claimable_amount must return the
-    // exact amount that a subsequent claim_winnings call transfers.
-    //
-    // Setup:
-    //   Yes pool = 300 tokens (user_stake 100 + another winner 200)
-    //   No pool  = 200 tokens, fee = 5 %
-    //   Yes won → user's view-amount = tokens actually received
+    /// Once all stakers have claimed in the empty-winning-pool scenario, the
+    /// contract balance reaches exactly zero.
     #[test]
-    fn view_output_equals_claim_winnings_transfer() {
+    fn empty_winning_pool_contract_balance_zero_after_all_claims() {
         let s = setup();
-        let poll_id = create_poll(&s, 2_000_000);
 
-        let user_stake: i128 = 100_000_000;
-        let other_stake: i128 = 200_000_000;
-        let no_pool: i128 = 200_000_000;
-        let yes_pool = user_stake + other_stake; // 300_000_000
+        // Poll resolves Yes, but all three stakers picked No
+        let poll_id: u64 = 101;
+        let amounts: [i128; 3] = [100_000_000, 200_000_000, 150_000_000];
+        let total: i128 = amounts[0] + amounts[1] + amounts[2];
 
-        plant_resolved_poll(&s, poll_id, yes_pool, no_pool, true);
+        let users: [Address; 3] = [
+            Address::generate(&s.env),
+            Address::generate(&s.env),
+            Address::generate(&s.env),
+        ];
 
+        // Seed contract with the full pooled amount
+        mint_tokens(&s, &s.contract_id, total);
+
+        inject_resolved_poll(&s, poll_id, true, 0, total);
+
+        for (i, user) in users.iter().enumerate() {
+            inject_stake(&s, poll_id, user, amounts[i], StakeSide::No);
+        }
+
+        // All three stakers claim their refund
+        for (i, user) in users.iter().enumerate() {
+            let refund = s.client.claim_winnings(user, &poll_id);
+            assert_eq!(refund, amounts[i]);
+        }
+
+        // Contract balance must be exactly zero — no stranded funds
+        assert_eq!(
+            token_balance(&s, &s.contract_id),
+            0,
+            "all funds should be returned; contract balance must be zero"
+        );
+    }
+
+    #[test]
+    fn successful_claim_marks_stake_as_claimed() {
+        let s = setup();
+        let poll_id: u64 = 102;
+        let winner = Address::generate(&s.env);
+        let winning_stake = 100_000_000;
+        let losing_pool = 300_000_000;
+
+        mint_tokens(&s, &s.contract_id, winning_stake + losing_pool);
+        inject_resolved_poll(&s, poll_id, true, winning_stake, losing_pool);
+        inject_stake(&s, poll_id, &winner, winning_stake, StakeSide::Yes);
+
+        s.client.claim_winnings(&winner, &poll_id);
+
+        let stake = s.client.get_stake_info(&poll_id, &winner);
+        assert!(stake.claimed);
+    }
+
+    // ── Tests: normal claim path ──────────────────────────────────────────────
+
+    /// A winner on the correct side receives their proportional payout.
+    #[test]
+    fn normal_winner_receives_proportional_payout() {
+        let s = setup();
+
+        let lock_time = 1_500_000;
+        let poll_id = create_poll(&s, lock_time);
+
+        let yes_user = Address::generate(&s.env);
+        let no_user = Address::generate(&s.env);
+        let yes_amount: i128 = 100_000_000;
+        let no_amount: i128 = 100_000_000;
+
+        mint_tokens(&s, &yes_user, yes_amount);
+        mint_tokens(&s, &no_user, no_amount);
+
+        s.client
+            .stake(&yes_user, &poll_id, &yes_amount, &StakeSide::Yes);
+        s.client
+            .stake(&no_user, &poll_id, &no_amount, &StakeSide::No);
+
+        // Resolve with Yes winning
+        inject_resolved_poll(&s, poll_id, true, yes_amount, no_amount);
+
+        let payout = s.client.claim_winnings(&yes_user, &poll_id);
+
+        // gross = 100M * 200M / 100M = 200M; net = 200M * 9500 / 10000 = 190M
+        let expected_net: i128 = 190_000_000;
+        assert_eq!(payout, expected_net);
+        assert!(token_balance(&s, &yes_user) >= expected_net);
+    }
+
+    /// A staker on the losing side is rejected with `NotOnWinningSide`.
+    #[test]
+    fn loser_cannot_claim_on_normal_resolution() {
+        let s = setup();
+
+        let lock_time = 1_500_000;
+        let poll_id = create_poll(&s, lock_time);
+
+        let yes_user = Address::generate(&s.env);
+        let no_user = Address::generate(&s.env);
+        let amount: i128 = 100_000_000;
+
+        mint_tokens(&s, &yes_user, amount);
+        mint_tokens(&s, &no_user, amount);
+
+        s.client
+            .stake(&yes_user, &poll_id, &amount, &StakeSide::Yes);
+        s.client.stake(&no_user, &poll_id, &amount, &StakeSide::No);
+
+        // Resolve with Yes winning — No user is the loser
+        inject_resolved_poll(&s, poll_id, true, amount, amount);
+
+        let err = s
+            .client
+            .try_claim_winnings(&no_user, &poll_id)
+            .expect_err("loser should not be able to claim");
+        assert_eq!(err, Ok(PredictXError::NotOnWinningSide));
+    }
+
+    /// Double-claiming is rejected with `AlreadyClaimed`.
+    #[test]
+    fn double_claim_is_rejected() {
+        let s = setup();
+
+        let poll_id: u64 = 200;
+        let amount: i128 = 100_000_000;
         let user = Address::generate(&s.env);
-        plant_stake(&s, poll_id, &user, user_stake, StakeSide::Yes, false);
 
-        // Fund the contract so claim_winnings can transfer tokens.
-        mint_tokens(&s, &s.contract_id, yes_pool + no_pool);
+        mint_tokens(&s, &s.contract_id, amount * 2);
 
         // ── Read view BEFORE claiming ─────────────────────────────────────────
         let claimable = s.client.get_claimable_amount(&poll_id, &user);
@@ -827,12 +1055,17 @@ mod test {
         let winner = stake_user(&s, poll_id, StakeSide::Yes, 100_000_000);
         inject_resolved_poll(&s, poll_id, true, 100_000_000, 0);
         s.client.resolve_poll(&s.oracle_id, &poll_id, &true);
+        inject_resolved_poll(&s, poll_id, true, amount, amount);
+        inject_stake(&s, poll_id, &user, amount, StakeSide::Yes);
 
-        let balance_before = token_balance(&s, &user);
+        s.client.claim_winnings(&user, &poll_id);
 
-        // ── Claim ─────────────────────────────────────────────────────────────
-        let returned = s.client.claim_winnings(&user, &poll_id);
-        let balance_after = token_balance(&s, &user);
+        let err = s
+            .client
+            .try_claim_winnings(&user, &poll_id)
+            .expect_err("second claim should fail");
+        assert_eq!(err, Ok(PredictXError::AlreadyClaimed));
+    }
 
         // ── Assert: view == returned value == tokens received ─────────────────
         assert_eq!(
@@ -846,18 +1079,230 @@ mod test {
             balance_after - balance_before
         );
     #[test]
+    fn one_sided_poll_refunds_the_winner_at_par() {
+        let s = setup();
+        let poll_id = create_poll(&s, 2_000_000);
+        let winner = stake_user(&s, poll_id, StakeSide::Yes, 100_000_000);
+        resolve_via_state_machine(&s, poll_id, true);
+
+        let claimed = s.client.claim_winnings(&winner, &poll_id);
+
+        // No losing side, so no fee may be taken: the stake comes back whole.
+        assert_eq!(claimed, 100_000_000);
+        let token_client = token::Client::new(&s.env, &s.token_addr);
+        assert_eq!(token_client.balance(&winner), 100_000_000);
+    }
+
+    #[test]
     fn one_sided_poll_no_side_also_refunds_at_par() {
         let s = setup();
         let poll_id = create_poll(&s, 2_000_000);
         let winner = stake_user(&s, poll_id, StakeSide::No, 50_000_000);
         inject_resolved_poll(&s, poll_id, false, 0, 50_000_000);
         s.client.resolve_poll(&s.oracle_id, &poll_id, &false);
+        resolve_via_state_machine(&s, poll_id, false);
 
-        // ── After claiming: view returns 0 ────────────────────────────────────
+        // The quote and the claim must agree, both fee-free.
+        assert_eq!(s.client.calculate_winnings(&poll_id, &winner), 50_000_000);
+        assert_eq!(s.client.claim_winnings(&winner, &poll_id), 50_000_000);
+    }
+
+    // ── Payouts that round to zero (issue #235) ───────────────────────────────
+
+    /// A winning-side stake whose payout truncates to zero gets its own error —
+    /// never `NotOnWinningSide`, which is factually wrong for a winner — and
+    /// the quote and the claim agree on it.
+    ///
+    /// `stake` refuses anything below `MIN_STAKE_AMOUNT` and the pool maths
+    /// guarantee `gross >= amount` for a real stake, so this is only reachable
+    /// by a record that predates the floor (or a directly seeded one).  The
+    /// guard is what stops that record from being told it lost.
+    #[test]
+    fn zero_rounded_payout_returns_its_own_error() {
+        let s = setup();
+        let poll_id: u64 = 300;
+        let winner = Address::generate(&s.env);
+        // A maximal winning pool faced by a dust-sized winning stake.
+        let winning_pool: i128 = MAX_STAKE_AMOUNT;
+        let losing_pool: i128 = 10_000_000;
+        let dust_stake: i128 = 1;
+
+        mint_tokens(&s, &s.contract_id, winning_pool + losing_pool);
+        inject_resolved_poll(&s, poll_id, true, winning_pool, losing_pool);
+        inject_stake(&s, poll_id, &winner, dust_stake, StakeSide::Yes);
+
+        // 1 * 110_000_000 / 100_000_000 = 1 gross, 1 * 9500 / 10000 = 0 net.
+        let err = s
+            .client
+            .try_calculate_winnings(&poll_id, &winner)
+            .expect_err("a zero payout is not payable");
+        assert_eq!(err, Ok(PredictXError::PayoutRoundsToZero));
+
+        let err = s
+            .client
+            .try_claim_winnings(&winner, &poll_id)
+            .expect_err("a zero payout is not payable");
+        assert_eq!(err, Ok(PredictXError::PayoutRoundsToZero));
+
+        // The stake is left unclaimed and no token moved.
+        assert!(!s.client.get_stake_info(&poll_id, &winner).claimed);
+        assert_eq!(token_balance(&s, &winner), 0);
+    }
+
+    /// Boundary case: the smallest stake `stake` accepts, against the largest
+    /// pool a single stake can build.  It must still pay, and both paths must
+    /// return that same number.
+    #[test]
+    fn minimal_stake_against_maximal_pool_is_payable() {
+        let s = setup();
+        let poll_id = create_poll(&s, 2_000_000);
+
+        let whale = Address::generate(&s.env);
+        mint_tokens(&s, &whale, MAX_STAKE_AMOUNT);
+        s.client
+            .stake(&whale, &poll_id, &MAX_STAKE_AMOUNT, &StakeSide::Yes);
+
+        let min_user = Address::generate(&s.env);
+        mint_tokens(&s, &min_user, MIN_STAKE_AMOUNT);
+        s.client
+            .stake(&min_user, &poll_id, &MIN_STAKE_AMOUNT, &StakeSide::Yes);
+
+        let losing = Address::generate(&s.env);
+        mint_tokens(&s, &losing, MIN_STAKE_AMOUNT);
+        s.client
+            .stake(&losing, &poll_id, &MIN_STAKE_AMOUNT, &StakeSide::No);
+
+        resolve_via_state_machine(&s, poll_id, true);
+
+        let winning_pool = MAX_STAKE_AMOUNT + MIN_STAKE_AMOUNT;
+        let total_pool = winning_pool + MIN_STAKE_AMOUNT;
+        let gross = MIN_STAKE_AMOUNT * total_pool / winning_pool;
+        let expected = gross * 9_500 / 10_000;
+
+        let quoted = s.client.calculate_winnings(&poll_id, &min_user);
+        assert_eq!(quoted, expected);
+        assert!(quoted > 0, "a minimum stake must never round to zero");
+        assert_eq!(s.client.claim_winnings(&min_user, &poll_id), expected);
+    }
+
+    /// The quote and the claim agree on every case the engine distinguishes,
+    /// including the rounding edges that the two used to compute differently.
+    #[test]
+    fn quote_and_claim_agree_across_payout_cases() {
+        // (yes_pool, no_pool, outcome_yes, staker amount, staker side)
+        let cases: [(i128, i128, bool, i128, StakeSide); 6] = [
+            (10_000_007, 10_000_003, true, 10_000_007, StakeSide::Yes),
+            (10_000_007, 10_000_003, true, 3, StakeSide::Yes),
+            (3, 10_000_000, true, 3, StakeSide::Yes),
+            (10_000_007, 10_000_003, false, 10_000_003, StakeSide::No),
+            (10_000_000, 0, true, 10_000_000, StakeSide::Yes),
+            (0, 10_000_000, true, 10_000_000, StakeSide::No),
+        ];
+
+        for (i, (yes_pool, no_pool, outcome_yes, amount, side)) in cases.iter().enumerate() {
+            let s = setup();
+            let poll_id: u64 = 400 + i as u64;
+            let staker = Address::generate(&s.env);
+            let other = Address::generate(&s.env);
+
+            mint_tokens(&s, &s.contract_id, yes_pool + no_pool);
+            inject_resolved_poll(&s, poll_id, *outcome_yes, *yes_pool, *no_pool);
+            inject_stake(&s, poll_id, &staker, *amount, *side);
+            // A second staker keeps the case honest: somebody is always on the
+            // other side of the book.
+            inject_stake(&s, poll_id, &other, *amount, *side);
+
+            let quoted = s.client.try_calculate_winnings(&poll_id, &staker);
+            let claimed = s.client.try_claim_winnings(&staker, &poll_id);
+            assert_eq!(
+                quoted,
+                claimed,
+                "quote and claim diverged for case {:?}",
+                (yes_pool, no_pool, outcome_yes, amount, side)
+            );
+        }
+    }
+
+    /// The engine never pays out more than the pool holds, and the truncation
+    /// remainder stays behind in the contract rather than being handed to a
+    /// single claimant.
+    #[test]
+    fn payouts_never_exceed_the_pool() {
+        let s = setup();
+        let poll_id: u64 = 500;
+        let yes_pool: i128 = 33_333_331;
+        let no_pool: i128 = 66_666_667;
+        let amounts: [i128; 3] = [11_111_111, 11_111_110, 11_111_110];
+        let pot: i128 = yes_pool + no_pool;
+
+        let treasury = s.client.get_treasury_address();
+        mint_tokens(&s, &s.contract_id, pot);
+        inject_resolved_poll(&s, poll_id, true, yes_pool, no_pool);
+
+        let mut winners: Vec<Address> = Vec::new(&s.env);
+        for amount in amounts {
+            let user = Address::generate(&s.env);
+            inject_stake(&s, poll_id, &user, amount, StakeSide::Yes);
+            winners.push_back(user);
+        }
+
+        for i in 0..amounts.len() as u32 {
+            let claimed = s.client.claim_winnings(&winners.get(i).unwrap(), &poll_id);
+            assert_eq!(
+                claimed,
+                s.client
+                    .calculate_winnings(&poll_id, &winners.get(i).unwrap())
+            );
+        }
+
+        let paid = token_balance(&s, &winners.get(0).unwrap())
+            + token_balance(&s, &winners.get(1).unwrap())
+            + token_balance(&s, &winners.get(2).unwrap())
+            + token_balance(&s, &treasury);
+        assert!(paid <= pot, "payouts plus fees must stay inside the pot");
         assert_eq!(
-            s.client.get_claimable_amount(&poll_id, &user),
-            0,
-            "claimable amount must be 0 after claiming"
+            token_balance(&s, &s.contract_id) + paid,
+            pot,
+            "every base unit is either paid out or still held"
         );
+    }
+}
+
+    // ── Invalid state transitions (issue #124) ────────────────────────────────
+
+    /// Claiming — or quoting — a poll that is not resolved reports the state
+    /// mismatch itself instead of the unrelated `PollNotActive` /
+    /// `PollNotLocked` that used to surface.
+    #[test]
+    fn claim_and_quote_before_resolution_report_invalid_state() {
+        let s = setup();
+        let poll_id = create_poll(&s, 2_000_000);
+        let user = stake_user(&s, poll_id, StakeSide::Yes, 10_000_000);
+
+        let err = s
+            .client
+            .try_claim_winnings(&user, &poll_id)
+            .expect_err("poll is not resolved");
+        assert_eq!(err, Ok(PredictXError::InvalidStateTransition));
+
+        let err = s
+            .client
+            .try_calculate_winnings(&poll_id, &user)
+            .expect_err("poll is not resolved");
+        assert_eq!(err, Ok(PredictXError::InvalidStateTransition));
+    }
+
+    /// A cancelled poll is terminal: resolving it is an illegal transition.
+    #[test]
+    fn resolve_after_cancel_reports_invalid_state() {
+        let s = setup();
+        let poll_id = create_poll(&s, 2_000_000);
+        s.client.cancel_poll(&s.admin, &poll_id);
+
+        let err = s
+            .client
+            .try_resolve_poll(&s.admin, &poll_id, &true)
+            .expect_err("cancelled polls are terminal");
+        assert_eq!(err, Ok(PredictXError::InvalidStateTransition));
     }
 }

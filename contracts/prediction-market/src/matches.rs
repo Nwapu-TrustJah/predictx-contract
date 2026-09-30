@@ -3,6 +3,9 @@ use predictx_shared::{Match, PredictXError, MAX_MATCH_STRING_LENGTH};
 use crate::DataKey;   // ← uses prediction-market's local DataKey, not shared one
 use crate::ensure_not_paused;
 use predictx_shared::{DataKey, Match, PredictXError};
+use crate::DataKey;
+use predictx_shared::{Match, PredictXError};
+use soroban_sdk::{Address, Env, String, Symbol, Vec};
 
 // ── Internal helper ───────────────────────────────────────────────────────────
 
@@ -16,57 +19,6 @@ pub fn require_admin(env: &Env, caller: &Address) -> Result<(), PredictXError> {
     if *caller != admin {
         return Err(PredictXError::Unauthorized);
     }
-    Ok(())
-}
-
-// ── Admin transfer ────────────────────────────────────────────────────────────
-
-pub fn propose_admin(
-    env: &Env,
-    current: Address,
-    candidate: Address,
-) -> Result<(), PredictXError> {
-    require_admin(env, &current)?;
-    env.storage().instance().set(&DataKey::PendingAdmin, &candidate);
-    env.events().publish(
-        (Symbol::new(env, "AdminProposed"), current),
-        candidate,
-    );
-    Ok(())
-}
-
-pub fn cancel_admin_proposal(
-    env: &Env,
-    current: Address,
-) -> Result<(), PredictXError> {
-    require_admin(env, &current)?;
-    env.storage().instance().remove(&DataKey::PendingAdmin);
-    env.events().publish(
-        (Symbol::new(env, "AdminProposalCancelled"), current),
-        (),
-    );
-    Ok(())
-}
-
-pub fn accept_admin(
-    env: &Env,
-    candidate: Address,
-) -> Result<(), PredictXError> {
-    candidate.require_auth();
-    let pending: Address = env
-        .storage()
-        .instance()
-        .get(&DataKey::PendingAdmin)
-        .ok_or(PredictXError::Unauthorized)?;
-    if candidate != pending {
-        return Err(PredictXError::Unauthorized);
-    }
-    env.storage().instance().set(&DataKey::Admin, &candidate);
-    env.storage().instance().remove(&DataKey::PendingAdmin);
-    env.events().publish(
-        (Symbol::new(env, "AdminTransferred"), candidate.clone()),
-        candidate,
-    );
     Ok(())
 }
 
@@ -118,17 +70,21 @@ pub fn create_match(
         is_finished: false,
     };
 
-    env.storage().persistent().set(&DataKey::Match(match_id), &new_match);
+    env.storage()
+        .persistent()
+        .set(&DataKey::Match(match_id), &new_match);
 
     let empty: Vec<u64> = Vec::new(env);
-    env.storage().persistent().set(&DataKey::MatchPolls(match_id), &empty);
+    env.storage()
+        .persistent()
+        .set(&DataKey::MatchPolls(match_id), &empty);
 
-    env.storage().instance().set(&DataKey::NextMatchId, &(match_id + 1));
+    env.storage()
+        .instance()
+        .set(&DataKey::NextMatchId, &(match_id + 1));
 
-    env.events().publish(
-        (Symbol::new(env, "MatchCreated"), match_id),
-        new_match,
-    );
+    env.events()
+        .publish((Symbol::new(env, "MatchCreated"), match_id), new_match);
 
     Ok(match_id)
 }
@@ -185,19 +141,30 @@ pub fn update_match(
         if v.len() > MAX_MATCH_STRING_LENGTH {
             return Err(PredictXError::MatchStringTooLong);
         }
+        m.home_team = v;
+    }
+    if let Some(v) = away_team {
+        m.away_team = v;
+    }
+    if let Some(v) = league {
+        m.league = v;
+    }
+    if let Some(v) = venue {
         m.venue = v;
     }
     if let Some(kt) = kickoff_time {
-        if kt <= now { return Err(PredictXError::InvalidLockTime); }
+        if kt <= now {
+            return Err(PredictXError::InvalidLockTime);
+        }
         m.kickoff_time = kt;
     }
 
-    env.storage().persistent().set(&DataKey::Match(match_id), &m);
+    env.storage()
+        .persistent()
+        .set(&DataKey::Match(match_id), &m);
 
-    env.events().publish(
-        (Symbol::new(env, "MatchUpdated"), match_id),
-        m.clone(),
-    );
+    env.events()
+        .publish((Symbol::new(env, "MatchUpdated"), match_id), m.clone());
 
     Ok(m)
 }
@@ -208,6 +175,7 @@ pub fn finish_match(
     match_id: u64,
 ) -> Result<(), PredictXError> {
     ensure_not_paused(env)?;
+pub fn finish_match(env: &Env, admin: Address, match_id: u64) -> Result<(), PredictXError> {
     require_admin(env, &admin)?;
 
     let mut m: Match = env
@@ -217,12 +185,12 @@ pub fn finish_match(
         .ok_or(PredictXError::MatchNotFound)?;
 
     m.is_finished = true;
-    env.storage().persistent().set(&DataKey::Match(match_id), &m);
+    env.storage()
+        .persistent()
+        .set(&DataKey::Match(match_id), &m);
 
-    env.events().publish(
-        (Symbol::new(env, "MatchFinished"), match_id),
-        (),
-    );
+    env.events()
+        .publish((Symbol::new(env, "MatchFinished"), match_id), ());
 
     Ok(())
 }
@@ -259,12 +227,12 @@ pub fn get_match_count(env: &Env) -> u64 {
 mod test {
     extern crate std;
 
+    use crate::{PredictionMarket, PredictionMarketClient};
+    use predictx_shared::PredictXError;
     use soroban_sdk::{
         testutils::{Address as _, Ledger},
         Address, Env, String,
     };
-    use predictx_shared::PredictXError;
-    use crate::{PredictionMarket, PredictionMarketClient};
 
     // setup now passes a dummy oracle address and token address to match the real initialize signature
     fn setup() -> (Env, Address, PredictionMarketClient<'static>) {
@@ -273,23 +241,27 @@ mod test {
         let cid = env.register(PredictionMarket, ());
         let client = PredictionMarketClient::new(&env, &cid);
         let admin = Address::generate(&env);
-        let oracle = Address::generate(&env);   // dummy — not used by match functions
-        let token = Address::generate(&env);    // dummy — not used by match functions
+        let oracle = Address::generate(&env); // dummy — not used by match functions
+        let token = Address::generate(&env); // dummy — not used by match functions
         let treasury = Address::generate(&env); // dummy — not used by match functions
         client.initialize(&admin, &oracle, &token, &treasury, &500_u32);
         env.ledger().with_mut(|l| l.timestamp = 1_000_000);
         (env, admin, client)
     }
 
-    fn s(env: &Env, t: &str) -> String { String::from_str(env, t) }
+    fn s(env: &Env, t: &str) -> String {
+        String::from_str(env, t)
+    }
 
     const KICKOFF: u64 = 1_003_600;
 
     fn default_match(env: &Env, client: &PredictionMarketClient, admin: &Address) -> u64 {
         client.create_match(
             admin,
-            &s(env, "Arsenal"), &s(env, "Chelsea"),
-            &s(env, "Premier League"), &s(env, "Emirates"),
+            &s(env, "Arsenal"),
+            &s(env, "Chelsea"),
+            &s(env, "Premier League"),
+            &s(env, "Emirates"),
             &KICKOFF,
         )
     }
@@ -321,24 +293,34 @@ mod test {
     #[test]
     fn test_create_match_rejects_past_kickoff() {
         let (env, admin, client) = setup();
-        let err = client.try_create_match(
-            &admin,
-            &s(&env, "A"), &s(&env, "B"),
-            &s(&env, "L"), &s(&env, "V"),
-            &999_999u64,
-        ).unwrap_err().unwrap();
+        let err = client
+            .try_create_match(
+                &admin,
+                &s(&env, "A"),
+                &s(&env, "B"),
+                &s(&env, "L"),
+                &s(&env, "V"),
+                &999_999u64,
+            )
+            .unwrap_err()
+            .unwrap();
         assert_eq!(err, PredictXError::InvalidLockTime);
     }
 
     #[test]
     fn test_create_match_rejects_non_admin() {
         let (env, _, client) = setup();
-        let err = client.try_create_match(
-            &Address::generate(&env),
-            &s(&env, "A"), &s(&env, "B"),
-            &s(&env, "L"), &s(&env, "V"),
-            &KICKOFF,
-        ).unwrap_err().unwrap();
+        let err = client
+            .try_create_match(
+                &Address::generate(&env),
+                &s(&env, "A"),
+                &s(&env, "B"),
+                &s(&env, "L"),
+                &s(&env, "V"),
+                &KICKOFF,
+            )
+            .unwrap_err()
+            .unwrap();
         assert_eq!(err, PredictXError::Unauthorized);
     }
 
@@ -359,8 +341,13 @@ mod test {
         let (env, admin, client) = setup();
         let id = default_match(&env, &client, &admin);
         let updated = client.update_match(
-            &admin, &id,
-            &Some(s(&env, "Liverpool")), &None, &None, &None, &None,
+            &admin,
+            &id,
+            &Some(s(&env, "Liverpool")),
+            &None,
+            &None,
+            &None,
+            &None,
         );
         assert_eq!(updated.home_team, s(&env, "Liverpool"));
         assert_eq!(updated.away_team, s(&env, "Chelsea"));
@@ -371,20 +358,20 @@ mod test {
         let (env, admin, client) = setup();
         let id = default_match(&env, &client, &admin);
         env.ledger().with_mut(|l| l.timestamp = KICKOFF + 1);
-        let err = client.try_update_match(
-            &admin, &id,
-            &Some(s(&env, "X")), &None, &None, &None, &None,
-        ).unwrap_err().unwrap();
+        let err = client
+            .try_update_match(&admin, &id, &Some(s(&env, "X")), &None, &None, &None, &None)
+            .unwrap_err()
+            .unwrap();
         assert_eq!(err, PredictXError::MatchAlreadyStarted);
     }
 
     #[test]
     fn test_update_nonexistent_match_fails() {
         let (_, admin, client) = setup();
-        let err = client.try_update_match(
-            &admin, &999u64,
-            &None, &None, &None, &None, &None,
-        ).unwrap_err().unwrap();
+        let err = client
+            .try_update_match(&admin, &999u64, &None, &None, &None, &None, &None)
+            .unwrap_err()
+            .unwrap();
         assert_eq!(err, PredictXError::MatchNotFound);
     }
 
@@ -392,10 +379,18 @@ mod test {
     fn test_update_match_rejects_non_admin() {
         let (env, admin, client) = setup();
         let id = default_match(&env, &client, &admin);
-        let err = client.try_update_match(
-            &Address::generate(&env), &id,
-            &Some(s(&env, "X")), &None, &None, &None, &None,
-        ).unwrap_err().unwrap();
+        let err = client
+            .try_update_match(
+                &Address::generate(&env),
+                &id,
+                &Some(s(&env, "X")),
+                &None,
+                &None,
+                &None,
+                &None,
+            )
+            .unwrap_err()
+            .unwrap();
         assert_eq!(err, PredictXError::Unauthorized);
     }
 
@@ -423,7 +418,10 @@ mod test {
     #[test]
     fn test_finish_nonexistent_match_fails() {
         let (_, admin, client) = setup();
-        let err = client.try_finish_match(&admin, &999u64).unwrap_err().unwrap();
+        let err = client
+            .try_finish_match(&admin, &999u64)
+            .unwrap_err()
+            .unwrap();
         assert_eq!(err, PredictXError::MatchNotFound);
     }
 
@@ -431,7 +429,10 @@ mod test {
     fn test_finish_match_rejects_non_admin() {
         let (env, admin, client) = setup();
         let id = default_match(&env, &client, &admin);
-        let err = client.try_finish_match(&Address::generate(&env), &id).unwrap_err().unwrap();
+        let err = client
+            .try_finish_match(&Address::generate(&env), &id)
+            .unwrap_err()
+            .unwrap();
         assert_eq!(err, PredictXError::Unauthorized);
     }
 
@@ -471,12 +472,17 @@ mod test {
         // old admin still works
         default_match(&env, &client, &admin);
         // candidate cannot act yet
-        let err = client.try_create_match(
-            &candidate,
-            &s(&env, "A"), &s(&env, "B"),
-            &s(&env, "L"), &s(&env, "V"),
-            &KICKOFF,
-        ).unwrap_err().unwrap();
+        let err = client
+            .try_create_match(
+                &candidate,
+                &s(&env, "A"),
+                &s(&env, "B"),
+                &s(&env, "L"),
+                &s(&env, "V"),
+                &KICKOFF,
+            )
+            .unwrap_err()
+            .unwrap();
         assert_eq!(err, PredictXError::Unauthorized);
     }
 
@@ -514,12 +520,17 @@ mod test {
         client.propose_admin(&admin, &candidate);
         client.accept_admin(&candidate);
         // old admin rejected
-        let err = client.try_create_match(
-            &admin,
-            &s(&env, "A"), &s(&env, "B"),
-            &s(&env, "L"), &s(&env, "V"),
-            &KICKOFF,
-        ).unwrap_err().unwrap();
+        let err = client
+            .try_create_match(
+                &admin,
+                &s(&env, "A"),
+                &s(&env, "B"),
+                &s(&env, "L"),
+                &s(&env, "V"),
+                &KICKOFF,
+            )
+            .unwrap_err()
+            .unwrap();
         assert_eq!(err, PredictXError::Unauthorized);
         // new admin works
         default_match(&env, &client, &candidate);

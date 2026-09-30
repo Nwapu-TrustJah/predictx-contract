@@ -66,6 +66,18 @@ pub enum DataKey {
     /// `(poll_id, user)` → `bool` — has this user already done an emergency
     /// withdrawal for this poll? (Persistent)
     EmergencyClaimed(u64, Address),
+    /// `poll_id` → oracle-side poll status snapshot. (Persistent)
+    PollStatus(u64),
+    /// `poll_id` → outcome the oracle auto-resolved to. (Persistent)
+    PollOutcome(u64),
+    /// `poll_id` → roster of voters who cast a vote. (Persistent)
+    Voters(u64),
+    /// `(poll_id, voter)` → `VoteChoice` the voter recorded. (Persistent)
+    VoterChoice(u64, Address),
+    /// `poll_id` → unclaimed voter reward reserve. (Persistent)
+    RewardPool(u64),
+    /// `(poll_id, voter)` → `bool` — has this voter claimed their reward? (Persistent)
+    RewardClaimed(u64, Address),
 
     // ── Temporary storage ─────────────────────────────────────────────────────
     /// `poll_id` → `VoteTally`. (Temporary — only needed during voting window)
