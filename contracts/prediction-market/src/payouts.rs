@@ -57,6 +57,7 @@ use crate::{DataKey, get_platform_stats, has_emergency_claimed, set_platform_sta
 ///
 /// Only the address stored as the market's voting oracle may resolve polls;
 /// this is the implementation behind the market's `resolve_poll` entry point.
+/// Resolve a poll using the configured admin or oracle and record its final outcome.
 pub fn resolve_poll(
     env: &Env,
     caller: Address,
@@ -73,7 +74,12 @@ pub fn resolve_poll(
         .instance()
         .get(&DataKey::Admin)
         .ok_or(PredictXError::NotInitialized)?;
-    if admin != stored_admin {
+    let stored_oracle: Address = env
+        .storage()
+        .instance()
+        .get(&DataKey::VotingOracle)
+        .ok_or(PredictXError::NotInitialized)?;
+    if caller != stored_admin && caller != stored_oracle {
         return Err(PredictXError::Unauthorized);
     }
 
@@ -117,6 +123,10 @@ pub fn resolve_poll(
     // Guard against a degenerate pool (no losers → only return stake).
     if winning_pool == 0 {
         return stake.amount;
+        .get(&DataKey::Poll(poll_id))
+        .ok_or(PredictXError::PollNotFound)?;
+    if poll.status == PollStatus::Resolved || poll.outcome.is_some() {
+        return Err(PredictXError::PollAlreadyResolved);
     }
 
     let fee_bps = token_utils::get_platform_fee_bps(env);
@@ -305,6 +315,11 @@ pub fn claim_winnings(
         if losing_pool <= 0 {
             // No-contest: nothing to skim a fee from, refund at par.
             // Must match calculate_winnings.
+        let losing_pool = if outcome_yes { poll.no_pool } else { poll.yes_pool };
+        if losing_pool <= 0 {
+            // No-contest: nothing was staked on the losing side, so there is no
+            // pot to skim a platform fee from. Every winner is refunded their exact
+            // stake rather than a fee-discounted share of a one-sided pool.
             stake.amount
         } else {
             // Proportional share of total pool, after platform fee.
@@ -360,6 +375,7 @@ pub fn claim_winnings(
         gross.saturating_sub(payout)
     } else {
         0
+        }
     };
     if fee > 0 {
         token_utils::transfer_to_treasury(env, fee)?;
@@ -523,6 +539,12 @@ mod test {
     /// Mint tokens and place a real stake, returning the staker's address.
     /// Stake on a poll through the public entry point and return the staker.
     fn stake_user(s: &TestSetup, poll_id: u64, side: StakeSide, amount: i128) -> Address {
+    fn stake_user(
+        s: &TestSetup,
+        poll_id: u64,
+        side: StakeSide,
+        amount: i128,
+    ) -> Address {
         let user = Address::generate(&s.env);
         mint_tokens(s, &user, amount);
         s.client.stake(&user, &poll_id, &amount, &side);

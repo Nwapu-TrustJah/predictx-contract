@@ -590,6 +590,12 @@ impl PredictionMarket {
         Ok(poll_id)
     }
 
+    pub fn get_poll(env: Env, poll_id: u64) -> Result<Poll, PredictXError> {
+        env.storage()
+            .persistent()
+            .get(&DataKey::Poll(poll_id))
+            .ok_or(PredictXError::PollNotFound)
+    }
 
     /// Resolve a poll with a boolean outcome. Callable only by the registered
     /// oracle; delegates to [`payouts::resolve_poll`].
@@ -611,6 +617,12 @@ impl PredictionMarket {
 
     pub fn get_poll(env: Env, poll_id: u64) -> Result<Poll, PredictXError> {
         let mut poll: Poll = env
+    /// Return the stored lifecycle status of a poll in the market.
+    ///
+    /// Reads the market's own copy of the poll, returning `PollNotFound`
+    /// if the poll does not exist.
+    pub fn get_poll_status(env: Env, poll_id: u64) -> Result<PollStatus, PredictXError> {
+        let poll: Poll = env
             .storage()
             .persistent()
             .get(&DataKey::Poll(poll_id))
@@ -632,13 +644,21 @@ impl PredictionMarket {
         payouts::resolve_poll(&env, caller, poll_id, outcome)
         payouts::record_poll_resolution(&env, &mut poll, outcome)
         payouts::resolve_poll(&env, caller, poll_id, outcome)
+        Ok(poll.status)
     }
 
-    pub fn get_poll(env: Env, poll_id: u64) -> Result<Poll, PredictXError> {
-        env.storage()
-            .persistent()
-            .get(&DataKey::Poll(poll_id))
-            .ok_or(PredictXError::PollNotFound)
+    /// Check whether a poll is currently open for staking, combining its lifecycle
+    /// status and lock time against the current ledger timestamp.
+    ///
+    /// Returns `false` for unknown polls rather than erroring.
+    /// Returns `false` for a poll past its `lock_time`, even if the stored status is stale.
+    pub fn is_poll_open(env: Env, poll_id: u64) -> bool {
+        let poll: Poll = match env.storage().persistent().get(&DataKey::Poll(poll_id)) {
+            Some(p) => p,
+            None => return false,
+        };
+
+        poll.status == PollStatus::Active && env.ledger().timestamp() < poll.lock_time
     }
 
     // ── Staking ───────────────────────────────────────────────────────────────
@@ -777,14 +797,16 @@ impl PredictionMarket {
 
     // ── Payouts ───────────────────────────────────────────────────────────────
 
+    /// Resolve a poll with a boolean outcome. Callable by the registered oracle or admin.
     pub fn resolve_poll(
         env: Env,
-        admin: Address,
+        caller: Address,
         poll_id: u64,
         outcome: bool,
     ) -> Result<(), PredictXError> {
         extend_instance_ttl(&env);
         payouts::resolve_poll(&env, admin, poll_id, outcome)
+        payouts::resolve_poll(&env, caller, poll_id, outcome)
     }
 
     /// Claim winnings after a resolved poll.
@@ -1312,6 +1334,7 @@ mod test {
 
     #[test]
     fn propose_admin_does_not_change_active_admin() {
+    fn get_poll_status_returns_poll_not_found_for_unknown_poll() {
         let env = Env::default();
         env.mock_all_auths();
         let contract_id = env.register(PredictionMarket, ());
@@ -1332,6 +1355,13 @@ mod test {
 
     /// Register and initialise a market contract for the stats view assertions.
     fn stats_env() -> (Env, Address, PredictionMarketClient<'static>) {
+
+        let err = client.try_get_poll_status(&999_u64).expect_err("unknown poll should fail");
+        assert_eq!(err, Ok(PredictXError::PollNotFound));
+    }
+
+    #[test]
+    fn get_poll_status_returns_market_poll_status() {
         let env = Env::default();
         env.mock_all_auths();
         let contract_id = env.register(PredictionMarket, ());
@@ -1456,6 +1486,16 @@ mod test {
 
     #[test]
     fn resolve_poll_rejects_active_poll_with_invalid_transition() {
+
+        seed_active_poll(&env, &contract_id, 10, &admin);
+        assert_eq!(client.get_poll_status(&10_u64), PollStatus::Active);
+
+        client.resolve_poll(&oracle, &10_u64, &true);
+        assert_eq!(client.get_poll_status(&10_u64), PollStatus::Resolved);
+    }
+
+    #[test]
+    fn is_poll_open_returns_false_for_unknown_poll() {
         let env = Env::default();
         env.mock_all_auths();
         let contract_id = env.register(PredictionMarket, ());
@@ -1496,6 +1536,17 @@ mod test {
     fn full_lifecycle_walk_via_state_machine() {
         let env = Env::default();
         env.mock_all_auths();
+
+        // Unknown poll must return false rather than erroring / panicking
+        assert_eq!(client.is_poll_open(&999_u64), false);
+    }
+
+    #[test]
+    fn is_poll_open_false_past_lock_time_even_if_status_stale() {
+        let env = Env::default();
+        env.mock_all_auths();
+        env.ledger().set_timestamp(1_000);
+
         let contract_id = env.register(PredictionMarket, ());
         let client = PredictionMarketClient::new(&env, &contract_id);
         let admin = Address::generate(&env);
@@ -1802,6 +1853,79 @@ mod test {
         // Emergency withdraw should remain callable while paused
         let refunded = client.emergency_withdraw(&user, &poll_id);
         assert_eq!(refunded, amount);
+
+        let lock_time = 2_000;
+        let poll = Poll {
+            poll_id: 20,
+            match_id: 1,
+            creator: admin.clone(),
+            question: String::from_str(&env, "Will team score?"),
+            category: PollCategory::TeamEvent,
+            lock_time,
+            yes_pool: 0,
+            no_pool: 0,
+            yes_count: 0,
+            no_count: 0,
+            status: PollStatus::Active,
+            outcome: None,
+            resolution_time: 0,
+            created_at: 1_000,
+        };
+        env.as_contract(&contract_id, || {
+            env.storage().persistent().set(&DataKey::Poll(20), &poll);
+        });
+
+        // 1. Before lock_time with status == Active: poll is open
+        assert_eq!(client.is_poll_open(&20_u64), true);
+
+        // 2. Exactly at lock_time: stored status is still Active (stale), but lock_time has been reached
+        env.ledger().set_timestamp(2_000);
+        assert_eq!(client.get_poll_status(&20_u64), PollStatus::Active); // verify status is stale Active
+        assert_eq!(client.is_poll_open(&20_u64), false);
+
+        // 3. Past lock_time: stored status is still Active (stale)
+        env.ledger().set_timestamp(2_500);
+        assert_eq!(client.get_poll_status(&20_u64), PollStatus::Active); // verify status is stale Active
+        assert_eq!(client.is_poll_open(&20_u64), false);
+    }
+
+    #[test]
+    fn is_poll_open_returns_false_for_non_active_poll_before_lock_time() {
+        let env = Env::default();
+        env.mock_all_auths();
+        env.ledger().set_timestamp(1_000);
+
+        let contract_id = env.register(PredictionMarket, ());
+        let client = PredictionMarketClient::new(&env, &contract_id);
+        let admin = Address::generate(&env);
+        let oracle = Address::generate(&env);
+        let tok = Address::generate(&env);
+        let treasury = Address::generate(&env);
+        client.initialize(&admin, &oracle, &tok, &treasury, &TEST_FEE_BPS);
+
+        // Seed a poll with Locked status, but lock_time is in the future
+        let poll = Poll {
+            poll_id: 30,
+            match_id: 1,
+            creator: admin.clone(),
+            question: String::from_str(&env, "Will team score?"),
+            category: PollCategory::TeamEvent,
+            lock_time: 5_000,
+            yes_pool: 0,
+            no_pool: 0,
+            yes_count: 0,
+            no_count: 0,
+            status: PollStatus::Locked,
+            outcome: None,
+            resolution_time: 0,
+            created_at: 1_000,
+        };
+        env.as_contract(&contract_id, || {
+            env.storage().persistent().set(&DataKey::Poll(30), &poll);
+        });
+
+        assert_eq!(client.get_poll_status(&30_u64), PollStatus::Locked);
+        assert_eq!(client.is_poll_open(&30_u64), false);
     }
 
 }
