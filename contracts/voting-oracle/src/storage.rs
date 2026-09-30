@@ -161,6 +161,12 @@ pub fn write_reward_pool(env: &Env, poll_id: u64, amount: i128) {
 }
 
 /// Whether `voter` has already claimed their reward on `poll_id`.
+// ── Voter-reward claim storage ───────────────────────────────────────────────
+
+/// Whether `voter` has already claimed their reward for `poll_id`.
+///
+/// Reward claims outlive the voting window, so the marker is *persistent*
+/// rather than temporary (unlike the vote-dedup marker above).
 pub fn has_claimed_reward(env: &Env, poll_id: u64, voter: &Address) -> bool {
     env.storage()
         .persistent()
@@ -169,6 +175,11 @@ pub fn has_claimed_reward(env: &Env, poll_id: u64, voter: &Address) -> bool {
 }
 
 /// Record that `voter` claimed their reward on `poll_id`.
+/// Record that `voter` has claimed their reward for `poll_id`.
+///
+/// Written *before* the token transfer (checks-effects-interactions) so a
+/// repeated or re-entrant claim cannot pass the entry check and drain the
+/// reward pool.
 pub fn write_reward_claimed(env: &Env, poll_id: u64, voter: &Address) {
     env.storage()
         .persistent()

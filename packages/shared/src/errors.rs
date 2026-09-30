@@ -84,4 +84,6 @@ pub enum PredictXError {
     InvalidRewardAmount = 38,
     /// The requested poll status transition is not part of the legal graph.
     InvalidStateTransition = 39,
+    /// Caller did not vote on this poll and cannot claim a voter reward.
+    NotEligibleVoter = 36,
 }

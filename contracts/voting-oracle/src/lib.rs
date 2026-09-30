@@ -90,6 +90,10 @@ pub(crate) enum DataKey {
     Approval(u64, Address),
     /// `poll_id` → `u32` approval count. (Persistent)
     ApprovalCount(u64),
+    /// Soroban token contract used to pay out voter rewards. (Instance)
+    TokenAddress,
+    /// `(poll_id, voter)` → `bool` — has this voter claimed their reward? (Persistent)
+    RewardClaimed(u64, Address),
 }
 
 fn get_admin(env: &Env) -> Result<Address, PredictXError> {
@@ -239,6 +243,28 @@ impl VotingOracle {
     /// Returns all registered admins.
     pub fn list_admins(env: Env) -> Vec<Address> {
         storage::read_admins(&env)
+    }
+
+    /// Admin-gated setter for the token contract used to pay voter rewards.
+    pub fn set_token_address(
+        env: Env,
+        admin: Address,
+        token_address: Address,
+    ) -> Result<(), PredictXError> {
+        storage::require_admin(&env, &admin)?;
+        admin.require_auth();
+        env.storage()
+            .instance()
+            .set(&DataKey::TokenAddress, &token_address);
+        Ok(())
+    }
+
+    /// Returns the stored voter-reward token address.
+    pub fn get_token_address(env: Env) -> Result<Address, PredictXError> {
+        env.storage()
+            .instance()
+            .get(&DataKey::TokenAddress)
+            .ok_or(PredictXError::NotInitialized)
     }
 
     /// Placeholder oracle state setter.
@@ -536,6 +562,16 @@ impl VotingOracle {
     /// Read the outcome approved by `admin` for `poll_id`, if any.
     pub fn get_approval(env: Env, poll_id: u64, admin: Address) -> Option<VoteChoice> {
         storage::read_approval(&env, poll_id, &admin)
+    /// Claim a voter's share of a resolved poll's reserved reward pool.
+    ///
+    /// Pull-based by design: each voter claims their own equal share instead of
+    /// the contract pushing a payout to every voter at once.
+    pub fn claim_voter_reward(
+        env: Env,
+        voter: Address,
+        poll_id: u64,
+    ) -> Result<i128, PredictXError> {
+        voting::claim_voter_reward(&env, voter, poll_id)
     }
 }
 
