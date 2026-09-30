@@ -9,9 +9,12 @@ pub(crate) mod token_utils;
 use predictx_shared::{
     Match, PlatformStats, Poll, PollCategory, PollStatus, PredictXError, Stake, StakeSide,
     UserStats, BPS_DENOMINATOR, MAX_POLLS_PER_MATCH,
+    DataKey, Match, PlatformStats, Poll, PollCategory, PollStatus, PredictXError, Stake, StakeSide,
+    MAX_POLLS_PER_MATCH,
 };
 use soroban_sdk::{contract, contractimpl, contracttype, Address, Env, String, Symbol, Vec};
 
+mod payouts;
 mod voting_oracle {
     soroban_sdk::contractimport!(file = "wasm/voting_oracle.wasm");
 }
@@ -607,6 +610,7 @@ impl PredictionMarket {
 
         Ok(poll)
         payouts::resolve_poll(&env, caller, poll_id, outcome)
+        payouts::record_poll_resolution(&env, &mut poll, outcome)
     }
 
     pub fn get_poll(env: Env, poll_id: u64) -> Result<Poll, PredictXError> {

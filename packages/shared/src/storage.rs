@@ -13,6 +13,12 @@ pub enum DataKey {
     Admin,
     /// Soroban token contract `Address` used for staking. (Instance)
     TokenAddress,
+    /// Cross-contract `Address` of the VotingOracle contract. (Instance)
+    VotingOracle,
+    /// Circuit-breaker flag `bool` — `true` while the contract is paused. (Instance)
+    Paused,
+    /// Treasury contract `Address` that receives platform fees. (Instance)
+    TreasuryAddress,
     /// Platform fee in basis points. (Instance)
     PlatformFeeBps,
     /// Duration of the voting window in seconds. (Instance)
@@ -57,6 +63,9 @@ pub enum DataKey {
     VoterReward(u64, Address),
     /// `poll_id` → `VotingOracle`-specific poll metadata. (Persistent)
     OraclePoll(u64),
+    /// `(poll_id, user)` → `bool` — has this user already done an emergency
+    /// withdrawal for this poll? (Persistent)
+    EmergencyClaimed(u64, Address),
 
     // ── Temporary storage ─────────────────────────────────────────────────────
     /// `poll_id` → `VoteTally`. (Temporary — only needed during voting window)
