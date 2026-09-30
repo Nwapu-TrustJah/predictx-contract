@@ -23,6 +23,7 @@ use soroban_sdk::{contract, contractimpl, contracttype, Address, Env, Vec};
 mod dispute;
 mod storage;
 mod voting;
+use soroban_sdk::{contract, contractimpl, contracttype, Address, Env, Symbol, Vec};
 
 use predictx_shared::{PollStatus, PredictXError, VoteChoice, VoteTally};
 use soroban_sdk::{contract, contractimpl, contracttype, Address, Env, String, Vec};
@@ -68,6 +69,7 @@ pub(crate) enum DataKey {
     AdminList,
     /// Soroban token contract `Address` used for dispute fees. (Instance)
     TokenAddress,
+    Paused,
     PollStatus(u64),
     Evidence(u64),
     /// `poll_id` → `VoteTally`. (Temporary — only needed during voting window)
@@ -147,6 +149,17 @@ fn write_tally(env: &Env, tally: &VoteTally) {
     env.storage()
         .persistent()
         .set(&DataKey::Tally(tally.poll_id), tally);
+fn is_paused(env: &Env) -> bool {
+    env.storage().instance().get(&DataKey::Paused).unwrap_or(false)
+}
+
+fn ensure_not_paused(env: &Env) -> Result<(), PredictXError> {
+    if is_paused(env) {
+        return Err(PredictXError::ContractPaused);
+    }
+    Ok(())
+}
+
 pub(crate) fn read_poll_status(env: &Env, poll_id: u64) -> PollStatus {
     let stored: Option<StoredPollStatus> = env
         .storage()
@@ -176,6 +189,7 @@ impl VotingOracle {
         env.storage()
             .instance()
             .set(&DataKey::TokenAddress, &token);
+        env.storage().instance().set(&DataKey::Paused, &false);
 
         // Seed the multi-admin registry with the initial admin.
         let mut admins: Vec<Address> = Vec::new(&env);
@@ -202,11 +216,32 @@ impl VotingOracle {
     }
 
     pub fn set_poll_status(env: Env, poll_id: u64, status: PollStatus) -> Result<(), PredictXError> {
+    pub fn pause(env: Env, admin: Address) -> Result<(), PredictXError> {
+        storage::require_admin(&env, &admin)?;
+        admin.require_auth();
+        env.storage().instance().set(&DataKey::Paused, &true);
+        env.events().publish((Symbol::new(&env, "ContractPaused"),), true);
+        Ok(())
+    }
+
+    pub fn unpause(env: Env, admin: Address) -> Result<(), PredictXError> {
+        storage::require_admin(&env, &admin)?;
+        admin.require_auth();
+        env.storage().instance().set(&DataKey::Paused, &false);
+        env.events().publish((Symbol::new(&env, "ContractUnpaused"),), true);
+        Ok(())
+    }
+
+    pub fn is_paused(env: Env) -> bool {
+        is_paused(&env)
+    }
+
     /// Register `new_admin` in the multi-admin registry.
     ///
     /// Only an existing admin may call this. Returns `AdminAlreadyRegistered`
     /// if the address is already registered.
     pub fn add_admin(env: Env, caller: Address, new_admin: Address) -> Result<(), PredictXError> {
+        ensure_not_paused(&env)?;
         storage::require_admin(&env, &caller)?;
         caller.require_auth();
 
@@ -228,6 +263,7 @@ impl VotingOracle {
     /// Only an existing admin may call this. The last remaining admin cannot
     /// be removed.
     pub fn remove_admin(env: Env, caller: Address, admin: Address) -> Result<(), PredictXError> {
+        ensure_not_paused(&env)?;
         storage::require_admin(&env, &caller)?;
         caller.require_auth();
 
@@ -320,6 +356,7 @@ impl VotingOracle {
         poll_id: u64,
         status: PollStatus,
     ) -> Result<(), PredictXError> {
+        ensure_not_paused(&env)?;
         let admin = get_admin(&env)?;
         admin.require_auth();
 
@@ -442,6 +479,7 @@ impl VotingOracle {
         poll_id: u64,
         choice: VoteChoice,
     ) -> Result<VoteTally, PredictXError> {
+        ensure_not_paused(&env)?;
         voting::cast_vote(&env, voter, poll_id, choice)
     }
 
@@ -453,6 +491,9 @@ impl VotingOracle {
         total_pool: i128,
     ) -> Result<VoteChoice, PredictXError> {
         voting::auto_resolve(&env, poll_id, total_pool)
+    pub fn auto_resolve(env: Env, poll_id: u64) -> Result<VoteChoice, PredictXError> {
+        ensure_not_paused(&env)?;
+        voting::auto_resolve(&env, poll_id)
     }
 
     pub fn get_poll_outcome(env: Env, poll_id: u64) -> Result<VoteChoice, PredictXError> {
@@ -505,6 +546,7 @@ impl VotingOracle {
         poll_id: u64,
         amount: i128,
     ) -> Result<(), PredictXError> {
+        ensure_not_paused(&env)?;
         voting::set_reward_pool(&env, caller, poll_id, amount)
     }
 
@@ -513,6 +555,7 @@ impl VotingOracle {
     /// Only voters who backed the resolved winning outcome may claim; the pool
     /// is split evenly across those eligible voters.
     pub fn claim_reward(env: Env, voter: Address, poll_id: u64) -> Result<i128, PredictXError> {
+        ensure_not_paused(&env)?;
         voting::claim_reward(&env, voter, poll_id)
     }
 
@@ -707,6 +750,7 @@ mod test {
     }
     use super::*; 
     use soroban_sdk::testutils::{Address as _, Ledger};
+    use soroban_sdk::testutils::{Address as _, Ledger as _};
 
     #[test]
     fn set_and_get_status() {
@@ -727,6 +771,7 @@ mod test {
     #[test]
     fn admin_verify_resolves_review_and_persists_reasoning() {
     fn set_and_get_evidence() {
+    fn paused_oracle_rejects_mutations_and_recovers_after_unpause() {
         let env = Env::default();
         env.mock_all_auths();
 
@@ -929,6 +974,37 @@ mod test {
         );
     #[test]
     fn get_vote_tally_returns_poll_not_found_for_unknown_poll() {
+
+        client.set_poll_status(&1_u64, &PollStatus::Voting);
+        assert_eq!(client.get_poll_status(&1_u64), PollStatus::Voting);
+
+        assert!(!client.is_paused());
+        client.pause(&admin);
+        assert!(client.is_paused());
+        assert_eq!(client.get_poll_status(&1_u64), PollStatus::Voting);
+
+        let voter = Address::generate(&env);
+        let err_set_status = client
+            .try_set_poll_status(&2_u64, &PollStatus::Voting)
+            .expect_err("paused oracle should reject status updates");
+        assert_eq!(err_set_status, Ok(PredictXError::ContractPaused));
+
+        let err_cast_vote = client
+            .try_cast_vote(&voter, &1_u64, &VoteChoice::Yes)
+            .expect_err("paused oracle should reject votes");
+        assert_eq!(err_cast_vote, Ok(PredictXError::ContractPaused));
+
+        client.unpause(&admin);
+        assert!(!client.is_paused());
+
+        client.set_poll_status(&2_u64, &PollStatus::Voting);
+        assert_eq!(client.get_poll_status(&2_u64), PollStatus::Voting);
+
+        let tally = client.cast_vote(&voter, &2_u64, &VoteChoice::Yes);
+        assert_eq!(tally.yes_votes, 1);
+    }
+
+    #[test]
     fn voting_views_return_false_for_unknown_poll() {
         let (env, _admin, client) = setup();
         let voter = Address::generate(&env);
