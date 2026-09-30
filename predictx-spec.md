@@ -57,15 +57,15 @@ A decentralized platform where:
 
 2. **Staking Phase** (Before 3:00 PM)
    - Users stake on "Yes" or "No"
-   - Example stakes:
-     - Alice: $100 on Yes
-     - Bob: $200 on Yes
-     - Carol: $150 on Yes
-     - Dave: $250 on No
-     - Eve: $50 on No
-   - **Total Pool**: $750
-     - Yes Pool: $450 (60%)
-     - No Pool: $300 (40%)
+   - Example stakes (in token base units):
+     - Alice: 100 tokens on Yes
+     - Bob: 200 tokens on Yes
+     - Carol: 150 tokens on Yes
+     - Dave: 250 tokens on No
+     - Eve: 50 tokens on No
+   - **Total Pool**: 750 tokens
+     - Yes Pool: 450 tokens (60%)
+     - No Pool: 300 tokens (40%)
 
 3. **Match Happens**
    - Poll locks at 3:00 PM (no more stakes)
@@ -79,13 +79,13 @@ A decentralized platform where:
    - Automatically approved (>85% threshold)
 
 5. **Payout**
-   - Platform takes 5% fee: $750 × 0.05 = **$37.50**
-   - Winners split: $750 - $37.50 = **$712.50**
+   - Platform takes 5% fee: 750 × 0.05 = **37.5 tokens**
+   - Winners split: 750 - 37.5 = **712.5 tokens**
    - Distribution (proportional to stake):
-     - Alice: $100/$450 × $712.50 = **$158.33** (Profit: $58.33)
-     - Bob: $200/$450 × $712.50 = **$316.67** (Profit: $116.67)
-     - Carol: $150/$450 × $712.50 = **$237.50** (Profit: $87.50)
-   - Dave and Eve lose their stakes ($300 total to winners)
+     - Alice: 100/450 × 712.5 = **158.33 tokens** (Profit: 58.33 tokens)
+     - Bob: 200/450 × 712.5 = **316.67 tokens** (Profit: 116.67 tokens)
+     - Carol: 150/450 × 712.5 = **237.50 tokens** (Profit: 87.50 tokens)
+   - Dave and Eve lose their stakes (300 tokens total to winners)
 
 ### Mathematical Formula
 
@@ -156,7 +156,7 @@ Where:
 
 **Rewards:**
 - 0.5-1% of total pool divided among all voters
-- Example: $1,000 pool, 50 voters = ~$0.10-0.20 per voter
+- Example: 1,000 token pool, 50 voters = ~0.1-0.2 tokens per voter
 
 ---
 
@@ -219,12 +219,13 @@ Where:
 - Your potential winnings if you win
 - ROI percentage
 - Platform fee (5%)
+- All amounts displayed in token base units (i128) with proper decimals
 
 **Validations:**
 - Sufficient wallet balance
 - Poll not locked yet
-- Minimum stake amount (e.g., $10)
-- Maximum stake (e.g., $10,000 per poll)
+- Minimum stake amount (e.g., 10 tokens in base units)
+- Maximum stake (e.g., 10,000 tokens in base units per poll)
 
 ---
 
@@ -334,18 +335,18 @@ Where:
 **User Story**: As a user, I want to connect my crypto wallet securely.
 
 **Supported Wallets:**
-- MetaMask (primary)
-- WalletConnect (mobile wallets)
-- Coinbase Wallet
-- Trust Wallet
+- Freighter (primary Stellar wallet)
+- LOBSTR Wallet
+- Albedo (browser-based)
+- Other Stellar-compatible wallets via WalletConnect
 
 **Wallet UI:**
 - "Connect Wallet" button (prominent, top-right)
 - Modal with wallet options
 - Connected state shows:
-  - Truncated address (0x742d...5e9f)
-  - Balance (ETH + USD equivalent)
-  - Network indicator (Ethereum, Polygon, etc.)
+  - Truncated address (GABC...XYZ9)
+  - Balance (XLM + platform token balance)
+  - Network indicator (Stellar Mainnet, Testnet, Futurenet)
 - Dropdown menu: Profile, History, Disconnect
 
 **Security:**
@@ -353,6 +354,7 @@ Where:
 - Sign transactions only (no direct transfers without user consent)
 - Network validation (warn if wrong network)
 - Transaction preview before signing
+- All token amounts displayed in base units (i128) with proper decimal formatting
 
 ---
 
@@ -363,21 +365,22 @@ Where:
 ```
 ┌─────────────────────────────────────────────────────────┐
 │                      FRONTEND                            │
-│  (React + Tailwind + Web3.js/Ethers.js)                 │
+│  (React + Tailwind + Stellar SDK)                       │
 │  - User Interface                                        │
-│  - Wallet Connection                                     │
+│  - Wallet Connection (Freighter)                         │
 │  - Smart Contract Interaction                            │
 └────────────────┬────────────────────────────────────────┘
                  │
-                 │ Web3 RPC Calls
+                 │ Soroban RPC Calls
                  │
 ┌────────────────▼────────────────────────────────────────┐
-│                    BLOCKCHAIN LAYER                      │
-│  (Ethereum / Polygon / Base / Arbitrum)                 │
+│                STELLAR SOROBAN LAYER                     │
+│  (Stellar Blockchain - Soroban Smart Contracts)         │
 │                                                          │
 │  ┌──────────────────┐  ┌──────────────────┐            │
 │  │ PredictionMarket │  │  VotingOracle    │            │
 │  │   Contract       │◄─┤   Contract       │            │
+│  │   (Rust)         │  │   (Rust)         │            │
 │  │                  │  │                  │            │
 │  │ - Create Polls   │  │ - Community Vote │            │
 │  │ - Stake Funds    │  │ - Admin Verify   │            │
@@ -387,6 +390,7 @@ Where:
 │  ┌──────────────────┐                                   │
 │  │   Treasury       │                                   │
 │  │   Contract       │                                   │
+│  │   (Rust)         │                                   │
 │  │                  │                                   │
 │  │ - Hold Fees      │                                   │
 │  │ - Distribute     │                                   │
@@ -398,7 +402,7 @@ Where:
 ┌────────────────▼────────────────────────────────────────┐
 │                   BACKEND / INDEXER                      │
 │  (Optional - for better UX)                             │
-│  - The Graph (index blockchain events)                  │
+│  - Stellar Horizon API (index blockchain events)        │
 │  - Cache poll data                                       │
 │  - Match data API integration                            │
 │  - Push notifications                                    │
@@ -411,9 +415,9 @@ Where:
 - **Framework**: React 18+ with TypeScript
 - **Styling**: Tailwind CSS + custom gaming UI components
 - **Web3**: 
-  - ethers.js or web3.js (blockchain interaction)
-  - wagmi (React hooks for Ethereum)
-  - RainbowKit or ConnectKit (wallet connection UI)
+  - @stellar/stellar-sdk (Stellar network interaction)
+  - soroban-react (React hooks for Soroban)
+  - Freighter Wallet integration (Stellar wallet)
 - **State Management**: 
   - React Context API (global state)
   - TanStack Query (server state/caching)
@@ -423,15 +427,16 @@ Where:
 - **Forms**: React Hook Form + Zod validation
 
 **Smart Contracts:**
-- **Language**: Solidity 0.8.20+
-- **Framework**: Hardhat or Foundry
+- **Language**: Rust with soroban-sdk
+- **Framework**: Soroban SDK for Stellar blockchain
+- **Platform**: Stellar Soroban (smart contract platform)
 - **Libraries**: 
-  - OpenZeppelin Contracts (security, access control)
-  - Chainlink (time automation, potential price feeds)
-- **Testing**: Hardhat tests (JavaScript/TypeScript)
+  - soroban-sdk (core contract functionality)
+  - predictx-shared (shared types and utilities across contracts)
+- **Testing**: Rust unit and integration tests
 
 **Backend (Optional but Recommended):**
-- **Indexer**: The Graph Protocol (index blockchain events)
+- **Indexer**: Stellar Horizon API + custom event indexing
 - **API**: Node.js + Express (match data, caching)
 - **Database**: PostgreSQL (cache poll data for faster queries)
 - **Match Data**: 
@@ -440,252 +445,352 @@ Where:
 
 **Infrastructure:**
 - **Hosting**: Vercel or Netlify (frontend)
-- **RPC Provider**: Alchemy or Infura
+- **RPC Provider**: Stellar Horizon public or custom RPC nodes
 - **IPFS**: Store evidence links, poll metadata (optional)
 - **CDN**: Cloudflare (fast global access)
 
 **DevOps:**
 - **Version Control**: Git + GitHub
 - **CI/CD**: GitHub Actions
+- **Build Tools**: Cargo (Rust package manager), soroban-cli
 - **Monitoring**: 
   - Sentry (error tracking)
-  - Tenderly (smart contract monitoring)
+  - Stellar Expert (blockchain explorer and contract monitoring)
 - **Analytics**: Mixpanel or Amplitude (user behavior)
 
 ---
 
 ## 📜 Smart Contract Specifications
 
-### Contract 1: PredictionMarket.sol
+### Contract 1: PredictionMarket (Rust/Soroban)
 
-**Purpose**: Main contract for poll creation, staking, and payouts.
+**Purpose**: Main contract for poll creation, staking, and payouts on Stellar Soroban.
 
-**State Variables:**
-```solidity
-// Mappings
-mapping(uint256 => Poll) public polls;
-mapping(uint256 => mapping(address => Stake)) public stakes;
-mapping(uint256 => PoolAmounts) public poolAmounts;
+**Key Storage:**
+```rust
+// Contract data keys
+enum DataKey {
+    Admin,
+    VotingOracle,
+    TokenAddress,
+    TreasuryAddress,
+    PlatformFeeBps,
+    Match(u64),
+    Poll(u64),
+    Stake(u64, Address),
+    UserStakes(Address),
+    HasStaked(u64, Address),
+    PlatformStats,
+    // ... additional keys for emergency handling
+}
 
-// Constants
-uint256 public constant PLATFORM_FEE_PERCENTAGE = 5; // 5%
-uint256 public minimumStake = 0.01 ether;
-uint256 public maximumStake = 10 ether;
-
-// Addresses
-address public owner;
-address public votingOracle;
-address public treasury;
-
-// Counters
-uint256 public pollCounter;
+// Platform fee in basis points (500 = 5%)
+const PLATFORM_FEE_BPS: u32 = 500;
 ```
 
-**Structs:**
-```solidity
-struct Poll {
-    uint256 id;
-    uint256 matchId;
-    address creator;
-    string question;
-    uint256 lockTime;
-    PollStatus status; // Active, Locked, Resolved, Disputed
-    bool outcome; // true = Yes wins, false = No wins
-    uint256 createdAt;
-    uint256 resolvedAt;
+**Core Data Types:**
+```rust
+pub struct Poll {
+    pub poll_id: u64,
+    pub match_id: u64,
+    pub creator: Address,
+    pub question: String,
+    pub category: PollCategory,
+    pub lock_time: u64,
+    pub yes_pool: i128,      // Token amounts in i128 base units
+    pub no_pool: i128,       // Token amounts in i128 base units
+    pub yes_count: u32,
+    pub no_count: u32,
+    pub status: PollStatus,
+    pub outcome: Option<bool>,
+    pub resolution_time: u64,
+    pub created_at: u64,
 }
 
-struct Stake {
-    address user;
-    uint256 amount;
-    bool isYesSide;
-    bool claimed;
-    uint256 timestamp;
+pub struct Stake {
+    pub user: Address,
+    pub poll_id: u64,
+    pub amount: i128,        // Token amount in i128 base units
+    pub side: StakeSide,
+    pub claimed: bool,
+    pub staked_at: u64,
 }
 
-struct PoolAmounts {
-    uint256 yesPool;
-    uint256 noPool;
-}
-
-enum PollStatus {
+pub enum PollStatus {
     Active,
     Locked,
     Voting,
-    Resolved,
+    AdminReview,
     Disputed,
-    Cancelled
+    Resolved,
+    Cancelled,
+}
+
+pub enum StakeSide {
+    Yes,
+    No,
 }
 ```
 
 **Key Functions:**
 
-```solidity
-// CREATE POLL
-function createPoll(
-    uint256 _matchId,
-    string memory _question,
-    uint256 _lockTime
-) external returns (uint256 pollId)
+```rust
+// INITIALIZATION
+pub fn initialize(
+    env: Env,
+    admin: Address,
+    voting_oracle: Address,
+    token_address: Address,
+    treasury_address: Address,
+    platform_fee_bps: u32,
+) -> Result<(), PredictXError>
 
-// STAKE
-function stake(
-    uint256 _pollId,
-    bool _isYesSide
-) external payable
+// CREATE POLL
+pub fn create_poll(
+    env: Env,
+    creator: Address,
+    match_id: u64,
+    question: String,
+    category: PollCategory,
+    lock_time: u64,
+) -> Result<u64, PredictXError>
+
+// STAKE (with token transfer)
+pub fn stake(
+    env: Env,
+    staker: Address,
+    poll_id: u64,
+    amount: i128,
+    side: StakeSide,
+) -> Result<Stake, PredictXError>
 
 // RESOLVE (called by VotingOracle)
-function resolvePoll(
-    uint256 _pollId,
-    bool _outcome
-) external onlyVotingOracle
+pub fn resolve_poll(
+    env: Env,
+    caller: Address,
+    poll_id: u64,
+    outcome: bool,
+) -> Result<(), PredictXError>
 
 // CLAIM WINNINGS
-function claimWinnings(uint256 _pollId) external
+pub fn claim_winnings(
+    env: Env,
+    claimant: Address,
+    poll_id: u64,
+) -> Result<i128, PredictXError>
 
 // VIEW FUNCTIONS
-function calculateWinnings(uint256 _pollId, address _user) 
-    external view returns (uint256)
+pub fn calculate_winnings(
+    env: Env,
+    poll_id: u64,
+    user: Address,
+) -> Result<i128, PredictXError>
 
-function getPollDetails(uint256 _pollId) 
-    external view returns (Poll memory)
+pub fn get_poll(
+    env: Env,
+    poll_id: u64,
+) -> Result<Poll, PredictXError>
 
-function getUserStake(uint256 _pollId, address _user) 
-    external view returns (Stake memory)
+pub fn get_stake_info(
+    env: Env,
+    poll_id: u64,
+    user: Address,
+) -> Result<Stake, PredictXError>
 
-function getPoolAmounts(uint256 _pollId) 
-    external view returns (uint256 yesPool, uint256 noPool)
+pub fn get_pool_info(
+    env: Env,
+    poll_id: u64,
+) -> Result<PoolInfo, PredictXError>
 
-// EMERGENCY
-function emergencyWithdraw(uint256 _pollId) external
+// EMERGENCY WITHDRAWAL
+pub fn emergency_withdraw(
+    env: Env,
+    user: Address,
+    poll_id: u64,
+) -> Result<i128, PredictXError>
 ```
 
 **Events:**
-```solidity
-event PollCreated(uint256 indexed pollId, uint256 matchId, string question, uint256 lockTime);
-event StakePlaced(uint256 indexed pollId, address indexed user, uint256 amount, bool isYesSide);
-event PollResolved(uint256 indexed pollId, bool outcome);
-event WinningsClaimed(uint256 indexed pollId, address indexed user, uint256 amount);
-event PollLocked(uint256 indexed pollId);
+Events are published using Soroban's event system:
+```rust
+env.events().publish((Symbol::new(&env, "PollCreated"), poll_id), ());
+env.events().publish((Symbol::new(&env, "StakePlaced"), poll_id, user), amount);
+env.events().publish((Symbol::new(&env, "PollResolved"), poll_id), outcome);
+env.events().publish((Symbol::new(&env, "WinningsClaimed"), poll_id, user), amount);
 ```
 
 ---
 
-### Contract 2: VotingOracle.sol
+### Contract 2: VotingOracle (Rust/Soroban)
 
 **Purpose**: Manages community voting and admin verification for poll resolution.
 
-**State Variables:**
-```solidity
-mapping(uint256 => VotingSession) public votingSessions;
-mapping(uint256 => mapping(address => bool)) public hasVoted;
-mapping(uint256 => mapping(address => bool)) public hasStaked; // imported from PredictionMarket
-
-uint256 public constant VOTING_WINDOW = 2 hours;
-uint256 public constant AUTO_RESOLVE_THRESHOLD = 85; // 85%
-uint256 public constant ADMIN_REVIEW_THRESHOLD = 60; // 60%
-
-address[] public admins;
-address public predictionMarket;
-```
-
-**Structs:**
-```solidity
-struct VotingSession {
-    uint256 pollId;
-    uint256 yesVotes;
-    uint256 noVotes;
-    uint256 totalVoters;
-    uint256 votingStartTime;
-    uint256 votingEndTime;
-    VoteStatus status;
-    string evidenceHash; // IPFS hash of evidence
+**Key Storage:**
+```rust
+enum DataKey {
+    Admin,
+    AdminList,              // Vec<Address> of registered admins
+    PollStatus(u64),
+    VoteTally(u64),
+    PollOutcome(u64),
+    Voters(u64),
+    HasVoted(u64, Address),
+    VoterChoice(u64, Address),
+    RewardPool(u64),
+    VoterReward(u64, Address),
+    RewardClaimed(u64, Address),
 }
 
-enum VoteStatus {
-    NotStarted,
-    Open,
-    AdminReview,
-    Resolved,
-    Disputed
+// Constants
+const VOTING_WINDOW_SECS: u64 = 7200; // 2 hours
+const MAX_VOTERS: u32 = 64;
+```
+
+**Core Data Types:**
+```rust
+pub struct VoteTally {
+    pub poll_id: u64,
+    pub yes_votes: u32,
+    pub no_votes: u32,
+    pub unclear_votes: u32,
+    pub total_voters: u32,
+    pub voting_end_time: u64,
+    pub reward_pool: i128,    // Voter incentives in i128 base units
+}
+
+pub enum VoteChoice {
+    Yes,
+    No,
+    Unclear,
 }
 ```
 
 **Key Functions:**
 
-```solidity
-// START VOTING (called after match ends)
-function initiateVoting(uint256 _pollId, string memory _evidenceHash) 
-    external onlyAdmin
+```rust
+// INITIALIZATION
+pub fn initialize(
+    env: Env,
+    admin: Address,
+) -> Result<(), PredictXError>
 
-// CAST VOTE
-function castVote(uint256 _pollId, bool _outcome) external
+// MULTI-ADMIN MANAGEMENT
+pub fn add_admin(
+    env: Env,
+    caller: Address,
+    new_admin: Address,
+) -> Result<(), PredictXError>
 
-// AUTO RESOLVE (if consensus reached)
-function checkAndAutoResolve(uint256 _pollId) internal
+pub fn remove_admin(
+    env: Env,
+    caller: Address,
+    admin: Address,
+) -> Result<(), PredictXError>
 
-// ADMIN VERIFY (for 60-85% consensus)
-function adminVerify(uint256 _pollId, bool _outcome, string memory _reasoning) 
-    external onlyAdmin
+// POLL STATUS MANAGEMENT
+pub fn set_poll_status(
+    env: Env,
+    poll_id: u64,
+    status: PollStatus,
+) -> Result<(), PredictXError>
 
-// DISPUTE
-function initiateDispute(uint256 _pollId, string memory _reason) 
-    external payable
+pub fn get_poll_status(
+    env: Env,
+    poll_id: u64,
+) -> PollStatus
 
-// RESOLVE DISPUTE (multi-sig required)
-function resolveDispute(uint256 _pollId, bool _outcome) 
-    external onlyMultiSigAdmins
+// VOTING
+pub fn cast_vote(
+    env: Env,
+    voter: Address,
+    poll_id: u64,
+    choice: VoteChoice,
+) -> Result<VoteTally, PredictXError>
 
-// VIEW FUNCTIONS
-function getVotingStats(uint256 _pollId) 
-    external view returns (uint256 yesPercent, uint256 noPercent)
+pub fn auto_resolve(
+    env: Env,
+    poll_id: u64,
+) -> Result<VoteChoice, PredictXError>
 
-function canVote(uint256 _pollId, address _user) 
-    external view returns (bool)
-```
+pub fn can_vote(
+    env: Env,
+    poll_id: u64,
+    voter: Address,
+) -> bool
 
-**Events:**
-```solidity
-event VotingStarted(uint256 indexed pollId, uint256 endTime);
-event VoteCast(uint256 indexed pollId, address indexed voter, bool outcome);
-event AutoResolved(uint256 indexed pollId, bool outcome, uint256 consensus);
-event AdminVerified(uint256 indexed pollId, bool outcome, address admin);
-event DisputeInitiated(uint256 indexed pollId, address disputer);
-event DisputeResolved(uint256 indexed pollId, bool outcome);
+// VOTER REWARDS
+pub fn set_reward_pool(
+    env: Env,
+    caller: Address,
+    poll_id: u64,
+    amount: i128,
+) -> Result<(), PredictXError>
+
+pub fn claim_reward(
+    env: Env,
+    voter: Address,
+    poll_id: u64,
+) -> Result<i128, PredictXError>
+
+pub fn get_reward_pool(
+    env: Env,
+    poll_id: u64,
+) -> i128
 ```
 
 ---
 
-### Contract 3: Treasury.sol
+### Contract 3: Treasury (Rust/Soroban)
 
 **Purpose**: Holds platform fees and manages fund distribution.
 
-**State Variables:**
-```solidity
-address public owner;
-address public predictionMarket;
-uint256 public totalFeesCollected;
-mapping(address => uint256) public voterRewards;
+**Key Storage:**
+```rust
+enum DataKey {
+    Admin,
+    TokenAddress,
+    TotalFeesCollected,
+    // Additional keys for fee tracking and distribution
+}
 ```
 
 **Key Functions:**
 
-```solidity
-// RECEIVE FEES
-function depositFees() external payable onlyPredictionMarket
+```rust
+// INITIALIZATION
+pub fn initialize(
+    env: Env,
+    admin: Address,
+    token_address: Address,
+) -> Result<(), PredictXError>
+
+// RECEIVE FEES (via token transfer)
+pub fn deposit_fees(
+    env: Env,
+    from: Address,
+    amount: i128,
+) -> Result<(), PredictXError>
 
 // DISTRIBUTE VOTER REWARDS
-function distributeVoterRewards(
-    uint256 _pollId,
-    address[] memory _voters,
-    uint256 _totalReward
-) external onlyVotingOracle
+pub fn distribute_voter_rewards(
+    env: Env,
+    poll_id: u64,
+    voters: Vec<Address>,
+    total_reward: i128,
+) -> Result<(), PredictXError>
 
-// WITHDRAW FEES (owner)
-function withdrawFees(uint256 _amount) external onlyOwner
+// WITHDRAW FEES (admin only)
+pub fn withdraw_fees(
+    env: Env,
+    admin: Address,
+    amount: i128,
+) -> Result<(), PredictXError>
 
 // CLAIM VOTER REWARD
-function claimVoterReward() external
+pub fn claim_voter_reward(
+    env: Env,
+    voter: Address,
+) -> Result<i128, PredictXError>
 ```
 
 ---
@@ -851,16 +956,16 @@ font-family: 'Roboto Mono', monospace;
 │  (toggle buttons)                        │
 ├─────────────────────────────────────────┤
 │  Stake Amount:                           │
-│  [___________] ETH                       │
-│  Balance: 2.5 ETH                        │
-│  [$50] [$100] [$500] [MAX]               │
+│  [___________] Tokens                    │
+│  Balance: 2,500 Tokens                   │
+│  [50] [100] [500] [MAX]                  │
 ├─────────────────────────────────────────┤
 │  Current Pool:                           │
 │  ███████████░░░░░ 65% Yes, 35% No        │
 │                                          │
 │  Your Potential Winnings:                │
-│  0.15 ETH → 0.23 ETH                     │
-│  Profit: +0.08 ETH (+53%)                │
+│  150 Tokens → 230 Tokens                 │
+│  Profit: +80 Tokens (+53%)               │
 │                                          │
 │  Platform Fee: 5% on winnings            │
 ├─────────────────────────────────────────┤
@@ -930,7 +1035,7 @@ font-family: 'Roboto Mono', monospace;
 │  CAST YOUR VOTE                          │
 │  [ YES ]  [ NO ]  [ UNCLEAR ]            │
 │                                          │
-│  Your Reward: 0.002 ETH                  │
+│  Your Reward: 2 tokens                   │
 ├─────────────────────────────────────────┤
 │         [SUBMIT VOTE]                    │
 └─────────────────────────────────────────┘
@@ -956,8 +1061,8 @@ font-family: 'Roboto Mono', monospace;
 12. MetaMask popup → Confirms connection
 13. Returns to staking modal (now connected)
 14. Chooses "Yes" side
-15. Enters 0.1 ETH stake
-16. Sees potential winnings: 0.15 ETH
+15. Enters 100 token stake
+16. Sees potential winnings: 150 tokens
 17. Clicks "Confirm Stake"
 18. MetaMask popup → Confirms transaction
 19. Transaction processing (spinner)
@@ -982,7 +1087,7 @@ font-family: 'Roboto Mono', monospace;
 11. User votes "Yes"
 12. Clicks "Submit Vote"
 13. Transaction confirms
-14. Success message: "Vote recorded! Reward: 0.002 ETH"
+14. Success message: "Vote recorded! Reward: 2 tokens"
 15. Returns to dashboard
 16. Reward pending in balance
 
@@ -1012,7 +1117,7 @@ font-family: 'Roboto Mono', monospace;
 2. User receives notification: "You won!"
 3. Navigates to "My Dashboard" → Completed
 4. Sees winning prediction with green badge
-5. Shows: Stake: 0.1 ETH → Winnings: 0.15 ETH (Profit: +0.05 ETH)
+5. Shows: Stake: 100 tokens → Winnings: 150 tokens (Profit: +50 tokens)
 6. "Claim" button glowing
 7. Clicks "Claim"
 8. MetaMask confirms withdrawal transaction
@@ -1107,20 +1212,20 @@ font-family: 'Roboto Mono', monospace;
 
 **Deliverables:**
 1. **Smart Contracts (v1)**
-   - PredictionMarket.sol (basic functionality)
+   - PredictionMarket contract (basic functionality)
    - Admin-only resolution (no voting yet)
-   - Deploy to Sepolia/Goerli testnet
+   - Deploy to Stellar Testnet or Futurenet
 
 2. **Frontend (Core)**
    - Home page
    - Match detail page
    - Staking interface
    - My Dashboard (Active + Completed tabs)
-   - Wallet connection (MetaMask only)
+   - Wallet connection (Freighter wallet)
 
 3. **Backend**
    - Match data API integration
-   - Basic indexing of contract events
+   - Basic indexing of contract events via Stellar Horizon
 
 4. **Testing**
    - Unit tests for contracts (90%+ coverage)
@@ -1141,7 +1246,7 @@ font-family: 'Roboto Mono', monospace;
 
 **Deliverables:**
 1. **Smart Contracts (v2)**
-   - VotingOracle.sol implementation
+   - VotingOracle contract implementation
    - Community voting mechanics
    - Dispute resolution
    - Treasury contract
@@ -1152,6 +1257,7 @@ font-family: 'Roboto Mono', monospace;
    - Voting Opportunities tab
    - Evidence display
    - Improved animations/UI polish
+   - Support for additional Stellar wallets (LOBSTR, Albedo)
 
 3. **Backend**
    - Video clip embedding
@@ -1171,16 +1277,16 @@ font-family: 'Roboto Mono', monospace;
 
 ### Phase 3: Public Beta (2 months)
 
-**Goal**: Launch on mainnet with real money
+**Goal**: Launch on Stellar Mainnet with real tokens
 
 **Deliverables:**
 1. **Security**
-   - Professional smart contract audit
+   - Professional smart contract audit (Rust/Soroban focused)
    - Fix all findings
    - Bug bounty program launch
 
 2. **Frontend**
-   - Multi-wallet support (WalletConnect, Coinbase)
+   - Multi-wallet support (Freighter, LOBSTR, Albedo, WalletConnect)
    - Mobile app (React Native or PWA)
    - Advanced analytics dashboard
    - Social features (leaderboards, profiles)
@@ -1204,7 +1310,7 @@ font-family: 'Roboto Mono', monospace;
 
 **Success Metrics:**
 - 1,000+ registered wallets
-- $50K+ total volume
+- 50K+ tokens total volume
 - <1% error rate
 - 4.0+ star user rating
 
@@ -1237,9 +1343,10 @@ font-family: 'Roboto Mono', monospace;
    - Community votes on features
    - Fee distribution to token holders
 
-5. **Layer 2 Migration**
-   - Move to Polygon/Arbitrum for lower fees
-   - Cross-chain support
+5. **Layer 2 / Scalability**
+   - Optimize for Stellar's built-in scalability
+   - Explore Soroban performance optimizations
+   - Cross-chain bridges if needed
 
 6. **Mobile Apps**
    - Native iOS/Android apps
@@ -1295,18 +1402,18 @@ font-family: 'Roboto Mono', monospace;
 
 **Example Calculation:**
 ```
-Total Pool: $1,000
-- Yes Pool: $700 (70%)
-- No Pool: $300 (30%)
+Total Pool: 1,000 tokens
+- Yes Pool: 700 tokens (70%)
+- No Pool: 300 tokens (30%)
 
 Outcome: Yes wins
 
-Platform Fee: $1,000 × 5% = $50
-Winners Split: $1,000 - $50 = $950
+Platform Fee: 1,000 × 5% = 50 tokens
+Winners Split: 1,000 - 50 = 950 tokens
 
-Alice staked $140 on Yes (20% of Yes Pool):
-Alice's Payout: ($140 / $700) × $950 = $190
-Alice's Profit: $190 - $140 = $50
+Alice staked 140 tokens on Yes (20% of Yes Pool):
+Alice's Payout: (140 / 700) × 950 = 190 tokens
+Alice's Profit: 190 - 140 = 50 tokens
 ```
 
 ---
@@ -1316,13 +1423,13 @@ Alice's Profit: $190 - $140 = $50
 ### Immediate Actions (Week 1):
 1. Set up development environment
    - Initialize Git repository
-   - Install Hardhat/Foundry
-   - Set up React project with Tailwind
+   - Install Rust and soroban-cli
+   - Set up React project with Tailwind and Stellar SDK
 
 2. Define project structure
    - Frontend folder structure
-   - Smart contract file organization
-   - Testing framework setup
+   - Smart contract workspace with Cargo
+   - Testing framework setup (Rust tests)
 
 3. Create mock data
    - Sample matches
@@ -1331,20 +1438,20 @@ Alice's Profit: $190 - $140 = $50
 
 4. Design database schema (if using backend)
    - Tables for cached data
-   - Indexer structure
+   - Indexer structure for Horizon API events
 
 ### Sprint 1 (Weeks 2-4):
-- **Smart Contracts**: Write PredictionMarket.sol (basic version)
-- **Frontend**: Build home page + wallet connection
-- **Testing**: Unit tests for contract functions
+- **Smart Contracts**: Write PredictionMarket contract in Rust with soroban-sdk (basic version)
+- **Frontend**: Build home page + wallet connection (Freighter integration)
+- **Testing**: Unit tests for contract functions using Rust test framework
 
 ### Sprint 2 (Weeks 5-7):
-- **Smart Contracts**: Add staking and payout logic
+- **Smart Contracts**: Add staking and payout logic with token transfers
 - **Frontend**: Build match detail page + staking modal
-- **Integration**: Connect frontend to testnet contracts
+- **Integration**: Connect frontend to Stellar testnet contracts using Soroban RPC
 
 ### Sprint 3 (Weeks 8-10):
-- **Smart Contracts**: Implement VotingOracle.sol
+- **Smart Contracts**: Implement VotingOracle contract
 - **Frontend**: Build My Dashboard + voting interface
 - **Testing**: Integration tests, user testing
 
@@ -1354,11 +1461,11 @@ Alice's Profit: $190 - $140 = $50
 
 Before development begins, clarify:
 
-1. **Target Blockchain**: Ethereum mainnet? Layer 2 (Polygon, Arbitrum)? Multiple chains?
-2. **Budget**: Development costs, audit costs, infrastructure costs?
+1. **Target Blockchain**: Stellar Soroban (testnet and mainnet deployment)
+2. **Budget**: Development costs, audit costs (Rust/Soroban specific), infrastructure costs?
 3. **Timeline**: Hard launch date? Phased rollout?
 4. **Legal**: Do we have legal counsel? Which jurisdictions are we targeting?
-5. **Team**: Who's on the team? Developers, designers, marketers?
+5. **Team**: Who's on the team? Rust developers, designers, marketers?
 6. **Competitive Analysis**: Who are our main competitors? What's our differentiation?
 7. **Revenue Model**: Just platform fees? Future token launch? Other monetization?
 
@@ -1366,19 +1473,20 @@ Before development begins, clarify:
 
 ## 📚 Additional Resources
 
-**Learn Solidity:**
-- CryptoZombies: https://cryptozombies.io
-- Solidity by Example: https://solidity-by-example.org
-- OpenZeppelin Docs: https://docs.openzeppelin.com
+**Learn Rust & Soroban:**
+- Soroban Documentation: https://soroban.stellar.org/docs
+- Soroban by Example: https://soroban.stellar.org/docs/learn/examples
+- Rust Book: https://doc.rust-lang.org/book/
+- Soroban Quest (Interactive Tutorials): https://quest.stellar.org/soroban
 
-**Web3 Frontend:**
-- wagmi Documentation: https://wagmi.sh
-- RainbowKit: https://www.rainbowkit.com
-- ethers.js: https://docs.ethers.org
+**Stellar & Web3 Frontend:**
+- Stellar SDK for JavaScript: https://stellar.github.io/js-stellar-sdk/
+- Freighter Wallet Docs: https://docs.freighter.app/
+- soroban-react (React hooks): https://github.com/esteblock/soroban-react
 
 **Security:**
-- Smart Contract Security Best Practices: https://consensys.github.io/smart-contract-best-practices
-- Trail of Bits Security Guides: https://github.com/crytic/building-secure-contracts
+- Soroban Smart Contract Security Best Practices: https://soroban.stellar.org/docs/learn/security
+- Rust Security Guidelines: https://anssi-fr.github.io/rust-guide/
 
 **Inspiration:**
 - Polymarket (prediction market): https://polymarket.com
