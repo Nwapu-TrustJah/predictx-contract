@@ -13,7 +13,10 @@ enum DataKey {
     Admin,
     Token,
     Market,
+    Oracle,
+    TokenAddress,
     Balance(Address),
+    VoterRewardsFunded(u64),
 }
 
 fn get_admin(env: &Env) -> Result<Address, PredictXError> {
@@ -34,6 +37,14 @@ fn get_market(env: &Env) -> Result<Address, PredictXError> {
     env.storage()
         .instance()
         .get(&DataKey::Market)
+        .ok_or(PredictXError::NotInitialized)
+}
+
+#[allow(dead_code)]
+fn get_oracle(env: &Env) -> Result<Address, PredictXError> {
+    env.storage()
+        .instance()
+        .get(&DataKey::Oracle)
         .ok_or(PredictXError::NotInitialized)
 }
 

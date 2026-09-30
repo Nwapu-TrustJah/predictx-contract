@@ -705,6 +705,8 @@ mod test {
         let client: VotingOracleClient<'static> = unsafe { core::mem::transmute(client) };
         (env, admin, client)
     }
+    use super::*; 
+    use soroban_sdk::testutils::{Address as _, Ledger};
 
     #[test]
     fn set_and_get_status() {

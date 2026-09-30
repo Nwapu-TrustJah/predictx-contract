@@ -775,7 +775,7 @@ mod test {
     #[test]
     fn emergency_withdraw_on_cancelled_poll_refunds_stake() {
         let (env, admin, oracle_id, contract_id, client) = setup_emergency_env();
-        let oracle_client = voting_oracle::Client::new(&env, &oracle_id);
+        let _oracle_client = voting_oracle::Client::new(&env, &oracle_id);
         let token_addr: Address = env.as_contract(&contract_id, || {
             env.storage().instance().get(&DataKey::TokenAddress).unwrap()
         });
