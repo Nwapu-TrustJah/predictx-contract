@@ -55,10 +55,26 @@ pub enum DataKey {
     UserStats(Address),
     /// `(poll_id, voter)` → `i128` unclaimed voter reward. (Persistent)
     VoterReward(u64, Address),
+    /// `poll_id` → `VotingOracle`-specific poll metadata. (Persistent)
+    OraclePoll(u64),
+    /// `poll_id` → oracle-side poll status snapshot. (Persistent)
+    PollStatus(u64),
+    /// `poll_id` → outcome the oracle auto-resolved to. (Persistent)
+    PollOutcome(u64),
+    /// `poll_id` → roster of voters who cast a vote. (Persistent)
+    Voters(u64),
+    /// `(poll_id, voter)` → `VoteChoice` the voter recorded. (Persistent)
+    VoterChoice(u64, Address),
+    /// `poll_id` → unclaimed voter reward reserve. (Persistent)
+    RewardPool(u64),
+    /// `(poll_id, voter)` → `bool` — has this voter claimed their reward? (Persistent)
+    RewardClaimed(u64, Address),
 
     // ── Temporary storage ─────────────────────────────────────────────────────
     /// `poll_id` → `VoteTally`. (Temporary — only needed during voting window)
     VoteTally(u64),
     /// `(poll_id, voter)` → `bool` — has this voter cast a vote? (Temporary)
     HasVoted(u64, Address),
+    /// `poll_id` → `VotingOracle`-specific tally snapshot. (Temporary)
+    OracleTally(u64),
 }

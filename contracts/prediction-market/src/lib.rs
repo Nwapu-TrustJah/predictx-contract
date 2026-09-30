@@ -15,15 +15,98 @@ mod voting_oracle {
     soroban_sdk::contractimport!(file = "wasm/voting_oracle.wasm");
 }
 
+/// Central poll-status state machine.
+///
+/// Legal transition graph:
+///
+/// ```text
+/// Active ──→ Locked ──→ Voting ──→ AdminReview
+///   │                        │    └──→ Disputed ──→ Resolved
+///   │                        └───────────────→ Resolved
+///   └──────→ Cancelled        Locked ────────→ Cancelled
+/// ```
+///
+/// - `Active` → `Locked` : staking window closed (lock time reached).
+/// - `Locked` → `Voting` : match finished; community voting opens.
+/// - `Voting` → `AdminReview` : consensus between the review thresholds.
+/// - `Voting` → `Disputed` : result challenged during the dispute window.
+/// - `AdminReview` → `Resolved` : admins finalise the outcome.
+/// - `Disputed` → `Resolved` : dispute settled.
+/// - `Voting` → `Resolved` : consensus reached the auto-resolve threshold.
+/// - `Active` | `Locked` → `Cancelled` : emergency cancellation (refunds).
+///
+/// `Resolved` and `Cancelled` are terminal — no outgoing transitions.
+/// Every other status change is rejected with `InvalidStateTransition`.
+pub(crate) fn transition_status(
+    env: &Env,
+    poll: &Poll,
+    to: PollStatus,
+) -> Result<(), PredictXError> {
+    use PollStatus::{Active, AdminReview, Cancelled, Disputed, Locked, Resolved, Voting};
+
+    let legal = match poll.status {
+        Active => matches!(to, Locked | Cancelled),
+        Locked => matches!(to, Voting | Cancelled),
+        Voting => matches!(to, AdminReview | Disputed | Resolved),
+        AdminReview => matches!(to, Resolved),
+        Disputed => matches!(to, Resolved),
+        // Terminal states accept no further transitions.
+        Resolved | Cancelled => false,
+    };
+
+    if !legal {
+        return Err(PredictXError::InvalidStateTransition);
+    }
+
+    env.events().publish(
+        (Symbol::new(env, "PollStatusChanged"), poll.poll_id),
+        (poll.status, to),
+    );
+    Ok(())
+}
+
+/// Persist a poll after a legal status change.
+///
+/// [`transition_status`] is the single authority on which edges are legal, and
+/// it publishes `PollStatusChanged`; this wrapper adds the storage write, so
+/// every transition announces itself exactly once and is durably recorded.  A
+/// rejected transition publishes nothing, because the legality check runs
+/// before any write.
+pub(crate) fn transition_poll_status(
+    env: &Env,
+    poll: &mut Poll,
+    to: PollStatus,
+) -> Result<(), PredictXError> {
+    transition_status(env, poll, to)?;
+    poll.status = to;
+    env.storage()
+        .persistent()
+        .set(&DataKey::Poll(poll.poll_id), poll);
+    Ok(())
+}
+
+/// Close a poll to further stakes and announce the closure.
+///
+/// Shared by the explicit `lock_poll` entry point and by the lazy
+/// self-correction in `get_poll`, so a poll announces `PollLocked` and
+/// `PollStatusChanged` exactly once no matter which path locks it first.
+/// `poll` must already be `Active`.
+fn lock_and_announce(env: &Env, poll: &mut Poll) -> Result<(), PredictXError> {
+    transition_poll_status(env, poll, PollStatus::Locked)?;
+    env.events()
+        .publish((Symbol::new(env, "PollLocked"), poll.poll_id), ());
+    Ok(())
+}
+
 fn map_oracle_poll_status(status: voting_oracle::PollStatus) -> PollStatus {
     match status {
-        voting_oracle::PollStatus::Active      => PollStatus::Active,
-        voting_oracle::PollStatus::Locked      => PollStatus::Locked,
-        voting_oracle::PollStatus::Voting      => PollStatus::Voting,
+        voting_oracle::PollStatus::Active => PollStatus::Active,
+        voting_oracle::PollStatus::Locked => PollStatus::Locked,
+        voting_oracle::PollStatus::Voting => PollStatus::Voting,
         voting_oracle::PollStatus::AdminReview => PollStatus::AdminReview,
-        voting_oracle::PollStatus::Disputed    => PollStatus::Disputed,
-        voting_oracle::PollStatus::Resolved    => PollStatus::Resolved,
-        voting_oracle::PollStatus::Cancelled   => PollStatus::Cancelled,
+        voting_oracle::PollStatus::Disputed => PollStatus::Disputed,
+        voting_oracle::PollStatus::Resolved => PollStatus::Resolved,
+        voting_oracle::PollStatus::Cancelled => PollStatus::Cancelled,
     }
 }
 
@@ -35,6 +118,7 @@ pub struct PredictionMarket;
 pub enum DataKey {
     // ── oracle / admin keys ───────────────────────────────────────────────────
     Admin,
+    PendingAdmin,
     VotingOracle,
     Paused,
     TokenAddress,
@@ -42,6 +126,8 @@ pub enum DataKey {
     PlatformFeeBps,
     Stake(u64, Address),
     EmergencyClaimed(u64, Address),
+    /// Set once the platform fee for a poll has been sent to the treasury.
+    FeePaid(u64),
     PlatformStats,
     // ── match management keys ─────────────────────────────────────────────────
     Initialized,
@@ -66,35 +152,24 @@ pub struct PoolInfo {
 }
 
 fn get_admin(env: &Env) -> Result<Address, PredictXError> {
-    env.storage().instance().get(&DataKey::Admin)
+    env.storage()
+        .instance()
+        .get(&DataKey::Admin)
         .ok_or(PredictXError::NotInitialized)
 }
 
 fn get_oracle(env: &Env) -> Result<Address, PredictXError> {
-    env.storage().instance().get(&DataKey::VotingOracle)
+    env.storage()
+        .instance()
+        .get(&DataKey::VotingOracle)
         .ok_or(PredictXError::NotInitialized)
 }
 
-/// Persist a poll after a status change and announce it.
-///
-/// Emits `PollStatusChanged(poll_id, from, to)` with `poll_id` as the second
-/// topic so an indexer can subscribe to one poll's lifecycle without scanning
-/// the whole ledger.  Callers must have validated the transition *before*
-/// calling this, so a rejected transition publishes nothing.
-pub(crate) fn transition_poll_status(env: &Env, poll: &mut Poll, to: PollStatus) {
-    let from = poll.status;
-    poll.status = to;
-    env.storage()
-        .persistent()
-        .set(&DataKey::Poll(poll.poll_id), poll);
-    env.events().publish(
-        (Symbol::new(env, "PollStatusChanged"), poll.poll_id),
-        (from, to),
-    );
-}
-
 fn is_paused(env: &Env) -> bool {
-    env.storage().instance().get(&DataKey::Paused).unwrap_or(false)
+    env.storage()
+        .instance()
+        .get(&DataKey::Paused)
+        .unwrap_or(false)
 }
 
 pub(crate) fn ensure_not_paused(env: &Env) -> Result<(), PredictXError> {
@@ -105,7 +180,9 @@ pub(crate) fn ensure_not_paused(env: &Env) -> Result<(), PredictXError> {
 }
 
 pub(crate) fn get_platform_stats(env: &Env) -> PlatformStats {
-    env.storage().instance().get(&DataKey::PlatformStats)
+    env.storage()
+        .instance()
+        .get(&DataKey::PlatformStats)
         .unwrap_or(PlatformStats {
             total_value_locked: 0,
             total_polls_created: 0,
@@ -120,18 +197,28 @@ pub(crate) fn set_platform_stats(env: &Env, stats: &PlatformStats) {
 }
 
 fn load_stake(env: &Env, poll_id: u64, user: &Address) -> Option<Stake> {
-    env.storage().persistent().get(&DataKey::Stake(poll_id, user.clone()))
+    env.storage()
+        .persistent()
+        .get(&DataKey::Stake(poll_id, user.clone()))
 }
 
-fn has_emergency_claimed(env: &Env, poll_id: u64, user: &Address) -> bool {
-    env.storage().persistent()
+pub(crate) fn has_emergency_claimed(env: &Env, poll_id: u64, user: &Address) -> bool {
+    env.storage()
+        .persistent()
         .get(&DataKey::EmergencyClaimed(poll_id, user.clone()))
         .unwrap_or(false)
 }
 
 fn set_emergency_claimed(env: &Env, poll_id: u64, user: &Address) {
-    env.storage().persistent()
+    env.storage()
+        .persistent()
         .set(&DataKey::EmergencyClaimed(poll_id, user.clone()), &true);
+}
+
+/// Extend the TTL of instance storage so the contract's admin, token and
+/// configuration entries are not archived during periods of inactivity.
+pub(crate) fn extend_instance_ttl(env: &Env) {
+    env.storage().instance().extend_ttl(100, 1000);
 }
 
 const EMERGENCY_TIMEOUT_SECS: u64 = 7 * 24 * 60 * 60;
@@ -146,51 +233,129 @@ impl PredictionMarket {
         treasury_address: Address,
         platform_fee_bps: u32,
     ) -> Result<(), PredictXError> {
+        extend_instance_ttl(&env);
         if env.storage().instance().has(&DataKey::Admin) {
             return Err(PredictXError::AlreadyInitialized);
         }
         admin.require_auth();
         env.storage().instance().set(&DataKey::Admin, &admin);
-        env.storage().instance().set(&DataKey::VotingOracle, &voting_oracle);
-        env.storage().instance().set(&DataKey::TokenAddress, &token_address);
-        env.storage().instance().set(&DataKey::TreasuryAddress, &treasury_address);
-        env.storage().instance().set(&DataKey::PlatformFeeBps, &platform_fee_bps);
+        env.storage()
+            .instance()
+            .set(&DataKey::VotingOracle, &voting_oracle);
+        env.storage()
+            .instance()
+            .set(&DataKey::TokenAddress, &token_address);
+        env.storage()
+            .instance()
+            .set(&DataKey::TreasuryAddress, &treasury_address);
+        env.storage()
+            .instance()
+            .set(&DataKey::PlatformFeeBps, &platform_fee_bps);
         env.storage().instance().set(&DataKey::NextMatchId, &1u64);
         env.storage().instance().set(&DataKey::NextPollId, &1u64);
         env.storage().instance().set(&DataKey::Initialized, &true);
         Ok(())
     }
 
-    pub fn admin(env: Env) -> Result<Address, PredictXError> { get_admin(&env) }
-    pub fn oracle(env: Env) -> Result<Address, PredictXError> { get_oracle(&env) }
+    /// Propose a new admin. The proposal does not change the active admin
+    /// until the candidate calls `accept_admin`. Only the current admin may
+    /// propose, and a new proposal overwrites any pending one.
+    pub fn propose_admin(
+        env: Env,
+        current: Address,
+        candidate: Address,
+    ) -> Result<(), PredictXError> {
+        let stored_admin = get_admin(&env)?;
+        if current != stored_admin {
+            return Err(PredictXError::Unauthorized);
+        }
+        current.require_auth();
+        env.storage()
+            .instance()
+            .set(&DataKey::PendingAdmin, &candidate);
+        env.events()
+            .publish((Symbol::new(&env, "AdminProposed"),), candidate);
+        Ok(())
+    }
+
+    /// Cancel a pending admin proposal. Only the current admin may cancel.
+    pub fn cancel_admin_proposal(env: Env, current: Address) -> Result<(), PredictXError> {
+        let stored_admin = get_admin(&env)?;
+        if current != stored_admin {
+            return Err(PredictXError::Unauthorized);
+        }
+        current.require_auth();
+        env.storage().instance().remove(&DataKey::PendingAdmin);
+        Ok(())
+    }
+
+    /// Accept a pending admin proposal. Only the proposed candidate may call
+    /// this, and it completes the handover: the candidate becomes the active
+    /// admin and the previous admin loses access.
+    pub fn accept_admin(env: Env, candidate: Address) -> Result<(), PredictXError> {
+        let pending: Address = env
+            .storage()
+            .instance()
+            .get(&DataKey::PendingAdmin)
+            .ok_or(PredictXError::Unauthorized)?;
+        if candidate != pending {
+            return Err(PredictXError::Unauthorized);
+        }
+        candidate.require_auth();
+        env.storage().instance().set(&DataKey::Admin, &candidate);
+        env.storage().instance().remove(&DataKey::PendingAdmin);
+        env.events()
+            .publish((Symbol::new(&env, "AdminTransferred"),), candidate);
+        Ok(())
+    }
+
+    pub fn admin(env: Env) -> Result<Address, PredictXError> {
+        get_admin(&env)
+    }
+    pub fn oracle(env: Env) -> Result<Address, PredictXError> {
+        get_oracle(&env)
+    }
 
     pub fn set_oracle(env: Env, voting_oracle: Address) -> Result<(), PredictXError> {
+        extend_instance_ttl(&env);
         ensure_not_paused(&env)?;
         let admin = get_admin(&env)?;
         admin.require_auth();
-        env.storage().instance().set(&DataKey::VotingOracle, &voting_oracle);
+        env.storage()
+            .instance()
+            .set(&DataKey::VotingOracle, &voting_oracle);
         Ok(())
     }
 
     pub fn pause(env: Env, admin: Address) -> Result<(), PredictXError> {
+        extend_instance_ttl(&env);
         let stored_admin = get_admin(&env)?;
-        if admin != stored_admin { return Err(PredictXError::Unauthorized); }
+        if admin != stored_admin {
+            return Err(PredictXError::Unauthorized);
+        }
         admin.require_auth();
         env.storage().instance().set(&DataKey::Paused, &true);
-        env.events().publish((Symbol::new(&env, "ContractPaused"),), true);
+        env.events()
+            .publish((Symbol::new(&env, "ContractPaused"),), true);
         Ok(())
     }
 
     pub fn unpause(env: Env, admin: Address) -> Result<(), PredictXError> {
+        extend_instance_ttl(&env);
         let stored_admin = get_admin(&env)?;
-        if admin != stored_admin { return Err(PredictXError::Unauthorized); }
+        if admin != stored_admin {
+            return Err(PredictXError::Unauthorized);
+        }
         admin.require_auth();
         env.storage().instance().set(&DataKey::Paused, &false);
-        env.events().publish((Symbol::new(&env, "ContractUnpaused"),), true);
+        env.events()
+            .publish((Symbol::new(&env, "ContractUnpaused"),), true);
         Ok(())
     }
 
-    pub fn is_paused(env: Env) -> bool { is_paused(&env) }
+    pub fn is_paused(env: Env) -> bool {
+        is_paused(&env)
+    }
 
     pub fn oracle_poll_status(env: Env, poll_id: u64) -> Result<PollStatus, PredictXError> {
         let oracle_id = get_oracle(&env)?;
@@ -203,11 +368,16 @@ impl PredictionMarket {
     /// The local poll record is the source of truth for status, so the poll
     /// must exist here.  A poll that has already reached a terminal state
     /// cannot be cancelled: `PollAlreadyResolved` for a resolved poll,
-    /// `InvalidStateTransition` for one that is already cancelled.
+    /// `InvalidStateTransition` for one that is already cancelled, and
+    /// `InvalidStateTransition` for any status the state machine does not allow
+    /// cancelling from.
     pub fn cancel_poll(env: Env, admin: Address, poll_id: u64) -> Result<(), PredictXError> {
+        extend_instance_ttl(&env);
         ensure_not_paused(&env)?;
         let stored_admin = get_admin(&env)?;
-        if admin != stored_admin { return Err(PredictXError::Unauthorized); }
+        if admin != stored_admin {
+            return Err(PredictXError::Unauthorized);
+        }
         admin.require_auth();
 
         let mut poll: Poll = env
@@ -218,29 +388,34 @@ impl PredictionMarket {
         if poll.status == PollStatus::Resolved {
             return Err(PredictXError::PollAlreadyResolved);
         }
-        if poll.status == PollStatus::Cancelled {
-            return Err(PredictXError::InvalidStateTransition);
-        }
 
         let oracle_id = get_oracle(&env)?;
         let client = voting_oracle::Client::new(&env, &oracle_id);
-        client.set_poll_status(&poll_id, &voting_oracle::PollStatus::Cancelled);
+        client.set_poll_status(
+            &env.current_contract_address(),
+            &poll_id,
+            &voting_oracle::PollStatus::Cancelled,
+        );
 
-        transition_poll_status(&env, &mut poll, PollStatus::Cancelled);
-        env.events().publish((Symbol::new(&env, "PollCancelled"), poll_id), ());
+        transition_poll_status(&env, &mut poll, PollStatus::Cancelled)?;
+        env.events()
+            .publish((Symbol::new(&env, "PollCancelled"), poll_id), ());
         Ok(())
     }
 
     /// Lock a poll at its lock time, closing it to further stakes.
     ///
     /// Callable by the registered admin or the registered voting oracle, so a
-    /// keeper can flip the status the moment `lock_time` passes.  Staking
-    /// already stops at `lock_time` regardless of status — this makes the
-    /// transition observable to indexers and keeps the stored status honest.
+    /// keeper can make the transition explicit the moment `lock_time` passes.
+    /// Staking already stops at `lock_time` regardless of status, and a read of
+    /// a past-lock poll self-corrects to `Locked` (issue #125); this entry
+    /// point exists so the lock can be persisted — and announced — without
+    /// waiting for a reader.
     ///
     /// Rejects (publishing no event) when the poll does not exist, is not
     /// `Active`, or is locked before its `lock_time`.
     pub fn lock_poll(env: Env, caller: Address, poll_id: u64) -> Result<(), PredictXError> {
+        extend_instance_ttl(&env);
         ensure_not_paused(&env)?;
         caller.require_auth();
         let admin = get_admin(&env)?;
@@ -262,9 +437,7 @@ impl PredictionMarket {
             return Err(PredictXError::InvalidLockTime);
         }
 
-        transition_poll_status(&env, &mut poll, PollStatus::Locked);
-        env.events().publish((Symbol::new(&env, "PollLocked"), poll_id), ());
-        Ok(())
+        lock_and_announce(&env, &mut poll)
     }
 
     pub fn check_emergency_eligible(env: Env, poll_id: u64) -> bool {
@@ -274,14 +447,25 @@ impl PredictionMarket {
         };
         let client = voting_oracle::Client::new(&env, &oracle_id);
         let status = map_oracle_poll_status(client.get_poll_status(&poll_id));
-        if status == PollStatus::Cancelled { return true; }
-        if status != PollStatus::Disputed && status != PollStatus::Locked { return false; }
+        if status == PollStatus::Cancelled {
+            return true;
+        }
+        if status != PollStatus::Disputed && status != PollStatus::Locked {
+            return false;
+        }
         let updated_at = client.get_poll_status_updated_at(&poll_id);
-        if updated_at == 0 { return false; }
+        if updated_at == 0 {
+            return false;
+        }
         env.ledger().timestamp().saturating_sub(updated_at) >= EMERGENCY_TIMEOUT_SECS
     }
 
-    pub fn emergency_withdraw(env: Env, user: Address, poll_id: u64) -> Result<i128, PredictXError> {
+    pub fn emergency_withdraw(
+        env: Env,
+        user: Address,
+        poll_id: u64,
+    ) -> Result<i128, PredictXError> {
+        extend_instance_ttl(&env);
         user.require_auth();
         if has_emergency_claimed(&env, poll_id, &user) {
             return Err(PredictXError::AlreadyClaimed);
@@ -293,11 +477,14 @@ impl PredictionMarket {
             true
         } else if status == PollStatus::Disputed || status == PollStatus::Locked {
             let updated_at = client.get_poll_status_updated_at(&poll_id);
-            updated_at != 0 && env.ledger().timestamp().saturating_sub(updated_at) >= EMERGENCY_TIMEOUT_SECS
+            updated_at != 0
+                && env.ledger().timestamp().saturating_sub(updated_at) >= EMERGENCY_TIMEOUT_SECS
         } else {
             false
         };
-        if !eligible { return Err(PredictXError::EmergencyWithdrawNotAllowed); }
+        if !eligible {
+            return Err(PredictXError::EmergencyWithdrawNotAllowed);
+        }
         let stake = load_stake(&env, poll_id, &user).ok_or(PredictXError::NotStaker)?;
         set_emergency_claimed(&env, poll_id, &user);
 
@@ -307,7 +494,14 @@ impl PredictionMarket {
         let mut stats = get_platform_stats(&env);
         stats.total_value_locked -= stake.amount;
         set_platform_stats(&env, &stats);
-        env.events().publish((Symbol::new(&env, "EmergencyWithdrawal"), poll_id, user.clone()), stake.amount);
+        env.events().publish(
+            (
+                Symbol::new(&env, "EmergencyWithdrawal"),
+                poll_id,
+                user.clone(),
+            ),
+            stake.amount,
+        );
         Ok(stake.amount)
     }
 
@@ -321,6 +515,7 @@ impl PredictionMarket {
         category: PollCategory,
         lock_time: u64,
     ) -> Result<u64, PredictXError> {
+        extend_instance_ttl(&env);
         ensure_not_paused(&env)?;
         creator.require_auth();
 
@@ -392,12 +587,26 @@ impl PredictionMarket {
         Ok(poll_id)
     }
 
-
+    /// Read the poll record, self-correcting a stale `Active` status.
     pub fn get_poll(env: Env, poll_id: u64) -> Result<Poll, PredictXError> {
-        env.storage()
+        let mut poll: Poll = env
+            .storage()
             .persistent()
             .get(&DataKey::Poll(poll_id))
-            .ok_or(PredictXError::PollNotFound)
+            .ok_or(PredictXError::PollNotFound)?;
+
+        // Lazily self-correct (issue #125): a poll past its lock time whose
+        // stored status is still `Active` is persisted as `Locked` on read.
+        // This is the access path where the correction can actually survive:
+        // writes performed by a *failed* `stake` invocation are reverted by
+        // the host, so the persisted lock lands here instead.  The correction
+        // goes through the same announcement as an explicit `lock_poll`, so an
+        // indexer sees the transition whichever path gets there first.
+        if poll.status == PollStatus::Active && env.ledger().timestamp() >= poll.lock_time {
+            lock_and_announce(&env, &mut poll)?;
+        }
+
+        Ok(poll)
     }
 
     // ── Staking ───────────────────────────────────────────────────────────────
@@ -409,6 +618,7 @@ impl PredictionMarket {
         amount: i128,
         side: StakeSide,
     ) -> Result<Stake, PredictXError> {
+        extend_instance_ttl(&env);
         staking::stake(&env, staker, poll_id, amount, side)
     }
 
@@ -418,6 +628,10 @@ impl PredictionMarket {
 
     pub fn get_user_stakes(env: Env, user: Address) -> Vec<u64> {
         staking::get_user_stakes(&env, &user)
+    }
+
+    pub fn get_user_stakes_paged(env: Env, user: Address, start: u32, limit: u32) -> Vec<u64> {
+        staking::get_user_stakes_paged(&env, &user, start, limit)
     }
 
     pub fn has_user_staked(env: Env, poll_id: u64, user: Address) -> bool {
@@ -435,6 +649,41 @@ impl PredictionMarket {
 
     pub fn get_pool_info(env: Env, poll_id: u64) -> Result<PoolInfo, PredictXError> {
         staking::get_pool_info(&env, poll_id)
+    }
+
+    /// Read-only view: return the token amount that `claim_winnings` would
+    /// transfer to `user` for the given poll.  Returns `0` for every
+    /// ineligible case (unresolved poll, non-staker, losing staker,
+    /// already-claimed, payout that rounds to zero) rather than erroring, so
+    /// a frontend can call it for any (poll, user) pair.  No `require_auth` —
+    /// public.
+    pub fn get_claimable_amount(env: Env, poll_id: u64, user: Address) -> i128 {
+        extend_instance_ttl(&env);
+        payouts::get_claimable_amount(&env, poll_id, &user)
+    }
+
+    /// Claim winnings for a resolved poll.
+    ///
+    /// Transfers the same amount `get_claimable_amount` would return, and
+    /// reports the same errors as [`calculate_winnings`] does for the same
+    /// stake.  Requires the caller to be the staker (`user.require_auth()`).
+    pub fn claim_winnings(env: Env, user: Address, poll_id: u64) -> Result<i128, PredictXError> {
+        extend_instance_ttl(&env);
+        ensure_not_paused(&env)?;
+        payouts::claim_winnings(&env, user, poll_id)
+    }
+
+    /// Quote the payout for a resolved poll without transferring anything.
+    ///
+    /// Shares every guard and every calculation with [`claim_winnings`], so a
+    /// quote can never disagree with the claim that follows it.
+    pub fn calculate_winnings(
+        env: Env,
+        poll_id: u64,
+        user: Address,
+    ) -> Result<i128, PredictXError> {
+        extend_instance_ttl(&env);
+        payouts::calculate_winnings(&env, poll_id, user)
     }
 
     pub fn get_platform_stats(env: Env) -> PlatformStats {
@@ -462,24 +711,51 @@ impl PredictionMarket {
     // ── Match management ──────────────────────────────────────────────────────
 
     pub fn create_match(
-        env: Env, admin: Address,
-        home_team: String, away_team: String,
-        league: String, venue: String,
+        env: Env,
+        admin: Address,
+        home_team: String,
+        away_team: String,
+        league: String,
+        venue: String,
         kickoff_time: u64,
     ) -> Result<u64, PredictXError> {
-        matches::create_match(&env, admin, home_team, away_team, league, venue, kickoff_time)
+        extend_instance_ttl(&env);
+        matches::create_match(
+            &env,
+            admin,
+            home_team,
+            away_team,
+            league,
+            venue,
+            kickoff_time,
+        )
     }
 
     pub fn update_match(
-        env: Env, admin: Address, match_id: u64,
-        home_team: Option<String>, away_team: Option<String>,
-        league: Option<String>, venue: Option<String>,
+        env: Env,
+        admin: Address,
+        match_id: u64,
+        home_team: Option<String>,
+        away_team: Option<String>,
+        league: Option<String>,
+        venue: Option<String>,
         kickoff_time: Option<u64>,
     ) -> Result<Match, PredictXError> {
-        matches::update_match(&env, admin, match_id, home_team, away_team, league, venue, kickoff_time)
+        extend_instance_ttl(&env);
+        matches::update_match(
+            &env,
+            admin,
+            match_id,
+            home_team,
+            away_team,
+            league,
+            venue,
+            kickoff_time,
+        )
     }
 
     pub fn finish_match(env: Env, admin: Address, match_id: u64) -> Result<(), PredictXError> {
+        extend_instance_ttl(&env);
         matches::finish_match(&env, admin, match_id)
     }
 
@@ -500,35 +776,17 @@ impl PredictionMarket {
     /// Resolve a poll with a boolean outcome and record the final result.
     ///
     /// Callable only by the registered admin or the registered voting oracle —
-    /// either address recorded at `initialize`.
+    /// either address stored at `initialize`.  The poll must sit on a status the
+    /// state machine allows resolving from, so an `Active` poll has to be
+    /// locked and moved into voting first.
     pub fn resolve_poll(
         env: Env,
         caller: Address,
         poll_id: u64,
         outcome: bool,
     ) -> Result<(), PredictXError> {
+        extend_instance_ttl(&env);
         payouts::resolve_poll(&env, caller, poll_id, outcome)
-    }
-
-    /// Claim winnings after a resolved poll.
-    ///
-    /// If the winning pool is empty (every staker was on the losing side),
-    /// any staker may recover their original stake fee-free.  See
-    /// [`payouts::claim_winnings`] for the full description.
-    pub fn claim_winnings(
-        env: Env,
-        claimant: Address,
-        poll_id: u64,
-    ) -> Result<i128, PredictXError> {
-        payouts::claim_winnings(&env, claimant, poll_id)
-    }
-
-    pub fn calculate_winnings(
-        env: Env,
-        poll_id: u64,
-        user: Address,
-    ) -> Result<i128, PredictXError> {
-        payouts::calculate_winnings(&env, poll_id, user)
     }
 }
 
@@ -539,55 +797,11 @@ extern crate std;
 mod test {
     use super::*;
     use predictx_shared::{PollCategory, StakeSide};
-    use soroban_sdk::testutils::{Address as _, Events, Ledger};
-    use soroban_sdk::{token, TryFromVal, Val, Vec as SdkVec};
+    use soroban_sdk::testutils::{Address as _, Ledger};
+    use soroban_sdk::token;
 
     /// Default platform fee BPS for tests (5%).
     const TEST_FEE_BPS: u32 = 500;
-
-    // ── Lifecycle event helpers ───────────────────────────────────────────────
-
-    /// Every event this contract published with a poll-id topic, as
-    /// `(name, poll_id, data)`.
-    fn lifecycle_events(env: &Env, contract_id: &Address) -> std::vec::Vec<(Symbol, u64, Val)> {
-        env.events()
-            .all()
-            .into_iter()
-            .filter(|(addr, _, _)| addr == contract_id)
-            .filter_map(|(_, topics, data)| {
-                let t: SdkVec<Val> = topics.into();
-                if t.len() < 2 {
-                    return None;
-                }
-                let name = Symbol::try_from_val(env, &t.get(0).unwrap()).unwrap();
-                let poll_id = u64::try_from_val(env, &t.get(1).unwrap()).unwrap();
-                Some((name, poll_id, data))
-            })
-            .collect()
-    }
-
-    /// Names of the lifecycle events published for `poll_id`, in order.
-    fn lifecycle_names(env: &Env, contract_id: &Address, poll_id: u64) -> std::vec::Vec<Symbol> {
-        lifecycle_events(env, contract_id)
-            .into_iter()
-            .filter(|(_, id, _)| *id == poll_id)
-            .map(|(name, _, _)| name)
-            .collect()
-    }
-
-    fn status_changes(
-        env: &Env,
-        contract_id: &Address,
-    ) -> std::vec::Vec<(u64, PollStatus, PollStatus)> {
-        lifecycle_events(env, contract_id)
-            .into_iter()
-            .filter(|(name, _, _)| *name == Symbol::new(env, "PollStatusChanged"))
-            .map(|(_, poll_id, data)| {
-                let (from, to) = <(PollStatus, PollStatus)>::try_from_val(env, &data).unwrap();
-                (poll_id, from, to)
-            })
-            .collect()
-    }
 
     #[test]
     fn initialize_sets_admin_and_oracle() {
@@ -631,7 +845,9 @@ mod test {
         let token = Address::generate(&env);
         let treasury = Address::generate(&env);
         client.initialize(&admin, &oracle, &token, &treasury, &TEST_FEE_BPS);
-        let err = client.try_initialize(&admin, &oracle, &token, &treasury, &TEST_FEE_BPS).expect_err("should fail");
+        let err = client
+            .try_initialize(&admin, &oracle, &token, &treasury, &TEST_FEE_BPS)
+            .expect_err("should fail");
         assert_eq!(err, Ok(PredictXError::AlreadyInitialized));
     }
 
@@ -643,7 +859,7 @@ mod test {
         let oracle_id = env.register(voting_oracle::WASM, ());
         let oracle_client = voting_oracle::Client::new(&env, &oracle_id);
         oracle_client.initialize(&admin);
-        oracle_client.set_poll_status(&7_u64, &voting_oracle::PollStatus::Resolved);
+        oracle_client.set_poll_status(&admin, &7_u64, &voting_oracle::PollStatus::Resolved);
         let contract_id = env.register(PredictionMarket, ());
         let client = PredictionMarketClient::new(&env, &contract_id);
         let tok = Address::generate(&env);
@@ -667,7 +883,9 @@ mod test {
         assert_eq!(client.is_paused(), false);
         client.pause(&admin);
         assert_eq!(client.is_paused(), true);
-        let err = client.try_set_oracle(&oracle).expect_err("should be blocked");
+        let err = client
+            .try_set_oracle(&oracle)
+            .expect_err("should be blocked");
         assert_eq!(err, Ok(PredictXError::EmergencyWithdrawNotAllowed));
         client.unpause(&admin);
         assert_eq!(client.is_paused(), false);
@@ -686,14 +904,46 @@ mod test {
         let tok = Address::generate(&env);
         let treasury = Address::generate(&env);
         client.initialize(&admin, &oracle_id, &tok, &treasury, &TEST_FEE_BPS);
+        // `cancel_poll` mirrors into the oracle, which authorises the caller of
+        // `set_poll_status` against its admin registry.
+        oracle_client.add_admin(&admin, &contract_id);
         seed_active_poll(&env, &contract_id, 1, &admin);
+
         client.cancel_poll(&admin, &1_u64);
-        assert_eq!(oracle_client.get_poll_status(&1_u64), voting_oracle::PollStatus::Cancelled);
         assert_eq!(client.get_poll(&1_u64).status, PollStatus::Cancelled);
+        assert_eq!(
+            oracle_client.get_poll_status(&1_u64),
+            voting_oracle::PollStatus::Cancelled
+        );
+    }
+
+    #[test]
+    fn cancel_poll_rejects_unknown_poll() {
+        let env = Env::default();
+        env.mock_all_auths();
+        let admin = Address::generate(&env);
+        let oracle_id = env.register(voting_oracle::WASM, ());
+        voting_oracle::Client::new(&env, &oracle_id).initialize(&admin);
+        let contract_id = env.register(PredictionMarket, ());
+        let client = PredictionMarketClient::new(&env, &contract_id);
+        let tok = Address::generate(&env);
+        let treasury = Address::generate(&env);
+        client.initialize(&admin, &oracle_id, &tok, &treasury, &TEST_FEE_BPS);
+
+        let err = client
+            .try_cancel_poll(&admin, &404_u64)
+            .expect_err("cancelling a poll that does not exist");
+        assert_eq!(err, Ok(PredictXError::PollNotFound));
     }
 
     // Helper to set up a real-token environment for emergency withdrawal tests
-    fn setup_emergency_env() -> (Env, Address, Address, Address, PredictionMarketClient<'static>) {
+    fn setup_emergency_env() -> (
+        Env,
+        Address,
+        Address,
+        Address,
+        PredictionMarketClient<'static>,
+    ) {
         let env = Env::default();
         env.mock_all_auths();
         let admin = Address::generate(&env);
@@ -723,9 +973,12 @@ mod test {
 
     #[test]
     fn emergency_withdraw_on_cancelled_poll_refunds_stake() {
-        let (env, admin, _oracle_id, contract_id, client) = setup_emergency_env();
+        let (env, admin, oracle_id, contract_id, client) = setup_emergency_env();
         let token_addr: Address = env.as_contract(&contract_id, || {
-            env.storage().instance().get(&DataKey::TokenAddress).unwrap()
+            env.storage()
+                .instance()
+                .get(&DataKey::TokenAddress)
+                .unwrap()
         });
 
         let user = Address::generate(&env);
@@ -734,11 +987,21 @@ mod test {
         // Fund the contract so it can transfer back
         mint_to(&env, &token_addr, &contract_id, amount);
 
-        let stake = Stake { user: user.clone(), poll_id: 10, amount, side: StakeSide::Yes, claimed: false, staked_at: env.ledger().timestamp() };
+        let stake = Stake {
+            user: user.clone(),
+            poll_id: 10,
+            amount,
+            side: StakeSide::Yes,
+            claimed: false,
+            staked_at: env.ledger().timestamp(),
+        };
         env.as_contract(&contract_id, || {
-            env.storage().persistent().set(&DataKey::Stake(10, user.clone()), &stake);
+            env.storage()
+                .persistent()
+                .set(&DataKey::Stake(10, user.clone()), &stake);
         });
         seed_active_poll(&env, &contract_id, 10, &admin);
+        voting_oracle::Client::new(&env, &oracle_id).add_admin(&admin, &contract_id);
         client.cancel_poll(&admin, &10_u64);
         let refunded = client.emergency_withdraw(&user, &10_u64);
         assert_eq!(refunded, amount);
@@ -751,22 +1014,34 @@ mod test {
 
     #[test]
     fn emergency_withdraw_after_dispute_timeout() {
-        let (env, _admin, oracle_id, contract_id, client) = setup_emergency_env();
+        let (env, admin, oracle_id, contract_id, client) = setup_emergency_env();
         let oracle_client = voting_oracle::Client::new(&env, &oracle_id);
         let token_addr: Address = env.as_contract(&contract_id, || {
-            env.storage().instance().get(&DataKey::TokenAddress).unwrap()
+            env.storage()
+                .instance()
+                .get(&DataKey::TokenAddress)
+                .unwrap()
         });
 
         env.ledger().set_timestamp(100);
-        oracle_client.set_poll_status(&5_u64, &voting_oracle::PollStatus::Disputed);
+        oracle_client.set_poll_status(&admin, &5_u64, &voting_oracle::PollStatus::Disputed);
 
         let user = Address::generate(&env);
         let amount: i128 = 25;
         mint_to(&env, &token_addr, &contract_id, amount);
 
-        let stake = Stake { user: user.clone(), poll_id: 5, amount, side: StakeSide::No, claimed: false, staked_at: env.ledger().timestamp() };
+        let stake = Stake {
+            user: user.clone(),
+            poll_id: 5,
+            amount,
+            side: StakeSide::No,
+            claimed: false,
+            staked_at: env.ledger().timestamp(),
+        };
         env.as_contract(&contract_id, || {
-            env.storage().persistent().set(&DataKey::Stake(5, user.clone()), &stake);
+            env.storage()
+                .persistent()
+                .set(&DataKey::Stake(5, user.clone()), &stake);
         });
         env.ledger().set_timestamp(100 + EMERGENCY_TIMEOUT_SECS + 1);
         assert!(client.check_emergency_eligible(&5_u64));
@@ -776,47 +1051,87 @@ mod test {
 
     #[test]
     fn emergency_withdraw_rejected_before_timeout() {
-        let (env, _admin, oracle_id, contract_id, client) = setup_emergency_env();
+        let (env, admin, oracle_id, contract_id, client) = setup_emergency_env();
         let oracle_client = voting_oracle::Client::new(&env, &oracle_id);
 
         env.ledger().set_timestamp(200);
-        oracle_client.set_poll_status(&2_u64, &voting_oracle::PollStatus::Locked);
+        oracle_client.set_poll_status(&admin, &2_u64, &voting_oracle::PollStatus::Locked);
 
         let user = Address::generate(&env);
-        let stake = Stake { user: user.clone(), poll_id: 2, amount: 30, side: StakeSide::Yes, claimed: false, staked_at: env.ledger().timestamp() };
+        let stake = Stake {
+            user: user.clone(),
+            poll_id: 2,
+            amount: 30,
+            side: StakeSide::Yes,
+            claimed: false,
+            staked_at: env.ledger().timestamp(),
+        };
         env.as_contract(&contract_id, || {
-            env.storage().persistent().set(&DataKey::Stake(2, user.clone()), &stake);
+            env.storage()
+                .persistent()
+                .set(&DataKey::Stake(2, user.clone()), &stake);
         });
         env.ledger().set_timestamp(200 + EMERGENCY_TIMEOUT_SECS - 1);
         assert!(!client.check_emergency_eligible(&2_u64));
-        let err = client.try_emergency_withdraw(&user, &2_u64).expect_err("should reject");
+        let err = client
+            .try_emergency_withdraw(&user, &2_u64)
+            .expect_err("should reject");
         assert_eq!(err, Ok(PredictXError::EmergencyWithdrawNotAllowed));
     }
 
     #[test]
     fn emergency_withdraw_prevents_double_withdrawal() {
-        let (env, _admin, oracle_id, contract_id, client) = setup_emergency_env();
+        let (env, admin, oracle_id, contract_id, client) = setup_emergency_env();
         let oracle_client = voting_oracle::Client::new(&env, &oracle_id);
         let token_addr: Address = env.as_contract(&contract_id, || {
-            env.storage().instance().get(&DataKey::TokenAddress).unwrap()
+            env.storage()
+                .instance()
+                .get(&DataKey::TokenAddress)
+                .unwrap()
         });
 
         env.ledger().set_timestamp(300);
-        oracle_client.set_poll_status(&3_u64, &voting_oracle::PollStatus::Disputed);
+        oracle_client.set_poll_status(&admin, &3_u64, &voting_oracle::PollStatus::Disputed);
 
         let user = Address::generate(&env);
         let amount: i128 = 40;
         mint_to(&env, &token_addr, &contract_id, amount);
 
-        let stake = Stake { user: user.clone(), poll_id: 3, amount, side: StakeSide::No, claimed: false, staked_at: env.ledger().timestamp() };
+        let stake = Stake {
+            user: user.clone(),
+            poll_id: 3,
+            amount,
+            side: StakeSide::No,
+            claimed: false,
+            staked_at: env.ledger().timestamp(),
+        };
         env.as_contract(&contract_id, || {
-            env.storage().persistent().set(&DataKey::Stake(3, user.clone()), &stake);
+            env.storage()
+                .persistent()
+                .set(&DataKey::Stake(3, user.clone()), &stake);
         });
         env.ledger().set_timestamp(300 + EMERGENCY_TIMEOUT_SECS + 1);
         let refunded = client.emergency_withdraw(&user, &3_u64);
         assert_eq!(refunded, amount);
-        let err = client.try_emergency_withdraw(&user, &3_u64).expect_err("double withdrawal should fail");
+        let err = client
+            .try_emergency_withdraw(&user, &3_u64)
+            .expect_err("double withdrawal should fail");
         assert_eq!(err, Ok(PredictXError::AlreadyClaimed));
+    }
+
+    /// Force a poll's stored status (test scaffolding for lifecycle tests).
+    fn force_poll_status(env: &Env, contract_id: &Address, poll_id: u64, status: PollStatus) {
+        env.as_contract(contract_id, || {
+            let mut poll: Poll = env
+                .storage()
+                .persistent()
+                .get(&DataKey::Poll(poll_id))
+                .unwrap();
+            poll.status = status;
+            env.storage()
+                .persistent()
+                .set(&DataKey::Poll(poll_id), &poll);
+        });
     }
 
     fn seed_active_poll(env: &Env, contract_id: &Address, poll_id: u64, creator: &Address) {
@@ -837,7 +1152,9 @@ mod test {
             created_at: env.ledger().timestamp(),
         };
         env.as_contract(contract_id, || {
-            env.storage().persistent().set(&DataKey::Poll(poll_id), &poll);
+            env.storage()
+                .persistent()
+                .set(&DataKey::Poll(poll_id), &poll);
         });
     }
 
@@ -854,7 +1171,9 @@ mod test {
         let treasury = Address::generate(&env);
         client.initialize(&admin, &oracle, &tok, &treasury, &TEST_FEE_BPS);
         seed_active_poll(&env, &contract_id, 1, &admin);
-        let err = client.try_resolve_poll(&stranger, &1_u64, &true).expect_err("non-oracle");
+        let err = client
+            .try_resolve_poll(&stranger, &1_u64, &true)
+            .expect_err("non-oracle");
         assert_eq!(err, Ok(PredictXError::Unauthorized));
     }
 
@@ -869,7 +1188,9 @@ mod test {
         let tok = Address::generate(&env);
         let treasury = Address::generate(&env);
         client.initialize(&admin, &oracle, &tok, &treasury, &TEST_FEE_BPS);
-        let err = client.try_resolve_poll(&oracle, &99_u64, &false).expect_err("missing");
+        let err = client
+            .try_resolve_poll(&admin, &99_u64, &false)
+            .expect_err("missing");
         assert_eq!(err, Ok(PredictXError::PollNotFound));
     }
 
@@ -886,7 +1207,9 @@ mod test {
         let treasury = Address::generate(&env);
         client.initialize(&admin, &oracle, &tok, &treasury, &TEST_FEE_BPS);
         seed_active_poll(&env, &contract_id, 7, &admin);
-        client.resolve_poll(&oracle, &7_u64, &true);
+        // Resolution is only legal once the poll has reached the voting phase.
+        force_poll_status(&env, &contract_id, 7, PollStatus::Voting);
+        client.resolve_poll(&admin, &7_u64, &true);
         let poll = client.get_poll(&7_u64);
         assert_eq!(poll.outcome, Some(true));
         assert_eq!(poll.resolution_time, 1_700_000_000);
@@ -905,104 +1228,263 @@ mod test {
         let treasury = Address::generate(&env);
         client.initialize(&admin, &oracle, &tok, &treasury, &TEST_FEE_BPS);
         seed_active_poll(&env, &contract_id, 3, &admin);
-        client.resolve_poll(&oracle, &3_u64, &false);
-        let err = client.try_resolve_poll(&oracle, &3_u64, &true).expect_err("already");
+        force_poll_status(&env, &contract_id, 3, PollStatus::Voting);
+        client.resolve_poll(&admin, &3_u64, &false);
+        let err = client
+            .try_resolve_poll(&admin, &3_u64, &true)
+            .expect_err("already");
         assert_eq!(err, Ok(PredictXError::PollAlreadyResolved));
     }
 
-    // ── Lifecycle events (issue #126) ─────────────────────────────────────────
+    #[test]
+    fn propose_admin_does_not_change_active_admin() {
+        let env = Env::default();
+        env.mock_all_auths();
+        let contract_id = env.register(PredictionMarket, ());
+        let client = PredictionMarketClient::new(&env, &contract_id);
+        let admin = Address::generate(&env);
+        let oracle = Address::generate(&env);
+        let tok = Address::generate(&env);
+        let treasury = Address::generate(&env);
+        client.initialize(&admin, &oracle, &tok, &treasury, &TEST_FEE_BPS);
+        let candidate = Address::generate(&env);
+        client.propose_admin(&admin, &candidate);
+        assert_eq!(client.admin(), admin);
+    }
 
-    /// Environment with both a real oracle contract and a live `PredictionMarket`.
-    fn setup_lifecycle() -> (Env, Address, Address, Address, PredictionMarketClient<'static>) {
+    #[test]
+    fn accept_admin_only_callable_by_candidate() {
+        let env = Env::default();
+        env.mock_all_auths();
+        let contract_id = env.register(PredictionMarket, ());
+        let client = PredictionMarketClient::new(&env, &contract_id);
+        let admin = Address::generate(&env);
+        let oracle = Address::generate(&env);
+        let tok = Address::generate(&env);
+        let treasury = Address::generate(&env);
+        client.initialize(&admin, &oracle, &tok, &treasury, &TEST_FEE_BPS);
+        let candidate = Address::generate(&env);
+        let stranger = Address::generate(&env);
+        client.propose_admin(&admin, &candidate);
+        let err = client
+            .try_accept_admin(&stranger)
+            .expect_err("stranger cannot accept");
+        assert_eq!(err, Ok(PredictXError::Unauthorized));
+        assert_eq!(client.admin(), admin);
+    }
+
+    #[test]
+    fn proposal_can_be_overwritten_or_cancelled() {
+        let env = Env::default();
+        env.mock_all_auths();
+        let contract_id = env.register(PredictionMarket, ());
+        let client = PredictionMarketClient::new(&env, &contract_id);
+        let admin = Address::generate(&env);
+        let oracle = Address::generate(&env);
+        let tok = Address::generate(&env);
+        let treasury = Address::generate(&env);
+        client.initialize(&admin, &oracle, &tok, &treasury, &TEST_FEE_BPS);
+
+        let first = Address::generate(&env);
+        let second = Address::generate(&env);
+        client.propose_admin(&admin, &first);
+        client.propose_admin(&admin, &second);
+        let err = client
+            .try_accept_admin(&first)
+            .expect_err("overwritten proposal");
+        assert_eq!(err, Ok(PredictXError::Unauthorized));
+
+        client.cancel_admin_proposal(&admin);
+        let err = client
+            .try_accept_admin(&second)
+            .expect_err("cancelled proposal");
+        assert_eq!(err, Ok(PredictXError::Unauthorized));
+        assert_eq!(client.admin(), admin);
+    }
+
+    // ── transition_status state machine (issue #123) ──────────────────────────
+
+    fn poll_with_status(env: &Env, status: PollStatus) -> Poll {
+        Poll {
+            poll_id: 1,
+            match_id: 1,
+            creator: Address::generate(env),
+            question: String::from_str(env, "q"),
+            category: PollCategory::TeamEvent,
+            lock_time: 1_000,
+            yes_pool: 0,
+            no_pool: 0,
+            yes_count: 0,
+            no_count: 0,
+            status,
+            outcome: None,
+            resolution_time: 0,
+            created_at: 0,
+        }
+    }
+
+    #[test]
+    fn transition_accepts_every_legal_edge() {
+        let env = Env::default();
+        let cases = [
+            (PollStatus::Active, PollStatus::Locked),
+            (PollStatus::Locked, PollStatus::Voting),
+            (PollStatus::Voting, PollStatus::AdminReview),
+            (PollStatus::Voting, PollStatus::Disputed),
+            (PollStatus::Voting, PollStatus::Resolved),
+            (PollStatus::AdminReview, PollStatus::Resolved),
+            (PollStatus::Disputed, PollStatus::Resolved),
+            (PollStatus::Active, PollStatus::Cancelled),
+            (PollStatus::Locked, PollStatus::Cancelled),
+        ];
+        for (from, to) in cases {
+            let poll = poll_with_status(&env, from);
+            assert_eq!(
+                transition_status(&env, &poll, to),
+                Ok(()),
+                "legal edge {:?} -> {:?} rejected",
+                from,
+                to
+            );
+        }
+    }
+
+    #[test]
+    fn transition_rejects_illegal_edges() {
+        let env = Env::default();
+        let cases = [
+            (PollStatus::Active, PollStatus::Resolved),
+            (PollStatus::Active, PollStatus::Voting),
+            (PollStatus::Active, PollStatus::AdminReview),
+            (PollStatus::Active, PollStatus::Disputed),
+            (PollStatus::Locked, PollStatus::Resolved),
+            (PollStatus::Locked, PollStatus::Locked),
+            (PollStatus::Voting, PollStatus::Locked),
+            (PollStatus::Voting, PollStatus::Cancelled),
+            (PollStatus::Voting, PollStatus::Active),
+            (PollStatus::AdminReview, PollStatus::Disputed),
+            (PollStatus::Disputed, PollStatus::AdminReview),
+        ];
+        for (from, to) in cases {
+            let poll = poll_with_status(&env, from);
+            assert_eq!(
+                transition_status(&env, &poll, to),
+                Err(PredictXError::InvalidStateTransition),
+                "illegal edge {:?} -> {:?} was accepted",
+                from,
+                to
+            );
+        }
+    }
+
+    #[test]
+    fn resolved_and_cancelled_are_terminal() {
+        let env = Env::default();
+        let statuses = [
+            PollStatus::Active,
+            PollStatus::Locked,
+            PollStatus::Voting,
+            PollStatus::AdminReview,
+            PollStatus::Disputed,
+            PollStatus::Resolved,
+            PollStatus::Cancelled,
+        ];
+        for terminal in [PollStatus::Resolved, PollStatus::Cancelled] {
+            for to in statuses {
+                let poll = poll_with_status(&env, terminal);
+                assert_eq!(
+                    transition_status(&env, &poll, to),
+                    Err(PredictXError::InvalidStateTransition),
+                    "terminal {:?} must not transition to {:?}",
+                    terminal,
+                    to
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn resolve_poll_rejects_active_poll_with_invalid_transition() {
+        let env = Env::default();
+        env.mock_all_auths();
+        let contract_id = env.register(PredictionMarket, ());
+        let client = PredictionMarketClient::new(&env, &contract_id);
+        let admin = Address::generate(&env);
+        let oracle = Address::generate(&env);
+        let tok = Address::generate(&env);
+        let treasury = Address::generate(&env);
+        client.initialize(&admin, &oracle, &tok, &treasury, &TEST_FEE_BPS);
+        seed_active_poll(&env, &contract_id, 4, &admin);
+
+        // Active -> Resolved is not part of the legal graph.
+        let err = client
+            .try_resolve_poll(&admin, &4_u64, &true)
+            .expect_err("active polls cannot be resolved directly");
+        assert_eq!(err, Ok(PredictXError::InvalidStateTransition));
+    }
+
+    #[test]
+    fn accept_admin_transfers_ownership_and_old_admin_loses_access() {
         let env = Env::default();
         env.mock_all_auths();
         let admin = Address::generate(&env);
-
         let oracle_id = env.register(voting_oracle::WASM, ());
         voting_oracle::Client::new(&env, &oracle_id).initialize(&admin);
-
         let contract_id = env.register(PredictionMarket, ());
         let client = PredictionMarketClient::new(&env, &contract_id);
         let tok = Address::generate(&env);
         let treasury = Address::generate(&env);
         client.initialize(&admin, &oracle_id, &tok, &treasury, &TEST_FEE_BPS);
+        voting_oracle::Client::new(&env, &oracle_id).add_admin(&admin, &contract_id);
+        seed_active_poll(&env, &contract_id, 4, &admin);
 
-        (env, admin, oracle_id, contract_id, client)
-    }
+        let successor = Address::generate(&env);
+        client.propose_admin(&admin, &successor);
+        client.accept_admin(&successor);
+        assert_eq!(client.admin(), successor);
 
-    #[test]
-    fn lock_poll_announces_the_transition_and_the_lock() {
-        let (env, admin, oracle_id, contract_id, client) = setup_lifecycle();
-        seed_active_poll(&env, &contract_id, 12, &admin);
-
-        // The oracle — not just the admin — may drive the transition.
-        env.ledger().set_timestamp(env.ledger().timestamp() + 3_600);
-        client.lock_poll(&oracle_id, &12_u64);
-
-        assert_eq!(client.get_poll(&12_u64).status, PollStatus::Locked);
-        assert_eq!(
-            status_changes(&env, &contract_id),
-            std::vec![(12_u64, PollStatus::Active, PollStatus::Locked)]
-        );
-        assert_eq!(
-            lifecycle_names(&env, &contract_id, 12),
-            std::vec![
-                Symbol::new(&env, "PollStatusChanged"),
-                Symbol::new(&env, "PollLocked"),
-            ]
-        );
-    }
-
-    #[test]
-    fn lock_poll_rejected_transitions_publish_nothing() {
-        let (env, admin, _oracle_id, contract_id, client) = setup_lifecycle();
-        seed_active_poll(&env, &contract_id, 13, &admin);
-
-        // Too early.
+        // The old admin can no longer mutate gated state.
         let err = client
-            .try_lock_poll(&admin, &13_u64)
-            .expect_err("lock time has not passed");
-        assert_eq!(err, Ok(PredictXError::InvalidLockTime));
-        assert!(lifecycle_events(&env, &contract_id).is_empty());
-
-        // Not the admin and not the oracle.
-        let stranger = Address::generate(&env);
-        env.ledger().set_timestamp(env.ledger().timestamp() + 3_600);
-        let err = client
-            .try_lock_poll(&stranger, &13_u64)
-            .expect_err("stranger may not lock");
+            .try_cancel_poll(&admin, &4_u64)
+            .expect_err("old admin lost access");
         assert_eq!(err, Ok(PredictXError::Unauthorized));
-        assert!(lifecycle_events(&env, &contract_id).is_empty());
 
-        // Valid, then illegal: locking twice must stay silent.
-        client.lock_poll(&admin, &13_u64);
-        let published = lifecycle_events(&env, &contract_id).len();
-        let err = client
-            .try_lock_poll(&admin, &13_u64)
-            .expect_err("already locked");
-        assert_eq!(err, Ok(PredictXError::InvalidStateTransition));
-        assert_eq!(lifecycle_events(&env, &contract_id).len(), published);
+        // The new admin can.
+        client.cancel_poll(&successor, &4_u64);
+        assert_eq!(client.get_poll(&4_u64).status, PollStatus::Cancelled);
     }
 
     #[test]
-    fn every_transition_publishes_a_status_change() {
-        let (env, admin, _oracle_id, contract_id, client) = setup_lifecycle();
-        seed_active_poll(&env, &contract_id, 21, &admin);
-        seed_active_poll(&env, &contract_id, 22, &admin);
-        seed_active_poll(&env, &contract_id, 23, &admin);
+    fn full_lifecycle_walk_via_state_machine() {
+        let env = Env::default();
+        env.mock_all_auths();
+        let contract_id = env.register(PredictionMarket, ());
+        let client = PredictionMarketClient::new(&env, &contract_id);
+        let admin = Address::generate(&env);
+        let oracle = Address::generate(&env);
+        let tok = Address::generate(&env);
+        let treasury = Address::generate(&env);
+        client.initialize(&admin, &oracle, &tok, &treasury, &TEST_FEE_BPS);
+        let candidate = Address::generate(&env);
+        client.propose_admin(&admin, &candidate);
+        client.accept_admin(&candidate);
+        assert_eq!(client.admin(), candidate);
+        let err = client
+            .try_pause(&admin)
+            .expect_err("old admin should lose access");
+        assert_eq!(err, Ok(PredictXError::Unauthorized));
+        client.pause(&candidate);
+        assert_eq!(client.is_paused(), true);
+        seed_active_poll(&env, &contract_id, 9, &admin);
 
-        env.ledger().set_timestamp(env.ledger().timestamp() + 3_600);
-        client.lock_poll(&admin, &21_u64);
-        client.cancel_poll(&admin, &22_u64);
-        client.resolve_poll(&admin, &23_u64, &true);
+        force_poll_status(&env, &contract_id, 9, PollStatus::Locked);
+        force_poll_status(&env, &contract_id, 9, PollStatus::Voting);
+        force_poll_status(&env, &contract_id, 9, PollStatus::Disputed);
 
-        assert_eq!(
-            status_changes(&env, &contract_id),
-            std::vec![
-                (21_u64, PollStatus::Active, PollStatus::Locked),
-                (22_u64, PollStatus::Active, PollStatus::Cancelled),
-                (23_u64, PollStatus::Active, PollStatus::Resolved),
-            ]
-        );
+        // Ownership moved, so the new admin is the one that can resolve.
+        client.resolve_poll(&candidate, &9_u64, &false);
+        let poll = client.get_poll(&9_u64);
+        assert_eq!(poll.status, PollStatus::Resolved);
+        assert_eq!(poll.outcome, Some(false));
     }
 }

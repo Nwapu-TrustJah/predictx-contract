@@ -1,10 +1,11 @@
 #![no_std]
 
-mod storage;
-mod voting;
-
+use predictx_shared::DataKey;
 use predictx_shared::{PollStatus, PredictXError, VoteChoice, VoteTally, VOTING_WINDOW_SECS};
 use soroban_sdk::{contract, contractimpl, contracttype, Address, Env, Vec};
+
+mod storage;
+mod voting;
 
 /// Maximum number of admins that may be registered at once.
 ///
@@ -21,31 +22,6 @@ pub struct VotingOracle;
 struct StoredPollStatus {
     status: PollStatus,
     updated_at: u64,
-}
-
-#[contracttype]
-#[derive(Clone)]
-enum DataKey {
-    Admin,
-    /// Registered admins `Vec<Address>`. (Instance)
-    AdminList,
-    PollStatus(u64),
-    /// `poll_id` → vote tally. (Temporary — only needed during the voting window)
-    VoteTally(u64),
-    /// `poll_id` → automatically resolved outcome.
-    PollOutcome(u64),
-    /// `poll_id` → persistent roster of voters who cast a vote.
-    Voters(u64),
-    /// `(poll_id, voter)` → `bool` — has this voter cast a vote? (Temporary)
-    HasVoted(u64, Address),
-    /// `(poll_id, voter)` → the choice the voter recorded. (Persistent)
-    VoterChoice(u64, Address),
-    /// `poll_id` → voter reward reserve (unclaimed incentive pool). (Persistent)
-    RewardPool(u64),
-    /// `(poll_id, voter)` → `i128` reward paid to an eligible voter. (Persistent)
-    VoterReward(u64, Address),
-    /// `(poll_id, voter)` → `bool` — has the voter claimed their reward? (Persistent)
-    RewardClaimed(u64, Address),
 }
 
 fn get_admin(env: &Env) -> Result<Address, PredictXError> {
@@ -161,13 +137,20 @@ impl VotingOracle {
     ///
     /// This exists only to validate cross-contract invocation patterns during
     /// Phase 1 scaffolding.
+    ///
+    /// `caller` is authorised against the multi-admin registry rather than
+    /// against the owning address: the `PredictionMarket` contract mirrors its
+    /// own cancellations here, and a contract call can never present the
+    /// owner's signature. That means the market address must be registered
+    /// with [`add_admin`] for the mirror to succeed.
     pub fn set_poll_status(
         env: Env,
+        caller: Address,
         poll_id: u64,
         status: PollStatus,
     ) -> Result<(), PredictXError> {
-        let admin = get_admin(&env)?;
-        admin.require_auth();
+        caller.require_auth();
+        storage::require_admin(&env, &caller)?;
 
         let stored = StoredPollStatus {
             status,
@@ -292,6 +275,14 @@ impl VotingOracle {
     pub fn has_claimed_reward(env: Env, poll_id: u64, voter: Address) -> bool {
         storage::has_claimed_reward(&env, poll_id, &voter)
     }
+
+    /// Read the aggregated community vote tally for `poll_id`.
+    ///
+    /// Returns [`PredictXError::PollNotFound`] when no tally has been recorded
+    /// for the poll yet.
+    pub fn get_vote_tally(env: Env, poll_id: u64) -> Result<VoteTally, PredictXError> {
+        storage::read_tally(&env, poll_id).ok_or(PredictXError::PollNotFound)
+    }
 }
 
 #[cfg(test)]
@@ -313,8 +304,18 @@ mod test {
         let admin = Address::generate(&env);
         client.initialize(&admin);
 
-        client.set_poll_status(&42_u64, &PollStatus::Resolved);
+        client.set_poll_status(&admin, &42_u64, &PollStatus::Resolved);
         assert_eq!(client.get_poll_status(&42_u64), PollStatus::Resolved);
+    }
+
+    #[test]
+    fn get_vote_tally_returns_poll_not_found_for_unknown_poll() {
+        let (_env, _admin, client) = setup();
+
+        let err = client
+            .try_get_vote_tally(&7_u64)
+            .expect_err("unknown poll should error");
+        assert_eq!(err, Ok(PredictXError::PollNotFound));
     }
 
     #[test]
@@ -328,9 +329,9 @@ mod test {
 
     #[test]
     fn voting_views_track_vote_and_duplicate_eligibility() {
-        let (env, _admin, client) = setup();
+        let (env, admin, client) = setup();
         let voter = Address::generate(&env);
-        client.set_poll_status(&1_u64, &PollStatus::Voting);
+        client.set_poll_status(&admin, &1_u64, &PollStatus::Voting);
 
         assert!(!client.has_voted(&1_u64, &voter));
         assert!(client.can_vote(&1_u64, &voter));
@@ -343,13 +344,13 @@ mod test {
 
     #[test]
     fn can_vote_rejects_unopened_and_expired_polls() {
-        let (env, _admin, client) = setup();
+        let (env, admin, client) = setup();
         let voter = Address::generate(&env);
 
-        client.set_poll_status(&2_u64, &PollStatus::Active);
+        client.set_poll_status(&admin, &2_u64, &PollStatus::Active);
         assert!(!client.can_vote(&2_u64, &voter));
 
-        client.set_poll_status(&3_u64, &PollStatus::Voting);
+        client.set_poll_status(&admin, &3_u64, &PollStatus::Voting);
         env.ledger()
             .with_mut(|ledger| ledger.timestamp += VOTING_WINDOW_SECS);
         assert!(!client.can_vote(&3_u64, &voter));
@@ -366,6 +367,74 @@ mod test {
         client.initialize(&admin);
 
         (env, admin, client)
+    }
+
+    #[test]
+    fn get_vote_tally_reads_back_stored_tally_field_for_field() {
+        let env = Env::default();
+        env.mock_all_auths();
+
+        let contract_id = env.register(VotingOracle, ());
+        let client = VotingOracleClient::new(&env, &contract_id);
+
+        let tally = VoteTally {
+            poll_id: 99,
+            yes_votes: 12,
+            no_votes: 5,
+            unclear_votes: 3,
+            total_voters: 20,
+            voting_end_time: 1_700_000_000,
+            reward_pool: 1_500_000,
+        };
+
+        env.as_contract(&contract_id, || {
+            storage::write_tally(&env, &tally);
+        });
+
+        let stored = client.get_vote_tally(&99_u64);
+        assert_eq!(stored, tally);
+        assert_eq!(stored.poll_id, 99);
+        assert_eq!(stored.yes_votes, 12);
+        assert_eq!(stored.no_votes, 5);
+        assert_eq!(stored.unclear_votes, 3);
+        assert_eq!(stored.total_voters, 20);
+        assert_eq!(stored.voting_end_time, 1_700_000_000);
+        assert_eq!(stored.reward_pool, 1_500_000);
+    }
+
+    #[test]
+    fn write_tally_overwrites_previous_tally_for_same_poll() {
+        let env = Env::default();
+        env.mock_all_auths();
+
+        let contract_id = env.register(VotingOracle, ());
+        let client = VotingOracleClient::new(&env, &contract_id);
+
+        let first = VoteTally {
+            poll_id: 1,
+            yes_votes: 1,
+            no_votes: 0,
+            unclear_votes: 0,
+            total_voters: 1,
+            voting_end_time: 100,
+            reward_pool: 10,
+        };
+        let second = VoteTally {
+            poll_id: 1,
+            yes_votes: 4,
+            no_votes: 2,
+            unclear_votes: 1,
+            total_voters: 7,
+            voting_end_time: 200,
+            reward_pool: 70,
+        };
+
+        env.as_contract(&contract_id, || {
+            storage::write_tally(&env, &first);
+            storage::write_tally(&env, &second);
+        });
+
+        assert_eq!(client.get_vote_tally(&1_u64), second);
     }
 
     #[test]

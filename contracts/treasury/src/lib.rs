@@ -3,6 +3,13 @@
 use predictx_shared::PredictXError;
 use soroban_sdk::{contract, contractimpl, contracttype, token, Address, Env};
 
+/// TTL extension in the number of ledgers.
+///
+/// At ~5 seconds per ledger, this is roughly 30 days.
+const INSTANCE_TTL_THRESHOLD: u32 = 518_400;
+/// Extend to at least this many ledgers from now.
+const INSTANCE_TTL_EXTEND_TO: u32 = 518_400;
+
 #[contract]
 pub struct Treasury;
 
@@ -36,9 +43,21 @@ fn get_balance(env: &Env, who: &Address) -> i128 {
         .unwrap_or(0_i128)
 }
 
+/// Extend the instance storage TTL so the contract's admin, token and
+/// configuration are never archived from inactivity.
+///
+/// Called at the top of every mutating entry point. Read-only views do not
+/// call this and thus do not pay the cost.
+fn extend_instance_ttl(env: &Env) {
+    env.storage()
+        .instance()
+        .extend_ttl(INSTANCE_TTL_THRESHOLD, INSTANCE_TTL_EXTEND_TO);
+}
+
 #[contractimpl]
 impl Treasury {
     pub fn initialize(env: Env, admin: Address) -> Result<(), PredictXError> {
+        extend_instance_ttl(&env);
         if env.storage().instance().has(&DataKey::Admin) {
             return Err(PredictXError::AlreadyInitialized);
         }
@@ -59,6 +78,7 @@ impl Treasury {
 
     /// Admin-gated setter for the registered market address.
     pub fn set_market(env: Env, admin: Address, market: Address) -> Result<(), PredictXError> {
+        extend_instance_ttl(&env);
         let stored_admin = get_admin(&env)?;
         if admin != stored_admin {
             return Err(PredictXError::Unauthorized);
@@ -74,6 +94,7 @@ impl Treasury {
         admin: Address,
         token_address: Address,
     ) -> Result<(), PredictXError> {
+        extend_instance_ttl(&env);
         let stored_admin = get_admin(&env)?;
         if admin != stored_admin {
             return Err(PredictXError::Unauthorized);
@@ -89,6 +110,7 @@ impl Treasury {
     ///
     /// Real token transfers are integrated in later issues.
     pub fn deposit(env: Env, from: Address, amount: i128) -> Result<i128, PredictXError> {
+        extend_instance_ttl(&env);
         if amount <= 0 {
             return Err(PredictXError::StakeAmountZero);
         }
@@ -108,6 +130,7 @@ impl Treasury {
     ///
     /// Any address other than the registered market receives `Unauthorized`.
     pub fn deposit_fees(env: Env, from: Address, amount: i128) -> Result<i128, PredictXError> {
+        extend_instance_ttl(&env);
         if amount <= 0 {
             return Err(PredictXError::StakeAmountZero);
         }
@@ -143,6 +166,7 @@ impl Treasury {
         admin.require_auth();
 
         if amount <= 0 {
+            extend_instance_ttl(&env);
             return Err(PredictXError::StakeAmountZero);
         }
 

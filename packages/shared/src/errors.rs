@@ -80,10 +80,10 @@ pub enum PredictXError {
     OutcomeNotAvailable = 37,
     /// The reward amount must not be negative.
     InvalidRewardAmount = 38,
+    /// The requested poll status transition is not part of the legal graph.
+    InvalidStateTransition = 39,
     /// Stake amount is above the maximum allowed for a single stake.
-    StakeAboveMaximum = 39,
-    /// The poll's current status does not allow the requested transition.
-    InvalidStateTransition = 40,
+    StakeAboveMaximum = 40,
     /// The stake is on the winning side but its payout rounds down to zero.
     PayoutRoundsToZero = 41,
 }
@@ -104,8 +104,8 @@ mod test {
         assert_eq!(PredictXError::ContractPaused as u32, 33);
         assert_eq!(PredictXError::StakeBelowMinimum as u32, 34);
         assert_eq!(PredictXError::InvalidRewardAmount as u32, 38);
-        assert_eq!(PredictXError::StakeAboveMaximum as u32, 39);
-        assert_eq!(PredictXError::InvalidStateTransition as u32, 40);
+        assert_eq!(PredictXError::InvalidStateTransition as u32, 39);
+        assert_eq!(PredictXError::StakeAboveMaximum as u32, 40);
         assert_eq!(PredictXError::PayoutRoundsToZero as u32, 41);
     }
 }

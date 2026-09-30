@@ -40,3 +40,8 @@ pub const MIN_STAKE_AMOUNT: i128 = 10_000_000;
 /// inside a predictable range. The bound is per stake, not per user: several
 /// smaller stakes on the same poll still add up.
 pub const MAX_STAKE_AMOUNT: i128 = 100_000_000;
+
+/// Upper bound on how many stakes [`get_user_stakes`] returns in one page.
+/// Keeps the view's response size and host execution cost predictable when a
+/// user has staked many times on many polls.
+pub const MAX_USER_STAKES_PAGE_SIZE: u32 = 50;
