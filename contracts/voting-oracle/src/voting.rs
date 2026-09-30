@@ -143,6 +143,10 @@ pub fn initiate_voting(
     let tally = VoteTally {
 use crate::{storage, DataKey, MAX_VOTERS};
 use predictx_shared::{
+    Dispute, PollStatus, PredictXError, VoteChoice, VoteTally, AUTO_RESOLVE_THRESHOLD_BPS,
+    BPS_DENOMINATOR, DISPUTE_FEE, MULTI_SIG_REQUIRED, VOTING_WINDOW_SECS,
+};
+use soroban_sdk::{token, Address, Env, String, Symbol};
     PollStatus, PredictXError, VoteChoice, VoteTally, AUTO_RESOLVE_THRESHOLD_BPS, BPS_DENOMINATOR,
     VOTER_REWARD_BPS, VOTING_WINDOW_SECS,
 };
@@ -525,6 +529,87 @@ pub(crate) fn consensus_bps(tally: &VoteTally) -> (bool, u32) {
     (leading_is_yes, share_bps)
 }
 
+/// Initiate a dispute against a resolved poll.
+///
+/// Flow (Checks → Effects):
+/// 1. Authenticates the caller as the initiator.
+/// 2. Verifies the poll exists and is in `Resolved` status.
+/// 3. Transfers the fixed dispute fee from the initiator to the contract.
+/// 4. Constructs a `Dispute` record and persists it.
+/// 5. Transitions the poll status to `Disputed`.
+/// 6. Emits a `DisputeInitiated(poll_id, initiator)` event.
+///
+/// Out of scope: dispute window, duplicate guard, fee refund/forfeit.
+pub fn initiate_dispute(
+    env: &Env,
+    initiator: Address,
+    poll_id: u64,
+    evidence_hash: String,
+) -> Result<Dispute, PredictXError> {
+    initiator.require_auth();
+
+    // ── Checks ────────────────────────────────────────────────────────────────
+
+    // Poll must be known to the oracle.
+    if !env
+        .storage()
+        .persistent()
+        .has(&DataKey::PollStatus(poll_id))
+    {
+        return Err(PredictXError::PollNotFound);
+    }
+
+    // Only resolved polls can be disputed.
+    if crate::read_poll_status(env, poll_id) != PollStatus::Resolved {
+        return Err(PredictXError::PollAlreadyResolved);
+    }
+
+    // ── Fee transfer ──────────────────────────────────────────────────────────
+
+    let token_addr = crate::get_token_address(env)?;
+    let token_client = token::Client::new(env, &token_addr);
+
+    // Verify the initiator can provide the required dispute fee.
+    if DISPUTE_FEE <= 0 || token_client.balance(&initiator) < DISPUTE_FEE {
+        return Err(PredictXError::DisputeFeeRequired);
+    }
+
+    token_client.transfer(&initiator, &env.current_contract_address(), &DISPUTE_FEE);
+
+    // ── Effects ───────────────────────────────────────────────────────────────
+
+    let now = env.ledger().timestamp();
+
+    let dispute = Dispute {
+        poll_id,
+        initiator: initiator.clone(),
+        evidence_hash,
+        dispute_fee: DISPUTE_FEE,
+        admin_approvals: 0,
+        required_approvals: MULTI_SIG_REQUIRED,
+        resolved: false,
+        initiated_at: now,
+    };
+
+    storage::write_dispute(env, &dispute);
+
+    // Transition poll to Disputed.
+    let stored_status = crate::StoredPollStatus {
+        status: PollStatus::Disputed,
+        updated_at: now,
+    };
+    env.storage()
+        .persistent()
+        .set(&DataKey::PollStatus(poll_id), &stored_status);
+
+    env.events().publish(
+        (Symbol::new(env, "DisputeInitiated"), poll_id),
+        initiator,
+    );
+
+    Ok(dispute)
+}
+
 // ── Tests ─────────────────────────────────────────────────────────────────────
 
 #[cfg(test)]
@@ -532,12 +617,14 @@ mod test {
     extern crate std;
 
     use predictx_shared::{
+        Dispute, PollStatus, PredictXError, VoteChoice, DISPUTE_FEE, MULTI_SIG_REQUIRED,
+        VOTING_WINDOW_SECS,
         PollStatus, PredictXError, VoteChoice, VoteTally, VOTER_REWARD_BPS, VOTING_WINDOW_SECS,
     };
     use soroban_sdk::{
         contract, contractimpl, contracttype,
         testutils::{Address as _, Ledger},
-        Address, Env,
+        Address, Env, String,
     };
 
     use crate::{storage, VotingOracle, VotingOracleClient};
@@ -567,23 +654,34 @@ mod test {
 
     use crate::{VotingOracle, VotingOracleClient};
 
-    fn setup() -> (Env, Address, VotingOracleClient<'static>) {
+    fn setup() -> (Env, Address, Address, VotingOracleClient<'static>) {
         let env = Env::default();
         env.mock_all_auths();
         let cid = env.register(VotingOracle, ());
         let client = VotingOracleClient::new(&env, &cid);
         let admin = Address::generate(&env);
 
+        // Deploy a test token and fund the contract.
+        let token_admin = Address::generate(&env);
+        let token_id = env.register_stellar_asset_contract_v2(token_admin.clone());
+        let token_addr = token_id.address();
+        let token_client =
+            soroban_sdk::token::StellarAssetClient::new(&env, &token_addr);
+
+        client.initialize(&admin, &token_addr);
         client.initialize(&admin);
         let prediction_market_id = env.register(TestPredictionMarket, ());
         client.set_prediction_market(&prediction_market_id);
         env.ledger().with_mut(|l| l.timestamp = 1_000_000);
 
+        // Mint tokens that dispute tests can use.
+        token_client.mint(&admin, &(DISPUTE_FEE * 10));
+
         // Register poll 1 as a known poll. `initiate_voting` (#80) will later
         // be the real production path for this transition.
         client.set_poll_status(&1_u64, &PollStatus::Voting);
 
-        (env, admin, client)
+        (env, admin, token_addr, client)
     }
 
     fn voter(env: &Env) -> Address {
@@ -598,7 +696,7 @@ mod test {
 
     #[test]
     fn cast_vote_records_choice_and_counts_voters() {
-        let (env, _admin, client) = setup();
+        let (env, _admin, _token, client) = setup();
 
         let tally = client.cast_vote(&voter(&env), &1_u64, &VoteChoice::Yes);
 
@@ -664,7 +762,7 @@ mod test {
 
     #[test]
     fn cast_vote_updates_persisted_tally() {
-        let (env, _admin, client) = setup();
+        let (env, _admin, _token, client) = setup();
 
         client.cast_vote(&voter(&env), &1_u64, &VoteChoice::Yes);
 
@@ -677,7 +775,7 @@ mod test {
 
     #[test]
     fn cast_vote_accumulates_all_three_choices() {
-        let (env, _admin, client) = setup();
+        let (env, _admin, _token, client) = setup();
 
         client.cast_vote(&voter(&env), &1_u64, &VoteChoice::Yes);
         client.cast_vote(&voter(&env), &1_u64, &VoteChoice::No);
@@ -691,7 +789,7 @@ mod test {
 
     #[test]
     fn cast_vote_rejects_unknown_poll() {
-        let (env, _admin, client) = setup();
+        let (env, _admin, _token, client) = setup();
 
         let err = client
             .try_cast_vote(&voter(&env), &999_u64, &VoteChoice::Yes)
@@ -702,7 +800,7 @@ mod test {
 
     #[test]
     fn cast_vote_rejects_active_poll() {
-        let (env, _admin, client) = setup();
+        let (env, _admin, _token, client) = setup();
         client.set_poll_status(&1_u64, &PollStatus::Active);
 
         let err = client
@@ -714,7 +812,7 @@ mod test {
 
     #[test]
     fn cast_vote_rejects_resolved_poll() {
-        let (env, _admin, client) = setup();
+        let (env, _admin, _token, client) = setup();
         client.set_poll_status(&1_u64, &PollStatus::Resolved);
 
         let err = client
@@ -726,7 +824,7 @@ mod test {
 
     #[test]
     fn cast_vote_rejects_duplicate_vote_from_same_voter() {
-        let (env, _admin, client) = setup();
+        let (env, _admin, _token, client) = setup();
         let v = voter(&env);
 
         client.cast_vote(&v, &1_u64, &VoteChoice::Yes);
@@ -740,7 +838,7 @@ mod test {
 
     #[test]
     fn rejected_duplicate_vote_leaves_tally_unchanged() {
-        let (env, _admin, client) = setup();
+        let (env, _admin, _token, client) = setup();
         let v = voter(&env);
 
         client.cast_vote(&v, &1_u64, &VoteChoice::Yes);
@@ -760,7 +858,7 @@ mod test {
 
     #[test]
     fn two_different_voters_can_vote_on_the_same_poll() {
-        let (env, _admin, client) = setup();
+        let (env, _admin, _token, client) = setup();
 
         client.cast_vote(&voter(&env), &1_u64, &VoteChoice::Yes);
         let tally = client.cast_vote(&voter(&env), &1_u64, &VoteChoice::No);
@@ -772,7 +870,7 @@ mod test {
 
     #[test]
     fn same_voter_can_vote_on_two_different_polls() {
-        let (env, _admin, client) = setup();
+        let (env, _admin, _token, client) = setup();
         let v = voter(&env);
 
         client.cast_vote(&v, &1_u64, &VoteChoice::Yes);
@@ -885,6 +983,120 @@ mod test {
         assert_eq!(super::consensus_bps(&tally(10, 10, 3)), (true, 5_000));
     }
 
+    // ── initiate_dispute ──────────────────────────────────────────────────────
+
+    /// Helper: set up a resolved poll and a funded initiator for dispute tests.
+    fn dispute_setup() -> (Env, Address, Address, VotingOracleClient<'static>) {
+        let (env, admin, token_addr, client) = setup();
+
+        // Set poll 1 to Resolved so it can be disputed.
+        client.set_poll_status(&1_u64, &PollStatus::Resolved);
+
+        // Create and fund the dispute initiator.
+        let initiator = Address::generate(&env);
+        let sac_client =
+            soroban_sdk::token::StellarAssetClient::new(&env, &token_addr);
+        // Mint directly to initiator (mock_all_auths bypasses admin check).
+        sac_client.mint(&initiator, &(DISPUTE_FEE * 2));
+
+        (env, admin, initiator, client)
+    }
+
+    #[test]
+    fn initiate_dispute_persists_dispute_and_transitions_status() {
+        let (env, _admin, initiator, client) = dispute_setup();
+        let evidence = String::from_str(&env, "QmEvidence123");
+
+        let dispute = client.initiate_dispute(&initiator, &1_u64, &evidence);
+
+        // Dispute fields are correct.
+        assert_eq!(dispute.poll_id, 1);
+        assert_eq!(dispute.initiator, initiator);
+        assert_eq!(dispute.dispute_fee, DISPUTE_FEE);
+        assert_eq!(dispute.admin_approvals, 0);
+        assert_eq!(dispute.required_approvals, MULTI_SIG_REQUIRED);
+        assert!(!dispute.resolved);
+        assert_eq!(dispute.initiated_at, 1_000_000);
+
+        // Poll status transitions to Disputed.
+        assert_eq!(client.get_poll_status(&1_u64), PollStatus::Disputed);
+
+        // Dispute is retrievable via get_dispute.
+        let stored = client.get_dispute(&1_u64);
+        assert_eq!(stored.poll_id, 1);
+        assert_eq!(stored.initiator, initiator);
+    }
+
+    #[test]
+    fn initiate_dispute_emits_event() {
+        use soroban_sdk::{testutils::Events, TryIntoVal};
+
+        let (env, _admin, initiator, client) = dispute_setup();
+        let evidence = String::from_str(&env, "QmEvidence123");
+
+        client.initiate_dispute(&initiator, &1_u64, &evidence);
+
+        let events = env.events().all();
+        // Find the DisputeInitiated event (skip any token transfer events).
+        let mut found = false;
+        for i in 0..events.len() {
+            let (_, topics, data) = events.get(i).unwrap();
+            let name_result: Result<soroban_sdk::Symbol, _> =
+                topics.get(0).unwrap().try_into_val(&env);
+            if let Ok(name) = name_result {
+                if name == soroban_sdk::Symbol::new(&env, "DisputeInitiated") {
+                    let event_poll_id: u64 =
+                        topics.get(1).unwrap().try_into_val(&env).unwrap();
+                    let event_initiator: Address = data.try_into_val(&env).unwrap();
+                    assert_eq!(event_poll_id, 1);
+                    assert_eq!(event_initiator, initiator);
+                    found = true;
+                }
+            }
+        }
+        assert!(found, "DisputeInitiated event must be emitted");
+    }
+
+    #[test]
+    fn initiate_dispute_rejects_unfunded_initiator() {
+        let (env, _admin, _token, client) = setup();
+        client.set_poll_status(&1_u64, &PollStatus::Resolved);
+
+        let unfunded_initiator = Address::generate(&env);
+        let evidence = String::from_str(&env, "QmEvidence123");
+
+        let err = client
+            .try_initiate_dispute(&unfunded_initiator, &1_u64, &evidence)
+            .expect_err("disputing with no fee transferred must fail");
+
+        assert_eq!(err, Ok(PredictXError::DisputeFeeRequired));
+    }
+
+    #[test]
+    fn initiate_dispute_rejects_non_resolved_poll() {
+        let (env, _admin, _token, client) = setup();
+        let initiator = Address::generate(&env);
+        let evidence = String::from_str(&env, "QmEvidence123");
+
+        // Poll 1 is in Voting status (from setup).
+        let err = client
+            .try_initiate_dispute(&initiator, &1_u64, &evidence)
+            .expect_err("disputing a non-resolved poll must fail");
+
+        assert_eq!(err, Ok(PredictXError::PollAlreadyResolved));
+    }
+
+    #[test]
+    fn initiate_dispute_rejects_unknown_poll() {
+        let (env, _admin, _token, client) = setup();
+        let initiator = Address::generate(&env);
+        let evidence = String::from_str(&env, "QmEvidence123");
+
+        let err = client
+            .try_initiate_dispute(&initiator, &999_u64, &evidence)
+            .expect_err("disputing an unknown poll must fail");
+
+        assert_eq!(err, Ok(PredictXError::PollNotFound));
     // ── voter_reward_reserve / auto_resolve reward pool ───────────────────────
 
     #[test]
