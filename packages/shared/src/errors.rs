@@ -94,4 +94,16 @@ pub enum PredictXError {
     InvalidOracle = 39,
     /// Oracle rotation was rejected because polls are still unresolved.
     OracleRotationBlocked = 40,
+    /// A team name cannot be empty.
+    EmptyTeamName = 39,
+    /// A match string field exceeds the maximum allowed length.
+    MatchStringTooLong = 40,
 }
+
+/// Alias for `EmptyTeamName` matching alternative naming conventions.
+#[allow(non_upper_case_globals)]
+pub const TeamNameEmpty: PredictXError = PredictXError::EmptyTeamName;
+
+/// Alias for `MatchStringTooLong` matching alternative naming conventions.
+#[allow(non_upper_case_globals)]
+pub const MatchFieldTooLong: PredictXError = PredictXError::MatchStringTooLong;

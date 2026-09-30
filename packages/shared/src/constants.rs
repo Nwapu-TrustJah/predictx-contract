@@ -22,6 +22,9 @@ pub const MULTI_SIG_REQUIRED: u32 = 3;
 /// Maximum length (in characters) for a poll question.
 pub const MAX_QUESTION_LENGTH: u32 = 256;
 
+/// Maximum length (in bytes) for match string fields (home team, away team, league, venue).
+pub const MAX_MATCH_STRING_LENGTH: u32 = 256;
+
 /// Maximum number of polls that can be attached to a single match.
 pub const MAX_POLLS_PER_MATCH: u32 = 50;
 

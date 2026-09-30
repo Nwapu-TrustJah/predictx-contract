@@ -1,5 +1,5 @@
 use soroban_sdk::{Address, Env, String, Symbol, Vec};
-use predictx_shared::{Match, PredictXError};
+use predictx_shared::{Match, PredictXError, MAX_MATCH_STRING_LENGTH};
 use crate::DataKey;   // ← uses prediction-market's local DataKey, not shared one
 use crate::ensure_not_paused;
 use predictx_shared::{DataKey, Match, PredictXError};
@@ -89,6 +89,18 @@ pub fn create_match(
         return Err(PredictXError::InvalidLockTime);
     }
 
+    if home_team.len() == 0 || away_team.len() == 0 {
+        return Err(PredictXError::EmptyTeamName);
+    }
+
+    if home_team.len() > MAX_MATCH_STRING_LENGTH
+        || away_team.len() > MAX_MATCH_STRING_LENGTH
+        || league.len() > MAX_MATCH_STRING_LENGTH
+        || venue.len() > MAX_MATCH_STRING_LENGTH
+    {
+        return Err(PredictXError::MatchStringTooLong);
+    }
+
     let match_id: u64 = env
         .storage()
         .instance()
@@ -145,10 +157,36 @@ pub fn update_match(
         return Err(PredictXError::MatchAlreadyStarted);
     }
 
-    if let Some(v) = home_team  { m.home_team = v; }
-    if let Some(v) = away_team  { m.away_team = v; }
-    if let Some(v) = league     { m.league    = v; }
-    if let Some(v) = venue      { m.venue     = v; }
+    if let Some(v) = home_team {
+        if v.len() == 0 {
+            return Err(PredictXError::EmptyTeamName);
+        }
+        if v.len() > MAX_MATCH_STRING_LENGTH {
+            return Err(PredictXError::MatchStringTooLong);
+        }
+        m.home_team = v;
+    }
+    if let Some(v) = away_team {
+        if v.len() == 0 {
+            return Err(PredictXError::EmptyTeamName);
+        }
+        if v.len() > MAX_MATCH_STRING_LENGTH {
+            return Err(PredictXError::MatchStringTooLong);
+        }
+        m.away_team = v;
+    }
+    if let Some(v) = league {
+        if v.len() > MAX_MATCH_STRING_LENGTH {
+            return Err(PredictXError::MatchStringTooLong);
+        }
+        m.league = v;
+    }
+    if let Some(v) = venue {
+        if v.len() > MAX_MATCH_STRING_LENGTH {
+            return Err(PredictXError::MatchStringTooLong);
+        }
+        m.venue = v;
+    }
     if let Some(kt) = kickoff_time {
         if kt <= now { return Err(PredictXError::InvalidLockTime); }
         m.kickoff_time = kt;
@@ -485,5 +523,162 @@ mod test {
         assert_eq!(err, PredictXError::Unauthorized);
         // new admin works
         default_match(&env, &client, &candidate);
+    fn make_string(env: &Env, len: usize) -> String {
+        let s = "a".repeat(len);
+        String::from_str(env, &s)
+    }
+
+    #[test]
+    fn test_create_match_rejects_empty_team_name() {
+        let (env, admin, client) = setup();
+
+        // 1. Empty home team
+        let err_home = client.try_create_match(
+            &admin,
+            &s(&env, ""),
+            &s(&env, "Chelsea"),
+            &s(&env, "Premier League"),
+            &s(&env, "Emirates"),
+            &KICKOFF,
+        ).unwrap_err().unwrap();
+        assert_eq!(err_home, PredictXError::EmptyTeamName);
+
+        // 2. Empty away team
+        let err_away = client.try_create_match(
+            &admin,
+            &s(&env, "Arsenal"),
+            &s(&env, ""),
+            &s(&env, "Premier League"),
+            &s(&env, "Emirates"),
+            &KICKOFF,
+        ).unwrap_err().unwrap();
+        assert_eq!(err_away, PredictXError::EmptyTeamName);
+
+        // 3. Both teams empty
+        let err_both = client.try_create_match(
+            &admin,
+            &s(&env, ""),
+            &s(&env, ""),
+            &s(&env, "Premier League"),
+            &s(&env, "Emirates"),
+            &KICKOFF,
+        ).unwrap_err().unwrap();
+        assert_eq!(err_both, PredictXError::EmptyTeamName);
+    }
+
+    #[test]
+    fn test_create_match_bounds_each_field_independently() {
+        let (env, admin, client) = setup();
+
+        // 1. Home team exceeding 256 bytes
+        let err_home = client.try_create_match(
+            &admin,
+            &make_string(&env, 257),
+            &s(&env, "Chelsea"),
+            &s(&env, "Premier League"),
+            &s(&env, "Emirates"),
+            &KICKOFF,
+        ).unwrap_err().unwrap();
+        assert_eq!(err_home, PredictXError::MatchStringTooLong);
+
+        // 2. Away team exceeding 256 bytes
+        let err_away = client.try_create_match(
+            &admin,
+            &s(&env, "Arsenal"),
+            &make_string(&env, 257),
+            &s(&env, "Premier League"),
+            &s(&env, "Emirates"),
+            &KICKOFF,
+        ).unwrap_err().unwrap();
+        assert_eq!(err_away, PredictXError::MatchStringTooLong);
+
+        // 3. League exceeding 256 bytes
+        let err_league = client.try_create_match(
+            &admin,
+            &s(&env, "Arsenal"),
+            &s(&env, "Chelsea"),
+            &make_string(&env, 257),
+            &s(&env, "Emirates"),
+            &KICKOFF,
+        ).unwrap_err().unwrap();
+        assert_eq!(err_league, PredictXError::MatchStringTooLong);
+
+        // 4. Venue exceeding 256 bytes
+        let err_venue = client.try_create_match(
+            &admin,
+            &s(&env, "Arsenal"),
+            &s(&env, "Chelsea"),
+            &s(&env, "Premier League"),
+            &make_string(&env, 257),
+            &KICKOFF,
+        ).unwrap_err().unwrap();
+        assert_eq!(err_venue, PredictXError::MatchStringTooLong);
+    }
+
+    #[test]
+    fn test_create_match_accepts_strings_at_exact_256_byte_bound() {
+        let (env, admin, client) = setup();
+
+        let s256_home = make_string(&env, 256);
+        let s256_away = make_string(&env, 256);
+        let s256_league = make_string(&env, 256);
+        let s256_venue = make_string(&env, 256);
+
+        let match_id = client.create_match(
+            &admin,
+            &s256_home,
+            &s256_away,
+            &s256_league,
+            &s256_venue,
+            &KICKOFF,
+        );
+        assert_eq!(match_id, 1);
+
+        let m = client.get_match(&match_id);
+        assert_eq!(m.home_team.len(), 256);
+        assert_eq!(m.away_team.len(), 256);
+        assert_eq!(m.league.len(), 256);
+        assert_eq!(m.venue.len(), 256);
+    }
+
+    #[test]
+    fn test_update_match_validates_bounds_and_empty_teams() {
+        let (env, admin, client) = setup();
+        let id = default_match(&env, &client, &admin);
+
+        // Reject empty home team update
+        let err_empty_home = client.try_update_match(
+            &admin, &id,
+            &Some(s(&env, "")), &None, &None, &None, &None,
+        ).unwrap_err().unwrap();
+        assert_eq!(err_empty_home, PredictXError::EmptyTeamName);
+
+        // Reject empty away team update
+        let err_empty_away = client.try_update_match(
+            &admin, &id,
+            &None, &Some(s(&env, "")), &None, &None, &None,
+        ).unwrap_err().unwrap();
+        assert_eq!(err_empty_away, PredictXError::EmptyTeamName);
+
+        // Reject home team > 256
+        let err_long_home = client.try_update_match(
+            &admin, &id,
+            &Some(make_string(&env, 257)), &None, &None, &None, &None,
+        ).unwrap_err().unwrap();
+        assert_eq!(err_long_home, PredictXError::MatchStringTooLong);
+
+        // Reject venue > 256
+        let err_long_venue = client.try_update_match(
+            &admin, &id,
+            &None, &None, &None, &Some(make_string(&env, 257)), &None,
+        ).unwrap_err().unwrap();
+        assert_eq!(err_long_venue, PredictXError::MatchStringTooLong);
+
+        // Accept update at exactly 256 bytes
+        let updated = client.update_match(
+            &admin, &id,
+            &Some(make_string(&env, 256)), &None, &None, &None, &None,
+        );
+        assert_eq!(updated.home_team.len(), 256);
     }
 }

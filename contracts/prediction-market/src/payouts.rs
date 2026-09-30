@@ -376,6 +376,7 @@ pub fn claim_winnings(
     } else {
         0
         }
+        }
     };
     if fee > 0 {
         token_utils::transfer_to_treasury(env, fee)?;
