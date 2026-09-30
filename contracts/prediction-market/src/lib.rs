@@ -1428,6 +1428,7 @@ impl PredictionMarket {
         staking::get_pool_info(&env, poll_id)
     }
 
+    // ── Payouts ────────────────────────────────────────────────────────────────
     /// Read-only view: return the token amount that `claim_winnings` would
     /// transfer to `user` for the given poll.  Returns `0` for every
     /// ineligible case (unresolved poll, non-staker, losing staker,
