@@ -80,6 +80,21 @@ impl PollFactory {
             outcome: None,
             resolution_time: 0,
             created_at: env.ledger().timestamp(),
+    			match_id: 0,                          // polls not linked to matches yet
+    			creator: creator.clone(),
+				question,
+				category: PollCategory::Other,
+				lock_time: lock_timestamp,
+				yes_pool: 0,
+				no_pool: 0,
+				yes_count: 0,
+				no_count: 0,
+				status: PollStatus::Active,
+				outcome: None,
+				resolver: None,
+				resolution_basis: None,
+				resolution_time: 0,
+				created_at: env.ledger().timestamp(),
         };
 
         env.storage()
