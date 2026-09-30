@@ -125,6 +125,8 @@ pub enum PredictXError {
     InvalidPollStatusTransition = 39,
     /// The platform fee exceeds the documented maximum.
     PlatformFeeTooHigh = 39,
+    /// The stake would exceed the maximum cumulative stake for this poll.
+    MaxStakePerPollExceeded = 39,
 }
 
 /// Schema version for the error discriminant layout.

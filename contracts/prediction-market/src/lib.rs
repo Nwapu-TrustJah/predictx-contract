@@ -115,6 +115,9 @@ fn lock_and_announce(env: &Env, poll: &mut Poll) -> Result<(), PredictXError> {
 }
 /// Maximum allowed platform fee in basis points (10%).
 pub const MAX_PLATFORM_FEE_BPS: u32 = 1000;
+/// Maximum cumulative amount a single address may stake on a single poll.
+/// Splitting a stake across multiple calls cannot bypass this cap.
+pub const MAX_STAKE_PER_USER_PER_POLL: i128 = 1_000_000_000;
 
 fn map_oracle_poll_status(status: voting_oracle::PollStatus) -> PollStatus {
     match status {
@@ -179,6 +182,7 @@ pub enum DataKey {
     PollEscrow(u64),
     PollOutflow(u64),
     UserStats(Address),
+    UserPollTotalStake(u64, Address),
 }
 
 /// Current on-chain schema version for stored types. Bump this whenever a
@@ -480,6 +484,20 @@ pub(crate) fn store_stake(env: &Env, poll_id: u64, stake: &Stake) {
 /// configuration entries are not archived during periods of inactivity.
 pub(crate) fn extend_instance_ttl(env: &Env) {
     env.storage().instance().extend_ttl(100, 1000);
+}
+
+/// Read the cumulative amount `user` has staked on `poll_id` so far.
+pub(crate) fn get_user_poll_total_stake(env: &Env, poll_id: u64, user: &Address) -> i128 {
+    env.storage()
+        .persistent()
+        .get(&DataKey::UserPollTotalStake(poll_id, user.clone()))
+        .unwrap_or(0)
+}
+
+pub(crate) fn set_user_poll_total_stake(env: &Env, poll_id: u64, user: &Address, total: i128) {
+    env.storage()
+        .persistent()
+        .set(&DataKey::UserPollTotalStake(poll_id, user.clone()), &total);
 }
 
 const EMERGENCY_TIMEOUT_SECS: u64 = 7 * 24 * 60 * 60;
@@ -1358,6 +1376,21 @@ impl PredictionMarket {
         extend_instance_ttl(&env);
         require_initialized(&env)?;
         staking::stake(&env, staker, poll_id, amount, side)
+        let current = get_user_poll_total_stake(&env, poll_id, &staker);
+        let new_total = current
+            .checked_add(amount)
+            .ok_or(PredictXError::InvalidAmount)?;
+        if new_total > MAX_STAKE_PER_USER_PER_POLL {
+            return Err(PredictXError::StakeLimitExceeded);
+        }
+        let result = staking::stake(&env, staker.clone(), poll_id, amount, side)?;
+        set_user_poll_total_stake(&env, poll_id, &staker, new_total);
+        Ok(result)
+    }
+
+    /// Return the cumulative amount `user` has staked on `poll_id`.
+    pub fn get_user_poll_total_stake(env: Env, poll_id: u64, user: Address) -> i128 {
+        get_user_poll_total_stake(&env, poll_id, &user)
     }
 
     pub fn get_stake_info(env: Env, poll_id: u64, user: Address) -> Result<Stake, PredictXError> {
