@@ -109,6 +109,7 @@ pub fn write_voted(env: &Env, poll_id: u64, voter: &Address) {
 
 /// Read the dispute for a poll, if one exists.
 /// Read the dispute raised against `poll_id`, if any.
+/// Read the dispute recorded for `poll_id`, if any.
 pub fn read_dispute(env: &Env, poll_id: u64) -> Option<Dispute> {
     env.storage().persistent().get(&DataKey::Dispute(poll_id))
 }
@@ -123,6 +124,7 @@ pub fn has_dispute(env: &Env, poll_id: u64) -> bool {
 
 /// Persist a dispute record.
 /// Persist the dispute raised against `poll_id`.
+/// Persist the dispute for `poll_id`.
 pub fn write_dispute(env: &Env, dispute: &Dispute) {
     env.storage()
         .persistent()

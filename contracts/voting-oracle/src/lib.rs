@@ -474,6 +474,11 @@ impl VotingOracle {
     /// `Disputed`.
     /// Open a dispute against a settled poll, escrowing `dispute_fee`.
     /// Open a dispute against a resolved poll within the dispute window.
+    /// Open a dispute against `poll_id`.
+    ///
+    /// Rejects a second dispute while an unresolved one is already open with
+    /// `DisputeAlreadyOpen`. Re-disputing after a dispute is resolved is out of
+    /// scope for this change (see [`voting::initiate_dispute`]).
     pub fn initiate_dispute(
         env: Env,
         initiator: Address,
@@ -665,6 +670,16 @@ impl VotingOracle {
     /// Return the dispute raised against `poll_id`, if any.
     pub fn get_dispute(env: Env, poll_id: u64) -> Result<Dispute, PredictXError> {
         storage::read_dispute(&env, poll_id).ok_or(PredictXError::PollNotFound)
+        dispute_fee: i128,
+    ) -> Result<Dispute, PredictXError> {
+        voting::initiate_dispute(&env, initiator, poll_id, evidence_hash, dispute_fee)
+    }
+
+    /// Read the dispute recorded for `poll_id`.
+    ///
+    /// Returns `PollNotFound` when no dispute has ever been opened for the poll.
+    pub fn get_dispute(env: Env, poll_id: u64) -> Result<Dispute, PredictXError> {
+        voting::get_dispute(&env, poll_id)
     }
 }
 

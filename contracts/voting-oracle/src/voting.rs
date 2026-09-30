@@ -168,6 +168,7 @@ fn has_user_staked(env: &Env, poll_id: u64, voter: &Address) -> Result<bool, Pre
 }
 use soroban_sdk::{token, Address, Env, Symbol};
     BPS_DENOMINATOR, DISPUTE_WINDOW_SECS, MULTI_SIG_REQUIRED, VOTING_WINDOW_SECS,
+    BPS_DENOMINATOR, MULTI_SIG_REQUIRED, VOTING_WINDOW_SECS,
 };
 use soroban_sdk::{Address, Env, String, Symbol};
 
@@ -491,6 +492,72 @@ pub fn auto_resolve(
 }
 
 /// Share of the total pool reserved for eligible voters at resolution time.
+/// Open a dispute against `poll_id`.
+///
+/// Flow (Checks → Effects):
+/// 1. Authenticates the caller as the initiator.
+/// 2. Verifies the poll is known to the oracle, else `PollNotFound`.
+/// 3. Rejects a second dispute while an unresolved one is already open, else
+///    `DisputeAlreadyOpen`.
+/// 4. Persists a fresh `Dispute` with zero approvals and returns it.
+///
+/// Policy (out of scope to build): once a dispute is resolved (`resolved ==
+/// true`) a new dispute may be opened again, since the guard only blocks
+/// *unresolved* disputes. Re-disputing after resolution is intentionally not
+/// implemented here.
+pub fn initiate_dispute(
+    env: &Env,
+    initiator: Address,
+    poll_id: u64,
+    evidence_hash: String,
+    dispute_fee: i128,
+) -> Result<Dispute, PredictXError> {
+    initiator.require_auth();
+
+    // ── Checks ────────────────────────────────────────────────────────────────
+
+    // Only accept disputes on polls the oracle already knows about.
+    if !env
+        .storage()
+        .persistent()
+        .has(&DataKey::PollStatus(poll_id))
+    {
+        return Err(PredictXError::PollNotFound);
+    }
+
+    // One poll, one open dispute: a griefer must not be able to stack disputes
+    // on the same poll and make the admin approval state meaningless.
+    if let Some(existing) = storage::read_dispute(env, poll_id) {
+        if !existing.resolved {
+            return Err(PredictXError::DisputeAlreadyOpen);
+        }
+    }
+
+    // ── Effects ───────────────────────────────────────────────────────────────
+
+    let dispute = Dispute {
+        poll_id,
+        initiator,
+        evidence_hash,
+        dispute_fee,
+        admin_approvals: 0,
+        required_approvals: MULTI_SIG_REQUIRED,
+        resolved: false,
+        initiated_at: env.ledger().timestamp(),
+    };
+
+    storage::write_dispute(env, &dispute);
+    Ok(dispute)
+}
+
+/// Read the dispute recorded for `poll_id`.
+///
+/// Returns `PollNotFound` when no dispute has ever been opened for the poll.
+pub fn get_dispute(env: &Env, poll_id: u64) -> Result<Dispute, PredictXError> {
+    storage::read_dispute(env, poll_id).ok_or(PredictXError::PollNotFound)
+}
+
+/// Share of the decisive (Yes/No) votes held by the leading outcome.
 ///
 /// Computes `total_pool * VOTER_REWARD_BPS / 10_000`, rounded down. Pure so
 /// it can be unit-tested directly: non-positive pools reserve nothing, and
@@ -560,6 +627,13 @@ pub fn initiate_dispute(
     if !voters.contains(voter.clone()) {
         return Err(PredictXError::NotEligibleVoter);
     }
+    use predictx_shared::{
+        PollStatus, PredictXError, VoteChoice, MULTI_SIG_REQUIRED, VOTING_WINDOW_SECS,
+    };
+    use soroban_sdk::{
+        testutils::{Address as _, Ledger},
+        Address, Env, String,
+    };
 
     // A voter may only ever claim once. Checked here and re-armed below before
     // any tokens move.
@@ -1570,6 +1644,55 @@ mod test {
             .expect_err("disputing with no fee transferred must fail");
 
         assert_eq!(err, Ok(PredictXError::DisputeFeeRequired));
+    }
+
+    // ── Disputes ──────────────────────────────────────────────────────────────
+
+    fn evidence(env: &Env) -> String {
+        String::from_str(env, "ipfs://evidence")
+    }
+
+    #[test]
+    fn initiate_dispute_records_and_get_dispute_returns_it() {
+        let (env, _admin, client) = setup();
+        let initiator = voter(&env);
+
+        let written = client.initiate_dispute(&initiator, &1_u64, &evidence(&env), &500_i128);
+        let read = client.get_dispute(&1_u64);
+
+        assert_eq!(read, written);
+        assert_eq!(read.poll_id, 1);
+        assert_eq!(read.initiator, initiator);
+        assert_eq!(read.evidence_hash, evidence(&env));
+        assert_eq!(read.dispute_fee, 500);
+        assert_eq!(read.admin_approvals, 0);
+        assert_eq!(read.required_approvals, MULTI_SIG_REQUIRED);
+        assert!(!read.resolved);
+        assert_eq!(read.initiated_at, 1_000_000);
+    }
+
+    #[test]
+    fn second_dispute_on_open_dispute_is_rejected() {
+        let (env, _admin, client) = setup();
+
+        client.initiate_dispute(&voter(&env), &1_u64, &evidence(&env), &500_i128);
+
+        let err = client
+            .try_initiate_dispute(&voter(&env), &1_u64, &evidence(&env), &500_i128)
+            .expect_err("a second dispute on an unresolved poll must be rejected");
+
+        assert_eq!(err, Ok(PredictXError::DisputeAlreadyOpen));
+    }
+
+    #[test]
+    fn get_dispute_on_undisputed_poll_returns_poll_not_found() {
+        let (env, _admin, client) = setup();
+
+        let err = client
+            .try_get_dispute(&1_u64)
+            .expect_err("an undisputed poll must not return a dispute");
+
+        assert_eq!(err, Ok(PredictXError::PollNotFound));
     }
 
     #[test]
