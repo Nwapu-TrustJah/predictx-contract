@@ -129,7 +129,7 @@ fn get_admin(env: &Env) -> Result<Address, PredictXError> {
         .ok_or(PredictXError::NotInitialized)
 }
 
-fn get_oracle(env: &Env) -> Result<Address, PredictXError> {
+pub(crate) fn get_oracle(env: &Env) -> Result<Address, PredictXError> {
     env.storage().instance().get(&DataKey::VotingOracle)
         .ok_or(PredictXError::NotInitialized)
 }
@@ -222,6 +222,50 @@ pub(crate) fn extend_instance_ttl(env: &Env) {
 
 const EMERGENCY_TIMEOUT_SECS: u64 = 7 * 24 * 60 * 60;
 
+/// Poll statuses for which the oracle will never be consulted again.
+fn is_terminal_poll_status(status: PollStatus) -> bool {
+    matches!(status, PollStatus::Resolved | PollStatus::Cancelled)
+}
+
+/// Whether any poll created through this contract is still open.
+///
+/// Poll ids are allocated sequentially from `NextPollId`, so a bounded scan of
+/// `1..NextPollId` visits every poll this contract has ever created.
+fn has_unresolved_polls(env: &Env) -> bool {
+    let next_poll_id: u64 = env
+        .storage()
+        .instance()
+        .get(&DataKey::NextPollId)
+        .unwrap_or(1);
+    let mut poll_id: u64 = 1;
+    while poll_id < next_poll_id {
+        if let Some(poll) = env
+            .storage()
+            .persistent()
+            .get::<DataKey, Poll>(&DataKey::Poll(poll_id))
+        {
+            if !is_terminal_poll_status(poll.status) {
+                return true;
+            }
+        }
+        poll_id += 1;
+    }
+    false
+}
+
+/// Confirm `oracle_id` is a live, initialised `VotingOracle`.
+///
+/// Probes the well-known `admin` view over the oracle interface. A missing
+/// contract, a non-oracle contract, or an uninitialised oracle all fail this
+/// check and map to `PredictXError::InvalidOracle`.
+fn assert_compatible_oracle(env: &Env, oracle_id: &Address) -> Result<(), PredictXError> {
+    let client = voting_oracle::Client::new(env, oracle_id);
+    match client.try_admin() {
+        Ok(Ok(_)) => Ok(()),
+        _ => Err(PredictXError::InvalidOracle),
+    }
+}
+
 #[contractimpl]
 impl PredictionMarket {
     pub fn initialize(
@@ -301,12 +345,34 @@ impl PredictionMarket {
     pub fn admin(env: Env) -> Result<Address, PredictXError> { get_admin(&env) }
     pub fn oracle(env: Env) -> Result<Address, PredictXError> { get_oracle(&env) }
 
+    /// Rotate the voting oracle that governs this market.
+    ///
+    /// Rotation is refused while any poll is still unresolved: a replacement
+    /// oracle has no record of the existing poll ids, so in-flight polls would
+    /// silently fall back to `Active` with `updated_at = 0`, emergency claims
+    /// would stop being eligible, and already-staked funds would become
+    /// unrecoverable. The target must also be a live, initialised
+    /// `VotingOracle`. On success an `OracleChanged(previous, next)` event is
+    /// emitted.
     pub fn set_oracle(env: Env, voting_oracle: Address) -> Result<(), PredictXError> {
         extend_instance_ttl(&env);
         ensure_not_paused(&env)?;
         let admin = get_admin(&env)?;
         admin.require_auth();
+
+        let previous = get_oracle(&env)?;
+
+        if has_unresolved_polls(&env) {
+            return Err(PredictXError::OracleRotationBlocked);
+        }
+
+        assert_compatible_oracle(&env, &voting_oracle)?;
+
         env.storage().instance().set(&DataKey::VotingOracle, &voting_oracle);
+        env.events().publish(
+            (Symbol::new(&env, "OracleChanged"),),
+            (previous, voting_oracle),
+        );
         Ok(())
     }
 
@@ -479,7 +545,8 @@ impl PredictionMarket {
     }
 
 
-    /// Resolve a poll with a boolean outcome. Callable only by the registered oracle.
+    /// Resolve a poll with a boolean outcome. Callable only by the registered
+    /// oracle; delegates to [`payouts::resolve_poll`].
     pub fn resolve_poll(
         env: Env,
         caller: Address,
@@ -513,6 +580,14 @@ impl PredictionMarket {
         }
 
         Ok(poll)
+        payouts::resolve_poll(&env, caller, poll_id, outcome)
+    }
+
+    pub fn get_poll(env: Env, poll_id: u64) -> Result<Poll, PredictXError> {
+        env.storage()
+            .persistent()
+            .get(&DataKey::Poll(poll_id))
+            .ok_or(PredictXError::PollNotFound)
     }
 
     // ── Staking ───────────────────────────────────────────────────────────────
@@ -1334,4 +1409,132 @@ mod test {
         );
         assert_eq!(client.get_user_win_rate(&pending), 0);
     }
+    // ── set_oracle rotation guard (issue #233) ────────────────────────────────
+
+    /// Register and initialise a second, real voting oracle.
+    fn register_oracle(env: &Env, admin: &Address) -> Address {
+        let oracle_id = env.register(voting_oracle::WASM, ());
+        let client = voting_oracle::Client::new(env, &oracle_id);
+        client.initialize(admin);
+        oracle_id
+    }
+
+    /// Create a match plus a single still-open poll, returning the poll id.
+    fn create_open_poll(
+        env: &Env,
+        admin: &Address,
+        client: &PredictionMarketClient,
+        lock_time: u64,
+    ) -> u64 {
+        let match_id = client.create_match(
+            admin,
+            &String::from_str(env, "Arsenal"),
+            &String::from_str(env, "Chelsea"),
+            &String::from_str(env, "Premier League"),
+            &String::from_str(env, "Emirates"),
+            &(lock_time + 3_600),
+        );
+        client.create_poll(
+            admin,
+            &match_id,
+            &String::from_str(env, "Will the home team win?"),
+            &PollCategory::TeamEvent,
+            &lock_time,
+        )
+    }
+
+    #[test]
+    fn set_oracle_rejects_incompatible_target() {
+        let (env, _admin, oracle_id, _contract_id, client) = setup_emergency_env();
+
+        // A registered but uninitialised oracle is not a usable target.
+        let uninitialised = env.register(voting_oracle::WASM, ());
+        let err = client
+            .try_set_oracle(&uninitialised)
+            .expect_err("uninitialised oracle must be rejected");
+        assert_eq!(err, Ok(PredictXError::InvalidOracle));
+
+        // A plain account address is not a contract at all.
+        let not_a_contract = Address::generate(&env);
+        let err = client
+            .try_set_oracle(&not_a_contract)
+            .expect_err("non-contract address must be rejected");
+        assert_eq!(err, Ok(PredictXError::InvalidOracle));
+
+        // Neither attempt may have changed the governing oracle.
+        assert_eq!(client.oracle(), oracle_id);
+    }
+
+    #[test]
+    fn set_oracle_rejects_rotation_while_polls_unresolved() {
+        let (env, admin, oracle_id, _contract_id, client) = setup_emergency_env();
+        env.ledger().set_timestamp(1_000_000);
+
+        let _poll_id = create_open_poll(&env, &admin, &client, 1_500_000);
+        let replacement = register_oracle(&env, &admin);
+
+        let err = client
+            .try_set_oracle(&replacement)
+            .expect_err("rotation must be refused while a poll is open");
+        assert_eq!(err, Ok(PredictXError::OracleRotationBlocked));
+        assert_eq!(client.oracle(), oracle_id);
+    }
+
+    #[test]
+    fn set_oracle_emits_oracle_changed_after_all_polls_resolve() {
+        use soroban_sdk::{testutils::Events, Symbol, TryIntoVal};
+
+        let (env, admin, previous_oracle, _contract_id, client) = setup_emergency_env();
+        env.ledger().set_timestamp(1_000_000);
+
+        let poll_id = create_open_poll(&env, &admin, &client, 1_500_000);
+        // Resolving the only poll clears the guard.
+        client.resolve_poll(&previous_oracle, &poll_id, &true);
+        assert_eq!(client.get_poll(&poll_id).status, PollStatus::Resolved);
+
+        let next_oracle = register_oracle(&env, &admin);
+        client.set_oracle(&next_oracle);
+
+        assert_eq!(client.oracle(), next_oracle);
+
+        let events = env.events().all();
+        let mut oracle_changed = false;
+        for i in 0..events.len() {
+            let (_, topics, data) = events.get(i).unwrap();
+            let name: Symbol = topics.get(0).unwrap().try_into_val(&env).unwrap();
+            if name == Symbol::new(&env, "OracleChanged") {
+                let (previous, next): (Address, Address) =
+                    data.try_into_val(&env).unwrap();
+                assert_eq!(previous, previous_oracle);
+                assert_eq!(next, next_oracle);
+                oracle_changed = true;
+            }
+        }
+        assert!(oracle_changed, "OracleChanged(previous, next) must be emitted");
+    }
+
+    #[test]
+    fn emergency_eligibility_unchanged_when_rotation_rejected() {
+        let (env, admin, oracle_id, _contract_id, client) = setup_emergency_env();
+        let oracle_client = voting_oracle::Client::new(&env, &oracle_id);
+
+        env.ledger().set_timestamp(1_000_000);
+        let poll_id = create_open_poll(&env, &admin, &client, 1_500_000);
+
+        // The governing oracle reports an in-flight dispute past the timeout.
+        oracle_client.set_poll_status(&poll_id, &voting_oracle::PollStatus::Disputed);
+        env.ledger().set_timestamp(1_000_000 + EMERGENCY_TIMEOUT_SECS + 1);
+        assert!(client.check_emergency_eligible(&poll_id));
+
+        let replacement = register_oracle(&env, &admin);
+        let err = client
+            .try_set_oracle(&replacement)
+            .expect_err("rotation must be refused while the dispute is open");
+        assert_eq!(err, Ok(PredictXError::OracleRotationBlocked));
+
+        // The failed rotation leaves the oracle and emergency eligibility intact.
+        assert_eq!(client.oracle(), oracle_id);
+        assert!(client.check_emergency_eligible(&poll_id));
+    }
+
 }

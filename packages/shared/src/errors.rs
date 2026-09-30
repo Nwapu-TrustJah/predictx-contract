@@ -90,4 +90,8 @@ pub enum PredictXError {
     NotEligibleVoter = 36,
     /// The dispute window has closed; the poll can no longer be disputed.
     DisputeWindowClosed = 36,
+    /// The address supplied as the voting oracle is not a compatible oracle.
+    InvalidOracle = 39,
+    /// Oracle rotation was rejected because polls are still unresolved.
+    OracleRotationBlocked = 40,
 }
