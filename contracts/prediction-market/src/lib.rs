@@ -1040,8 +1040,9 @@ extern crate std;
 mod test {
     use super::*;
     use predictx_shared::{PollCategory, StakeSide};
-    use soroban_sdk::testutils::{Address as _, Ledger};
+    use soroban_sdk::testutils::{Address as _, Ledger, MockAuth, MockAuthInvoke};
     use soroban_sdk::token;
+    use soroban_sdk::IntoVal;
 
     /// Default platform fee BPS for tests (5%).
     const TEST_FEE_BPS: u32 = 500;
@@ -1647,6 +1648,8 @@ mod test {
     fn get_poll_status_returns_poll_not_found_for_unknown_poll() {
         let env = Env::default();
         env.mock_all_auths();
+    fn create_poll_and_pause_enforce_auth() {
+        let env = Env::default();
         let contract_id = env.register(PredictionMarket, ());
         let client = PredictionMarketClient::new(&env, &contract_id);
         let admin = Address::generate(&env);
@@ -2280,4 +2283,103 @@ mod test {
     }
 
 }
+}
+
+        client
+            .mock_auths(&[MockAuth {
+                address: &admin,
+                invoke: &MockAuthInvoke {
+                    contract: &contract_id,
+                    fn_name: "initialize",
+                    args: (&admin, &oracle, &tok, &treasury, TEST_FEE_BPS).into_val(&env),
+                    sub_invokes: &[],
+                },
+            }])
+            .initialize(&admin, &oracle, &tok, &treasury, &TEST_FEE_BPS);
+
+        // pause without admin auth must fail
+        let err = client
+            .mock_auths(&[])
+            .try_pause(&admin);
+        assert!(err.is_err(), "pause without admin auth must fail");
+
+        // pause with admin auth succeeds
+        client
+            .mock_auths(&[MockAuth {
+                address: &admin,
+                invoke: &MockAuthInvoke {
+                    contract: &contract_id,
+                    fn_name: "pause",
+                    args: (&admin,).into_val(&env),
+                    sub_invokes: &[],
+                },
+            }])
+            .pause(&admin);
+
+        assert!(client.is_paused());
+
+        // unpause with admin auth
+        client
+            .mock_auths(&[MockAuth {
+                address: &admin,
+                invoke: &MockAuthInvoke {
+                    contract: &contract_id,
+                    fn_name: "unpause",
+                    args: (&admin,).into_val(&env),
+                    sub_invokes: &[],
+                },
+            }])
+            .unpause(&admin);
+
+        assert!(!client.is_paused());
+
+        // Seed match 1
+        let dummy_match = Match {
+            match_id: 1,
+            home_team: String::from_str(&env, "Team A"),
+            away_team: String::from_str(&env, "Team B"),
+            league: String::from_str(&env, "League"),
+            venue: String::from_str(&env, "Venue"),
+            kickoff_time: 10_000,
+            created_by: admin.clone(),
+            is_finished: false,
+        };
+        env.as_contract(&contract_id, || {
+            env.storage().persistent().set(&DataKey::Match(1), &dummy_match);
+        });
+
+        let creator = Address::generate(&env);
+        let question = String::from_str(&env, "Will Team A win?");
+        let lock_time = 5_000_u64;
+
+        // create_poll without creator auth must fail
+        let err = client
+            .mock_auths(&[])
+            .try_create_poll(&creator, &1_u64, &question, &PollCategory::TeamEvent, &lock_time);
+        assert!(err.is_err(), "create_poll without creator auth must fail");
+
+        // create_poll with targeted creator auth succeeds
+        let poll_id = client
+            .mock_auths(&[MockAuth {
+                address: &creator,
+                invoke: &MockAuthInvoke {
+                    contract: &contract_id,
+                    fn_name: "create_poll",
+                    args: (
+                        &creator,
+                        1_u64,
+                        question.clone(),
+                        PollCategory::TeamEvent,
+                        lock_time,
+                    )
+                        .into_val(&env),
+                    sub_invokes: &[],
+                },
+            }])
+            .create_poll(&creator, &1_u64, &question, &PollCategory::TeamEvent, &lock_time);
+
+        assert_eq!(poll_id, 1);
+        let poll = client.get_poll(&poll_id);
+        assert_eq!(poll.creator, creator);
+    }
 }

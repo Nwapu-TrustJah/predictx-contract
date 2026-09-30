@@ -768,6 +768,8 @@ mod test {
     use super::*; 
     use soroban_sdk::testutils::{Address as _, Ledger};
     use soroban_sdk::testutils::{Address as _, Ledger as _};
+    use soroban_sdk::testutils::{Address as _, Ledger as _, MockAuth, MockAuthInvoke};
+    use soroban_sdk::IntoVal;
 
     #[test]
     fn set_and_get_status() {
@@ -1251,5 +1253,84 @@ mod test {
 
         assert_eq!(err, Ok(PredictXError::Unauthorized));
         assert!(client.is_admin(&admin));
+    }
+
+    #[test]
+    fn add_admin_and_cast_vote_enforce_auth() {
+        let env = Env::default();
+        let contract_id = env.register(VotingOracle, ());
+        let client = VotingOracleClient::new(&env, &contract_id);
+
+        let admin = Address::generate(&env);
+        client
+            .mock_auths(&[MockAuth {
+                address: &admin,
+                invoke: &MockAuthInvoke {
+                    contract: &contract_id,
+                    fn_name: "initialize",
+                    args: (&admin,).into_val(&env),
+                    sub_invokes: &[],
+                },
+            }])
+            .initialize(&admin);
+
+        let new_admin = Address::generate(&env);
+
+        // add_admin without caller auth must fail
+        let err = client
+            .mock_auths(&[])
+            .try_add_admin(&admin, &new_admin);
+        assert!(err.is_err(), "add_admin without caller auth must fail");
+
+        // add_admin with targeted admin auth succeeds
+        client
+            .mock_auths(&[MockAuth {
+                address: &admin,
+                invoke: &MockAuthInvoke {
+                    contract: &contract_id,
+                    fn_name: "add_admin",
+                    args: (&admin, &new_admin).into_val(&env),
+                    sub_invokes: &[],
+                },
+            }])
+            .add_admin(&admin, &new_admin);
+
+        assert!(client.is_admin(&new_admin));
+
+        // Open voting window with admin auth
+        client
+            .mock_auths(&[MockAuth {
+                address: &admin,
+                invoke: &MockAuthInvoke {
+                    contract: &contract_id,
+                    fn_name: "set_poll_status",
+                    args: (10_u64, PollStatus::Voting).into_val(&env),
+                    sub_invokes: &[],
+                },
+            }])
+            .set_poll_status(&10_u64, &PollStatus::Voting);
+
+        let voter = Address::generate(&env);
+
+        // cast_vote without voter auth must fail
+        let err = client
+            .mock_auths(&[])
+            .try_cast_vote(&voter, &10_u64, &VoteChoice::Yes);
+        assert!(err.is_err(), "cast_vote without voter auth must fail");
+
+        // cast_vote with targeted voter auth succeeds
+        client
+            .mock_auths(&[MockAuth {
+                address: &voter,
+                invoke: &MockAuthInvoke {
+                    contract: &contract_id,
+                    fn_name: "cast_vote",
+                    args: (&voter, 10_u64, VoteChoice::Yes).into_val(&env),
+                    sub_invokes: &[],
+                },
+            }])
+            .cast_vote(&voter, &10_u64, &VoteChoice::Yes);
+
+        assert!(client.has_voted(&10_u64, &voter));
     }
 }
