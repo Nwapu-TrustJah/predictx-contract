@@ -241,3 +241,6 @@ pub struct ParamProposal {
     /// Admin address that submitted the proposal.
     pub proposer: Address,
 }
+    /// Contract that owns and mutates this record (voting-oracle).
+    pub stats_owner: Address,
+}

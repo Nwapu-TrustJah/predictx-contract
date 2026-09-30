@@ -173,6 +173,7 @@ use soroban_sdk::{token, Address, Env, Symbol};
 use crate::{storage, MAX_VOTERS};
 use predictx_shared::{
     DataKey, PollStatus, PredictXError, VoteChoice, VoteTally, AUTO_RESOLVE_THRESHOLD_BPS,
+    PollStatus, PredictXError, UserStats, VoteChoice, VoteTally, AUTO_RESOLVE_THRESHOLD_BPS,
     BPS_DENOMINATOR, VOTING_WINDOW_SECS,
 };
 use soroban_sdk::{Address, Env, String, Symbol};
@@ -318,6 +319,14 @@ pub fn cast_vote(
     // Persist the choice itself (not just the count) so reward eligibility can
     // be checked against the resolved outcome later.
     storage::write_vote_choice(env, poll_id, &voter, choice);
+
+    // Bump the voter's lifetime `votes_cast` counter. The `UserStats` record is
+    // owned by this contract for the community-voting fields; the staking-side
+    // fields are written by PredictionMarket into its own record, and the
+    // frontend reads both side by side.
+    let mut stats = storage::read_user_stats(env, &voter);
+    stats.votes_cast = stats.votes_cast.saturating_add(1);
+    storage::write_user_stats(env, &voter, &stats);
     Ok(tally)
 }
 
@@ -404,6 +413,12 @@ pub fn claim_reward(env: &Env, voter: Address, poll_id: u64) -> Result<i128, Pre
     env.storage()
         .persistent()
         .set(&DataKey::VoterReward(poll_id, voter.clone()), &share);
+
+    // Accumulate the voter's lifetime reward earnings across every poll they
+    // have claimed on. `share` is zero for an unfunded poll, which is a no-op.
+    let mut stats = storage::read_user_stats(env, &voter);
+    stats.voting_rewards_earned = stats.voting_rewards_earned.saturating_add(share);
+    storage::write_user_stats(env, &voter, &stats);
 
     env.events()
         .publish((Symbol::new(env, "RewardClaimed"), poll_id, voter), share);
@@ -2352,6 +2367,69 @@ mod test {
 
         assert_eq!(err, Ok(PredictXError::PollNotActive));
         assert_eq!(client.get_poll_status(&1_u64), PollStatus::Voting);
+    }
+
+    // ── UserStats (#106) ──────────────────────────────────────────────────────
+
+    #[test]
+    fn votes_cast_increments_once_per_vote_across_polls() {
+        let (env, _admin, client) = setup();
+        let v = voter(&env);
+
+        client.cast_vote(&v, &1_u64, &VoteChoice::Yes);
+        client.set_poll_status(&2_u64, &PollStatus::Voting);
+        client.cast_vote(&v, &2_u64, &VoteChoice::No);
+
+        let stats = client.get_user_stats(&v);
+        assert_eq!(stats.votes_cast, 2);
+        assert_eq!(stats.voting_rewards_earned, 0);
+    }
+
+    #[test]
+    fn voting_rewards_earned_accumulates_across_polls() {
+        let (env, admin, client) = setup();
+        let winner = voter(&env);
+        client.cast_vote(&winner, &1_u64, &VoteChoice::Yes);
+        for _ in 0..29 {
+            client.cast_vote(&voter(&env), &1_u64, &VoteChoice::Yes);
+        }
+        fund_and_resolve_yes(&env, &client, &admin, 300);
+        assert_eq!(client.claim_reward(&winner, &1_u64), 10);
+
+        // Second poll: same voter wins again and earns another share.
+        client.set_poll_status(&2_u64, &PollStatus::Voting);
+        client.cast_vote(&winner, &2_u64, &VoteChoice::Yes);
+        for _ in 0..29 {
+            client.cast_vote(&voter(&env), &2_u64, &VoteChoice::Yes);
+        }
+        client.set_reward_pool(&admin, &2_u64, &600);
+        env.ledger().set_timestamp(2_000_000 + VOTING_WINDOW_SECS);
+        assert_eq!(client.auto_resolve(&2_u64), VoteChoice::Yes);
+        assert_eq!(client.claim_reward(&winner, &2_u64), 20);
+
+        let stats = client.get_user_stats(&winner);
+        assert_eq!(stats.votes_cast, 2);
+        assert_eq!(stats.voting_rewards_earned, 30);
+    }
+
+    #[test]
+    fn losing_voter_stats_unchanged_on_rejected_claim() {
+        let (env, admin, client) = setup();
+        let loser = voter(&env);
+        client.cast_vote(&loser, &1_u64, &VoteChoice::No);
+        for _ in 0..30 {
+            client.cast_vote(&voter(&env), &1_u64, &VoteChoice::Yes);
+        }
+        fund_and_resolve_yes(&env, &client, &admin, 300);
+
+        let err = client
+            .try_claim_reward(&loser, &1_u64)
+            .expect_err("losing voter must not be paid");
+        assert_eq!(err, Ok(PredictXError::VoterNotEligible));
+
+        let stats = client.get_user_stats(&loser);
+        assert_eq!(stats.votes_cast, 1);
+        assert_eq!(stats.voting_rewards_earned, 0);
     }
 }
 
