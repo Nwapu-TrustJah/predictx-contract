@@ -72,6 +72,8 @@ pub(crate) enum DataKey {
     PollOutcome(u64),
     /// `poll_id` → persistent roster of voters who cast a vote.
     Voters(u64),
+    /// `poll_id` → `Dispute`. (Persistent)
+    Dispute(u64),
     /// `(poll_id, voter)` → `bool` — has this voter cast a vote? (Temporary)
     HasVoted(u64, Address),
     /// `poll_id` → `Dispute`. (Persistent)
@@ -386,6 +388,14 @@ impl VotingOracle {
             .ok_or(PredictXError::PollNotFound)
     }
 
+    /// Resolve an open dispute on a poll under admin / multi-sig control.
+    pub fn resolve_dispute(
+        env: Env,
+        admin: Address,
+        poll_id: u64,
+        final_outcome: VoteChoice,
+    ) -> Result<(), PredictXError> {
+        voting::resolve_dispute(&env, admin, poll_id, final_outcome)
     /// Initiate a dispute against a resolved poll.
     ///
     /// The initiator must transfer the fixed dispute fee into the contract.
