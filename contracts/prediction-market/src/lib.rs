@@ -19,6 +19,7 @@ use predictx_shared::{
     MAX_POLLS_PER_MATCH, MAX_QUESTION_LENGTH,
     Match, ParamKey, ParamProposal, PlatformStats, Poll, PollCategory, PollStatus, PredictXError,
     Stake, StakeSide, MAX_POLLS_PER_MATCH, PARAM_TIMELOCK_DELAY,
+    UserStats, MAX_POLLS_PER_MATCH,
 };
 use soroban_sdk::{contract, contractimpl, contracttype, token, Address, Env, String, Symbol, Vec};
 
@@ -164,6 +165,8 @@ pub enum DataKey {
     // ── parameter timelock keys ───────────────────────────────────────────────
     /// Stores a pending `ParamProposal` for a given `ParamKey`.
     ParamProposal(ParamKey),
+    /// `user` → `UserStats` per-user activity aggregates. (Persistent)
+    UserStats(Address),
 }
 
 /// Pool state returned by `get_pool_info`.
@@ -1041,6 +1044,9 @@ impl PredictionMarket {
 
     /// Resolve a poll with a boolean outcome. Callable only by the registered
     /// oracle; delegates to [`payouts::resolve_poll`].
+    /// Resolve a poll with a boolean outcome, recording it in the payouts
+    /// engine. Callable by the admin or the registered oracle — whichever
+    /// authority resolves the poll first wins.
     pub fn resolve_poll(
     /// Resolve a poll with a boolean outcome. Callable only by the registered oracle.
     pub fn oracle_resolve_poll(
@@ -1099,6 +1105,7 @@ impl PredictionMarket {
         store_poll(&env, &poll);
 
         Ok(())
+        payouts::resolve_poll(&env, caller, poll_id, outcome)
     }
 
     /// Check whether a poll is currently open for staking, combining its lifecycle
@@ -1154,6 +1161,11 @@ impl PredictionMarket {
 
     pub fn has_user_staked(env: Env, poll_id: u64, user: Address) -> bool {
         staking::has_user_staked(&env, poll_id, &user)
+    }
+
+    /// Per-user activity statistics (dashboard read path).
+    pub fn get_user_stats(env: Env, user: Address) -> UserStats {
+        staking::get_user_stats(&env, &user)
     }
 
     pub fn calculate_potential_winnings(

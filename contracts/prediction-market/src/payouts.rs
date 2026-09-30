@@ -98,6 +98,11 @@ use crate::{DataKey, get_platform_stats, set_platform_stats, token_utils, load_p
 /// Only the address stored as the market's voting oracle may resolve polls;
 /// this is the implementation behind the market's `resolve_poll` entry point.
 /// Resolve a poll using the configured admin or oracle and record its final outcome.
+/// Resolve a poll and record its final outcome in the payouts engine.
+///
+/// Callable by the **admin** (manual resolution) or the registered **voting
+/// oracle** (automated resolution flow) — whichever authority resolves the
+/// poll first wins; subsequent calls fail with `PollAlreadyResolved`.
 pub fn resolve_poll(
     env: &Env,
     caller: Address,
@@ -110,6 +115,8 @@ pub fn resolve_poll(
     if caller != oracle {
     ensure_not_paused(env)?;
     admin.require_auth();
+
+    // ── Authorisation: admin or registered oracle ─────────────────────────
     let stored_admin: Address = env
         .storage()
         .instance()
@@ -129,6 +136,15 @@ pub fn resolve_poll(
         .ok_or(PredictXError::PollNotFound)?;
     if poll.outcome.is_some() {
         return Err(PredictXError::PollAlreadyResolved);
+    if caller != stored_admin {
+        let oracle_id: Address = env
+            .storage()
+            .instance()
+            .get(&DataKey::VotingOracle)
+            .ok_or(PredictXError::NotInitialized)?;
+        if caller != oracle_id {
+            return Err(PredictXError::Unauthorized);
+        }
     }
 
     poll.outcome = Some(outcome);
@@ -453,6 +469,13 @@ pub fn claim_winnings(env: &Env, claimant: Address, poll_id: u64) -> Result<i128
             // Nothing was staked on the losing side, so there is no opposing
             // liquidity to share and no "winner's profit" to skim a fee from.
             // Mirrors `calculate_winnings`.
+        // No-contest (issue #73): nothing was staked on the losing side, so
+        // there is no pot to skim a platform fee from. Every winner is
+        // refunded their exact stake rather than a fee-discounted share of a
+        // one-sided pool. Mirrors `calculate_winnings`.
+        let losing_pool = if outcome_yes { poll.no_pool } else { poll.yes_pool };
+
+        if losing_pool <= 0 {
             stake.amount
         } else {
             // Proportional share of total pool, after platform fee.
@@ -508,6 +531,7 @@ pub fn claim_winnings(env: &Env, claimant: Address, poll_id: u64) -> Result<i128
         gross.saturating_sub(payout)
     } else {
         0
+        }
         }
         }
         }
@@ -783,6 +807,15 @@ mod test {
     fn mint_tokens(s: &TestSetup, to: &Address, amount: i128) {
         let sac = token::StellarAssetClient::new(&s.env, &s.token_addr);
         sac.mint(to, &amount);
+    }
+
+    /// Create a fresh user, fund them and place a stake on `poll_id`.
+    /// Returns the user address.
+    fn stake_user(s: &TestSetup, poll_id: u64, side: StakeSide, amount: i128) -> Address {
+        let user = Address::generate(&s.env);
+        mint_tokens(s, &user, amount);
+        s.client.stake(&user, &poll_id, &amount, &side);
+        user
     }
 
     fn token_balance(s: &TestSetup, addr: &Address) -> i128 {
