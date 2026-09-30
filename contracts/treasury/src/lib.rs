@@ -15,6 +15,7 @@ const INSTANCE_TTL_THRESHOLD: u32 = 518_400;
 /// Extend to at least this many ledgers from now.
 const INSTANCE_TTL_EXTEND_TO: u32 = 518_400;
 use soroban_sdk::{contract, contractimpl, contracttype, token, Address, Env};
+use soroban_sdk::{contract, contractimpl, contracttype, symbol_short, token, Address, Env, Symbol};
 
 /// Schema version for the treasury contract's stored layout.
 ///
@@ -69,6 +70,9 @@ fn get_oracle(env: &Env) -> Result<Address, PredictXError> {
         .get(&DataKey::Oracle)
         .ok_or(PredictXError::NotInitialized)
 }
+const FEES_DEPOSITED: Symbol = symbol_short!("fees_dep");
+const FEES_WITHDRAWN: Symbol = symbol_short!("fees_wdr");
+const REWARDS_FUNDED: Symbol = symbol_short!("rwd_fund");
 
 fn get_balance(env: &Env, who: &Address) -> i128 {
     env.storage()
@@ -166,6 +170,8 @@ impl Treasury {
         env.storage()
             .persistent()
             .set(&DataKey::Balance(from), &new_balance);
+        env.events()
+            .publish((FEES_DEPOSITED, from.clone()), amount);
         Ok(new_balance)
     }
 
@@ -196,6 +202,8 @@ impl Treasury {
         env.storage()
             .persistent()
             .set(&DataKey::Balance(from), &new_balance);
+        env.events()
+            .publish((FEES_DEPOSITED, from.clone()), amount);
         Ok(new_balance)
     }
 
@@ -240,6 +248,8 @@ impl Treasury {
         }
 
         token_client.transfer(&treasury_address, &to, &amount);
+        env.events()
+            .publish((FEES_WITHDRAWN, to.clone()), amount);
         Ok(())
     }
 
@@ -248,6 +258,27 @@ impl Treasury {
             return Err(PredictXError::NotInitialized);
         }
         Ok(get_balance(&env, &who))
+    }
+
+    /// Fund rewards for a poll. Only callable by the registered market.
+    pub fn fund_rewards(
+        env: Env,
+        from: Address,
+        poll_id: u64,
+        amount: i128,
+    ) -> Result<(), PredictXError> {
+        if amount <= 0 {
+            return Err(PredictXError::StakeAmountZero);
+        }
+        let registered_market = get_market(&env)?;
+        if from != registered_market {
+            return Err(PredictXError::Unauthorized);
+        }
+        from.require_auth();
+
+        env.events()
+            .publish((REWARDS_FUNDED, poll_id), amount);
+        Ok(())
     }
 }
 
@@ -608,6 +639,70 @@ mod test {
     #[test]
     fn deposit_and_set_market_enforce_auth() {
         let env = Env::default();
+    // ── event emission tests ───────────────────────────────────────────────
+
+    #[test]
+    fn deposit_fees_emits_event() {
+        use soroban_sdk::testutils::Events as _;
+
+        let env = Env::default();
+        env.mock_all_auths();
+
+        let contract_id = env.register(Treasury, ());
+        let client = TreasuryClient::new(&env, &contract_id);
+
+        let admin = Address::generate(&env);
+        client.initialize(&admin);
+
+        let market = Address::generate(&env);
+        client.set_market(&admin, &market);
+
+        client.deposit_fees(&market, &500_i128);
+
+        let events = env.events().all();
+        let last = events.last().unwrap();
+        assert_eq!(last.0, contract_id);
+        let topics = last.1;
+        assert_eq!(topics.len(), 2);
+        assert_eq!(
+            topics.get(0).unwrap(),
+            FEES_DEPOSITED.into_val(&env)
+        );
+        assert_eq!(topics.get(1).unwrap(), market.into_val(&env));
+        assert_eq!(last.2, 500_i128.into_val(&env));
+    }
+
+    #[test]
+    fn withdraw_fees_emits_event() {
+        use soroban_sdk::testutils::Events as _;
+
+        let (env, contract_id, client, admin, token_address) = setup();
+        let recipient = Address::generate(&env);
+        let asset = token::StellarAssetClient::new(&env, &token_address);
+        asset.mint(&contract_id, &250_i128);
+
+        client.withdraw_fees(&admin, &recipient, &75_i128);
+
+        let events = env.events().all();
+        let last = events.last().unwrap();
+        assert_eq!(last.0, contract_id);
+        let topics = last.1;
+        assert_eq!(topics.len(), 2);
+        assert_eq!(
+            topics.get(0).unwrap(),
+            FEES_WITHDRAWN.into_val(&env)
+        );
+        assert_eq!(topics.get(1).unwrap(), recipient.into_val(&env));
+        assert_eq!(last.2, 75_i128.into_val(&env));
+    }
+
+    #[test]
+    fn rejected_deposit_fees_emits_no_event() {
+        use soroban_sdk::testutils::Events as _;
+
+        let env = Env::default();
+        env.mock_all_auths();
+
         let contract_id = env.register(Treasury, ());
         let client = TreasuryClient::new(&env, &contract_id);
 
@@ -670,5 +765,15 @@ mod test {
 
         assert_eq!(new_bal, 50_i128);
         assert_eq!(client.balance(&user), 50_i128);
+        client.initialize(&admin);
+
+        let market = Address::generate(&env);
+        client.set_market(&admin, &market);
+
+        let unauthorized = Address::generate(&env);
+        let _ = client.try_deposit_fees(&unauthorized, &100_i128);
+
+        let events = env.events().all();
+        assert_eq!(events.len(), 0);
     }
 }
