@@ -157,6 +157,8 @@ pub enum DataKey {
     NextPollId,
     Match(u64),
     MatchPolls(u64),
+    // ── duplicate-question guard ──────────────────────────────────────────────
+    MatchQuestionHashes(u64),
     // ── poll & staking keys ───────────────────────────────────────────────────
     Poll(u64),
     /// `status` → `Vec<u64>` poll IDs currently in that status bucket.

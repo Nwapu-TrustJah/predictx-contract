@@ -16,6 +16,7 @@ use predictx_shared::DataKey;
 use crate::DataKey;
 use predictx_shared::{Match, PredictXError};
 use soroban_sdk::{Address, Env, String, Symbol, Vec}; // ← uses prediction-market's local DataKey, not shared one
+use crate::MAX_POLLS_PER_MATCH;
 
 // ── Internal helper ───────────────────────────────────────────────────────────
 
@@ -48,6 +49,37 @@ pub enum Error {
     InvalidLockTime = 1,
     MatchAlreadyStarted = 2,
 }
+// ── Question hashing helper ───────────────────────────────────────────────────
+
+/// Normalize a question by trimming surrounding whitespace and lowercasing,
+/// then hash it into a stable u64 key for duplicate detection.
+fn hash_question(env: &Env, question: &String) -> u64 {
+    let len = question.len();
+    let mut buf = [0u8; 128];
+    let n = if len > 128 { 128 } else { len };
+    question.copy_into_slice(&mut buf[..n as usize]);
+
+    // Trim leading/trailing ASCII whitespace.
+    let mut start = 0usize;
+    let mut end = n as usize;
+    while start < end && (buf[start] as char).is_whitespace() {
+        start += 1;
+    }
+    while end > start && (buf[end - 1] as char).is_whitespace() {
+        end -= 1;
+    }
+
+    // FNV-1a hash over lowercased bytes.
+    let mut hash: u64 = 0xcbf29ce484222325;
+    for i in start..end {
+        let b = (buf[i] as char).to_ascii_lowercase() as u8;
+        hash ^= b as u64;
+        hash = hash.wrapping_mul(0x100000001b3);
+    }
+    hash
+}
+
+// ── Match functions ───────────────────────────────────────────────────────────
 
 pub fn create_match(
     env: &Env,
