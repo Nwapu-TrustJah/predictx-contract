@@ -108,6 +108,12 @@ pub enum PredictXError {
     InvalidTokenAddress = 40,
     /// The token address cannot be changed while the contract holds a balance.
     ContractBalanceNotZero = 39,
+    /// No pending parameter proposal exists for this key.
+    ProposalNotFound = 39,
+    /// The timelock delay has not elapsed yet — too early to execute.
+    ProposalNotReady = 40,
+    /// A pending proposal already exists for this parameter key.
+    ProposalAlreadyExists = 41,
 }
 
 #[cfg(test)]

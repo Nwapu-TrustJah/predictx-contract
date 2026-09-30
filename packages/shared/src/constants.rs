@@ -57,3 +57,10 @@ pub const TEMPORARY_STORAGE_TTL_SECS: u64 = 14_400; // 4 hours
 /// Target TTL extend-to value for temporary storage entries.
 /// Used to re-arm the TTL before it expires.
 pub const TEMPORARY_STORAGE_EXTEND_TO_SECS: u64 = 17_280; // 4.8 hours > 2 hours voting window
+/// Delay (in seconds) between proposing a parameter change and being able to execute it.
+///
+/// Set to 24 hours (`86_400` seconds).  The goal is visibility, not friction: any user who
+/// watches contract events or polls `get_param_proposal` has a full day to react before the
+/// new value takes effect.  A longer window (e.g. 7 days) would be more appropriate for a
+/// fully decentralised protocol but adds unnecessary friction during the current MVP phase.
+pub const PARAM_TIMELOCK_DELAY: u64 = 86_400;
