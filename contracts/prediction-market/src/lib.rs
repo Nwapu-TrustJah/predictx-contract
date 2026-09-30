@@ -177,6 +177,8 @@ pub enum DataKey {
 /// stored struct or key enum changes layout; the golden XDR tests below will
 /// fail with an explicit message until fixtures are regenerated.
 pub const SCHEMA_VERSION: u32 = 1;
+/// Hard cap on the number of polls returned by a single `get_polls` page.
+pub const MAX_POLLS_PAGE_SIZE: u32 = 20;
 
 /// Pool state returned by `get_pool_info`.
 #[contracttype]
@@ -1208,6 +1210,30 @@ impl PredictionMarket {
     /// number of results returned (clamped to the max page size).
     pub fn get_polls_by_status(env: Env, status: PollStatus, start: u32, limit: u32) -> Vec<u64> {
         polls::get_polls_by_status(&env, status, start, limit)
+    /// Return a page of polls starting at `start` (inclusive).
+    ///
+    /// `limit` is clamped to [`MAX_POLLS_PAGE_SIZE`] rather than rejected.
+    /// Missing or deleted poll ids are skipped without breaking the page.
+    /// Paging past the end returns an empty vector.
+    pub fn get_polls(env: Env, start: u64, limit: u32) -> Vec<Poll> {
+        let mut out: Vec<Poll> = Vec::new(&env);
+        if limit == 0 {
+            return out;
+        }
+        let capped = if limit > MAX_POLLS_PAGE_SIZE { MAX_POLLS_PAGE_SIZE } else { limit };
+        let next_id: u64 = env
+            .storage()
+            .instance()
+            .get(&DataKey::NextPollId)
+            .unwrap_or(1);
+        let mut id = start;
+        while id < next_id && out.len() < capped {
+            if let Some(poll) = env.storage().persistent().get::<DataKey, Poll>(&DataKey::Poll(id)) {
+                out.push_back(poll);
+            }
+            id += 1;
+        }
+        out
     }
 
     // ── Staking ───────────────────────────────────────────────────────────────
@@ -4089,6 +4115,91 @@ mod test {
         let err = client.try_resolve_poll(&oracle, &3_u64, &true).expect_err("already");
         assert_eq!(err, Ok(PredictXError::PollAlreadyResolved));
         assert_eq!(client.schema_version(), SCHEMA_VERSION);
+    }
+
+    #[test]
+    fn get_polls_clamps_limit_above_cap() {
+        let env = Env::default();
+        env.mock_all_auths();
+        let contract_id = env.register(PredictionMarket, ());
+        let client = PredictionMarketClient::new(&env, &contract_id);
+        let admin = Address::generate(&env);
+        let oracle = Address::generate(&env);
+        let tok = Address::generate(&env);
+        let treasury = Address::generate(&env);
+        client.initialize(&admin, &oracle, &tok, &treasury, &TEST_FEE_BPS);
+        for id in 1..=(MAX_POLLS_PAGE_SIZE as u64 + 5) {
+            seed_active_poll(&env, &contract_id, id, &admin);
+        }
+        env.as_contract(&contract_id, || {
+            env.storage().instance().set(&DataKey::NextPollId, &(MAX_POLLS_PAGE_SIZE as u64 + 6));
+        });
+        let page = client.get_polls(&1_u64, &u32::MAX);
+        assert_eq!(page.len(), MAX_POLLS_PAGE_SIZE);
+    }
+
+    #[test]
+    fn get_polls_paging_past_end_returns_empty() {
+        let env = Env::default();
+        env.mock_all_auths();
+        let contract_id = env.register(PredictionMarket, ());
+        let client = PredictionMarketClient::new(&env, &contract_id);
+        let admin = Address::generate(&env);
+        let oracle = Address::generate(&env);
+        let tok = Address::generate(&env);
+        let treasury = Address::generate(&env);
+        client.initialize(&admin, &oracle, &tok, &treasury, &TEST_FEE_BPS);
+        seed_active_poll(&env, &contract_id, 1, &admin);
+        env.as_contract(&contract_id, || {
+            env.storage().instance().set(&DataKey::NextPollId, &2u64);
+        });
+        let page = client.get_polls(&100_u64, &10_u32);
+        assert_eq!(page.len(), 0);
+    }
+
+    #[test]
+    fn get_polls_skips_missing_ids() {
+        let env = Env::default();
+        env.mock_all_auths();
+        let contract_id = env.register(PredictionMarket, ());
+        let client = PredictionMarketClient::new(&env, &contract_id);
+        let admin = Address::generate(&env);
+        let oracle = Address::generate(&env);
+        let tok = Address::generate(&env);
+        let treasury = Address::generate(&env);
+        client.initialize(&admin, &oracle, &tok, &treasury, &TEST_FEE_BPS);
+        seed_active_poll(&env, &contract_id, 1, &admin);
+        seed_active_poll(&env, &contract_id, 3, &admin);
+        env.as_contract(&contract_id, || {
+            env.storage().instance().set(&DataKey::NextPollId, &4u64);
+        });
+        let page = client.get_polls(&1_u64, &10_u32);
+        assert_eq!(page.len(), 2);
+        assert_eq!(page.get(0).unwrap().poll_id, 1);
+        assert_eq!(page.get(1).unwrap().poll_id, 3);
+    }
+
+    #[test]
+    fn get_polls_returns_expected_page() {
+        let env = Env::default();
+        env.mock_all_auths();
+        let contract_id = env.register(PredictionMarket, ());
+        let client = PredictionMarketClient::new(&env, &contract_id);
+        let admin = Address::generate(&env);
+        let oracle = Address::generate(&env);
+        let tok = Address::generate(&env);
+        let treasury = Address::generate(&env);
+        client.initialize(&admin, &oracle, &tok, &treasury, &TEST_FEE_BPS);
+        for id in 1..=5u64 {
+            seed_active_poll(&env, &contract_id, id, &admin);
+        }
+        env.as_contract(&contract_id, || {
+            env.storage().instance().set(&DataKey::NextPollId, &6u64);
+        });
+        let page = client.get_polls(&2_u64, &2_u32);
+        assert_eq!(page.len(), 2);
+        assert_eq!(page.get(0).unwrap().poll_id, 2);
+        assert_eq!(page.get(1).unwrap().poll_id, 3);
     }
 
 }
