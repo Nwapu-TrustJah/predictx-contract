@@ -87,6 +87,9 @@ use predictx_shared::{
 use crate::{DataKey, get_oracle, get_platform_stats, set_platform_stats, token_utils};
 use crate::{DataKey, get_platform_stats, set_platform_stats, token_utils, ensure_not_paused};
 use crate::{DataKey, get_platform_stats, has_emergency_claimed, set_platform_stats, token_utils};
+use crate::{get_platform_stats, set_platform_stats, token_utils, DataKey};
+use predictx_shared::{Poll, PollStatus, PredictXError, Stake, StakeSide, BPS_DENOMINATOR};
+use soroban_sdk::{Address, Env, Symbol};
 
 /// Resolve a poll using the registered oracle and record its final outcome.
 ///
@@ -266,8 +269,7 @@ pub(crate) fn record_poll_resolution(
         .set(&DataKey::Poll(poll.poll_id), poll);
 
     let total_pool = poll.yes_pool + poll.no_pool;
-    let fee = total_pool * token_utils::get_platform_fee_bps(env) as i128
-        / BPS_DENOMINATOR as i128;
+    let fee = total_pool * token_utils::get_platform_fee_bps(env) as i128 / BPS_DENOMINATOR as i128;
     env.events().publish(
         (Symbol::new(env, "PollResolved"), poll.poll_id),
         (outcome, total_pool, fee),
@@ -325,6 +327,7 @@ pub fn claim_winnings(
 ) -> Result<i128, PredictXError> {
     user.require_auth();
     ensure_not_paused(env)?;
+pub fn claim_winnings(env: &Env, claimant: Address, poll_id: u64) -> Result<i128, PredictXError> {
     claimant.require_auth();
 
     // ── Checks ────────────────────────────────────────────────────────────────
@@ -394,6 +397,11 @@ pub fn claim_winnings(env: &Env, claimant: Address, poll_id: u64) -> Result<i128
     // transfer happens and every staker is made whole.
     let winning_pool: i128 = if outcome_yes { poll.yes_pool } else { poll.no_pool };
     let losing_pool: i128 = if outcome_yes { poll.no_pool } else { poll.yes_pool };
+    let winning_pool: i128 = if outcome_yes {
+        poll.yes_pool
+    } else {
+        poll.no_pool
+    };
     let total_pool: i128 = poll.yes_pool + poll.no_pool;
     let losing_pool: i128 = total_pool - winning_pool;
 
@@ -590,11 +598,7 @@ pub fn get_claimable_amount(env: &Env, poll_id: u64, user: &Address) -> i128 {
 }
 
 /// Calculate a resolved poll's payout for a user without transferring tokens.
-pub fn calculate_winnings(
-    env: &Env,
-    poll_id: u64,
-    user: Address,
-) -> Result<i128, PredictXError> {
+pub fn calculate_winnings(env: &Env, poll_id: u64, user: Address) -> Result<i128, PredictXError> {
     let poll: Poll = env
         .storage()
         .persistent()
@@ -636,6 +640,13 @@ fn calculate_winnings_for(
 
     let winning_side = if outcome { StakeSide::Yes } else { StakeSide::No };
     if stake.side != winning_side {
+    if stake.side
+        != if outcome {
+            StakeSide::Yes
+        } else {
+            StakeSide::No
+        }
+    {
         return Ok(0);
     }
 
@@ -659,6 +670,7 @@ mod test {
     extern crate std;
 
     use crate::{DataKey, PredictionMarket, PredictionMarketClient};
+    use predictx_shared::{Poll, PollCategory, PollStatus, PredictXError, Stake, StakeSide};
     use soroban_sdk::{
         testutils::{Address as _, Ledger},
         token, Address, Env, String,
@@ -753,6 +765,7 @@ mod test {
         side: StakeSide,
         amount: i128,
     ) -> Address {
+    fn stake_user(s: &TestSetup, poll_id: u64, side: StakeSide, amount: i128) -> Address {
         let user = Address::generate(&s.env);
         mint_tokens(s, &user, amount);
         s.client.stake(&user, &poll_id, &amount, &side);

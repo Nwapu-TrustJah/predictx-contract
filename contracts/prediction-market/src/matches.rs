@@ -8,6 +8,9 @@ use predictx_shared::{Match, PredictXError};
 use soroban_sdk::{Address, Env, String, Symbol, Vec};
 use predictx_shared::{Match, PredictXError};
 use crate::{DataKey, MatchStats};
+use crate::{DataKey, MatchUpdate};
+use predictx_shared::{Match, PredictXError};
+use soroban_sdk::{Address, Env, String, Symbol, Vec}; // ← uses prediction-market's local DataKey, not shared one
 
 // ── Internal helper ───────────────────────────────────────────────────────────
 
@@ -95,11 +98,7 @@ pub fn update_match(
     env: &Env,
     admin: Address,
     match_id: u64,
-    home_team: Option<String>,
-    away_team: Option<String>,
-    league: Option<String>,
-    venue: Option<String>,
-    kickoff_time: Option<u64>,
+    updates: MatchUpdate,
 ) -> Result<Match, PredictXError> {
     ensure_not_paused(env)?;
     require_admin(env, &admin)?;
@@ -155,6 +154,19 @@ pub fn update_match(
         m.venue = v;
     }
     if let Some(kt) = kickoff_time {
+    if let Some(v) = updates.home_team {
+        m.home_team = v;
+    }
+    if let Some(v) = updates.away_team {
+        m.away_team = v;
+    }
+    if let Some(v) = updates.league {
+        m.league = v;
+    }
+    if let Some(v) = updates.venue {
+        m.venue = v;
+    }
+    if let Some(kt) = updates.kickoff_time {
         if kt <= now {
             return Err(PredictXError::InvalidLockTime);
         }
@@ -254,6 +266,7 @@ mod test {
     extern crate std;
 
     use crate::{PredictionMarket, PredictionMarketClient};
+    use crate::{MatchUpdate, PredictionMarket, PredictionMarketClient};
     use predictx_shared::PredictXError;
     use soroban_sdk::{
         contract, contractimpl,
@@ -438,6 +451,13 @@ mod test {
             &None,
             &None,
             &None,
+            &MatchUpdate {
+                home_team: Some(s(&env, "Liverpool")),
+                away_team: None,
+                league: None,
+                venue: None,
+                kickoff_time: None,
+            },
         );
         assert_eq!(updated.home_team, s(&env, "Liverpool"));
         assert_eq!(updated.away_team, s(&env, "Chelsea"));
@@ -450,6 +470,17 @@ mod test {
         env.ledger().with_mut(|l| l.timestamp = KICKOFF + 1);
         let err = client
             .try_update_match(&admin, &id, &Some(s(&env, "X")), &None, &None, &None, &None)
+            .try_update_match(
+                &admin,
+                &id,
+                &MatchUpdate {
+                    home_team: Some(s(&env, "X")),
+                    away_team: None,
+                    league: None,
+                    venue: None,
+                    kickoff_time: None,
+                },
+            )
             .unwrap_err()
             .unwrap();
         assert_eq!(err, PredictXError::MatchAlreadyStarted);
@@ -460,6 +491,17 @@ mod test {
         let (_, admin, client) = setup();
         let err = client
             .try_update_match(&admin, &999u64, &None, &None, &None, &None, &None)
+            .try_update_match(
+                &admin,
+                &999u64,
+                &MatchUpdate {
+                    home_team: None,
+                    away_team: None,
+                    league: None,
+                    venue: None,
+                    kickoff_time: None,
+                },
+            )
             .unwrap_err()
             .unwrap();
         assert_eq!(err, PredictXError::MatchNotFound);
@@ -478,6 +520,13 @@ mod test {
                 &None,
                 &None,
                 &None,
+                &MatchUpdate {
+                    home_team: Some(s(&env, "X")),
+                    away_team: None,
+                    league: None,
+                    venue: None,
+                    kickoff_time: None,
+                },
             )
             .unwrap_err()
             .unwrap();

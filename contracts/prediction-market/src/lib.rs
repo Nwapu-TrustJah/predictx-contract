@@ -180,6 +180,15 @@ pub struct ContractConfig {
     pub token_address: Address,
     pub treasury_address: Address,
     pub platform_fee_bps: u32,
+/// Optional fields used when updating a match before kickoff.
+#[contracttype]
+#[derive(Clone, Debug)]
+pub struct MatchUpdate {
+    pub home_team: Option<String>,
+    pub away_team: Option<String>,
+    pub league: Option<String>,
+    pub venue: Option<String>,
+    pub kickoff_time: Option<u64>,
 }
 
 fn get_admin(env: &Env) -> Result<Address, PredictXError> {
@@ -284,6 +293,7 @@ fn load_stake(env: &Env, poll_id: u64, user: &Address) -> Option<Stake> {
 
 pub(crate) fn has_emergency_claimed(env: &Env, poll_id: u64, user: &Address) -> bool {
     env.storage().persistent()
+fn has_emergency_claimed(env: &Env, poll_id: u64, user: &Address) -> bool {
     env.storage()
         .persistent()
         .get(&DataKey::EmergencyClaimed(poll_id, user.clone()))
@@ -1082,6 +1092,9 @@ impl PredictionMarket {
         extend_instance_ttl(&env);
         require_initialized(&env)?;
         matches::update_match(&env, admin, match_id, home_team, away_team, league, venue, kickoff_time)
+        updates: MatchUpdate,
+    ) -> Result<Match, PredictXError> {
+        matches::update_match(&env, admin, match_id, updates)
     }
 
     pub fn finish_match(env: Env, admin: Address, match_id: u64) -> Result<(), PredictXError> {
@@ -1329,15 +1342,16 @@ mod test {
         let tok = create_test_token(&env);
         let treasury = Address::generate(&env);
         client.initialize(&admin, &oracle, &tok, &treasury, &TEST_FEE_BPS);
-        assert_eq!(client.is_paused(), false);
+        assert!(!client.is_paused());
         client.pause(&admin);
         assert_eq!(client.is_paused(), true);
+        assert!(client.is_paused());
         let err = client
             .try_set_oracle(&oracle)
             .expect_err("should be blocked");
         assert_eq!(err, Ok(PredictXError::EmergencyWithdrawNotAllowed));
         client.unpause(&admin);
-        assert_eq!(client.is_paused(), false);
+        assert!(!client.is_paused());
     }
 
     #[test]
@@ -1385,6 +1399,14 @@ mod test {
 
     #[test]
     fn cancel_poll_rejects_unknown_poll() {
+    // Helper to set up a real-token environment for emergency withdrawal tests
+    fn setup_emergency_env() -> (
+        Env,
+        Address,
+        Address,
+        Address,
+        PredictionMarketClient<'static>,
+    ) {
         let env = Env::default();
         env.mock_all_auths();
         let admin = Address::generate(&env);
@@ -1758,6 +1780,9 @@ mod test {
             .try_resolve_poll(&stranger, &1_u64, &true)
             .expect_err("non-oracle");
         let err = client.try_resolve_poll(&stranger, &1_u64, &true, &String::from_str(&env, "test")).expect_err("non-admin");
+        let err = client
+            .try_resolve_poll(&stranger, &1_u64, &true)
+            .expect_err("non-oracle");
         assert_eq!(err, Ok(PredictXError::Unauthorized));
     }
 
@@ -1778,6 +1803,9 @@ mod test {
             .try_resolve_poll(&admin, &99_u64, &false)
             .expect_err("missing");
         let err = client.try_resolve_poll(&admin, &99_u64, &false, &String::from_str(&env, "test")).expect_err("missing");
+        let err = client
+            .try_resolve_poll(&admin, &99_u64, &false)
+            .expect_err("missing");
         assert_eq!(err, Ok(PredictXError::PollNotFound));
     }
 
@@ -1801,6 +1829,7 @@ mod test {
         env.ledger().set_timestamp(1_700_004_000);
         let basis = String::from_str(&env, "manual-settlement:test");
         client.resolve_poll(&admin, &7_u64, &true, &basis);
+        client.resolve_poll(&admin, &7_u64, &true);
         let poll = client.get_poll(&7_u64);
         assert_eq!(poll.outcome, Some(true));
         assert_eq!(poll.resolution_time, 1_700_004_000);
@@ -2733,4 +2762,10 @@ mod test {
         assert_eq!(config.platform_fee_bps, TEST_FEE_BPS);
     }
 
+        client.resolve_poll(&admin, &3_u64, &false);
+        let err = client
+            .try_resolve_poll(&admin, &3_u64, &true)
+            .expect_err("already");
+        assert_eq!(err, Ok(PredictXError::PollAlreadyResolved));
+    }
 }

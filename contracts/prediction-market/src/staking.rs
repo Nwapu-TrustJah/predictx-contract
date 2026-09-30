@@ -13,6 +13,12 @@ use predictx_shared::{
     Poll, PollStatus, PredictXError, Stake, StakeSide, BPS_DENOMINATOR, MAX_STAKE_AMOUNT,
     MAX_USER_STAKES_PAGE_SIZE, MIN_STAKE_AMOUNT,
 };
+use crate::{
+    ensure_not_paused, get_platform_stats, set_platform_stats, token_utils, DataKey, PoolInfo,
+};
+use predictx_shared::{
+    Poll, PollStatus, PredictXError, Stake, StakeSide, BPS_DENOMINATOR, MIN_STAKE_AMOUNT,
+};
 use soroban_sdk::{Address, Env, Symbol, Vec};
 
 // ── Stake placement ───────────────────────────────────────────────────────────
@@ -297,6 +303,7 @@ mod test {
         Poll, PollCategory, PollStatus, PredictXError, StakeSide, MAX_STAKE_AMOUNT,
         MIN_STAKE_AMOUNT,
     };
+    use predictx_shared::{Poll, PollCategory, PollStatus, PredictXError, StakeSide};
     use soroban_sdk::{
         testutils::{Address as _, Ledger},
         token, Address, Env, String,
@@ -986,6 +993,8 @@ mod test {
 
         // Preview the smallest acceptable stake (MIN_STAKE_AMOUNT) on Yes.
         let new_stake: i128 = MIN_STAKE_AMOUNT;
+        // Simulate a new 700-token yes stake (7_000_000_000 base units)
+        let new_stake: i128 = 7_000_000_000;
         let winnings = s
             .client
             .calculate_potential_winnings(&poll_id, &StakeSide::Yes, &new_stake);
@@ -994,6 +1003,10 @@ mod test {
         // total_pool_after   = 80M + 30M = 110M
         // winnings = 10M * 110M * 9500 / (80M * 10000)
         let expected = new_stake * 110_000_000_i128 * 9500 / (80_000_000_i128 * 10_000);
+        // pool_on_side_after = 70B + 7B = 77B = 77_000_000_000
+        // total_pool_after   = 77B + 30B = 107B = 107_000_000_000
+        // winnings = 7B * 107B * 9500 / (77B * 10000)
+        let expected = new_stake * 107_000_000_000_i128 * 9500 / (77_000_000_000_i128 * 10_000);
         assert_eq!(winnings, expected);
         assert!(winnings > 0);
 
@@ -1084,6 +1097,7 @@ mod test {
         mint_tokens(&s, &user, deposit);
 
         let stake_amount: i128 = 40_000_000;
+        let stake_amount: i128 = 150_000_000;
         s.client
             .stake(&user, &poll_id, &stake_amount, &StakeSide::Yes);
 
