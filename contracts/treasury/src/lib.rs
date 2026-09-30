@@ -39,7 +39,8 @@ enum DataKey {
     VoterRewardsFunded(u64),
     Market,
     TokenAddress,
-    Balance(Address),
+    TotalFeesCollected,
+    TotalFeesWithdrawn,
 }
 
 fn get_admin(env: &Env) -> Result<Address, PredictXError> {
@@ -75,9 +76,17 @@ const FEES_WITHDRAWN: Symbol = symbol_short!("fees_wdr");
 const REWARDS_FUNDED: Symbol = symbol_short!("rwd_fund");
 
 fn get_balance(env: &Env, who: &Address) -> i128 {
+fn get_total_fees_collected(env: &Env) -> i128 {
     env.storage()
-        .persistent()
-        .get(&DataKey::Balance(who.clone()))
+        .instance()
+        .get(&DataKey::TotalFeesCollected)
+        .unwrap_or(0_i128)
+}
+
+fn get_total_fees_withdrawn(env: &Env) -> i128 {
+    env.storage()
+        .instance()
+        .get(&DataKey::TotalFeesWithdrawn)
         .unwrap_or(0_i128)
 }
 
@@ -106,6 +115,12 @@ impl Treasury {
         admin.require_auth();
         env.storage().instance().set(&DataKey::Admin, &admin);
         env.storage().instance().set(&DataKey::Token, &token);
+        env.storage()
+            .instance()
+            .set(&DataKey::TotalFeesCollected, &0_i128);
+        env.storage()
+            .instance()
+            .set(&DataKey::TotalFeesWithdrawn, &0_i128);
         Ok(())
     }
 
@@ -180,6 +195,7 @@ impl Treasury {
     /// Deposit fees — only callable by the registered PredictionMarket contract.
     ///
     /// Any address other than the registered market receives `Unauthorized`.
+    /// Increments the total_fees_collected counter.
     pub fn deposit_fees(env: Env, from: Address, amount: i128) -> Result<i128, PredictXError> {
         extend_instance_ttl(&env);
         if amount <= 0 {
@@ -198,16 +214,20 @@ impl Treasury {
 
         from.require_auth();
 
-        let new_balance = get_balance(&env, &from) + amount;
+        let total_collected = get_total_fees_collected(&env) + amount;
         env.storage()
             .persistent()
             .set(&DataKey::Balance(from), &new_balance);
         env.events()
             .publish((FEES_DEPOSITED, from.clone()), amount);
         Ok(new_balance)
+            .instance()
+            .set(&DataKey::TotalFeesCollected, &total_collected);
+        Ok(total_collected)
     }
 
     /// Withdraw collected fees to an operational address.
+    /// Increments the total_fees_withdrawn counter.
     pub fn withdraw_fees(
         env: Env,
         admin: Address,
@@ -250,14 +270,36 @@ impl Treasury {
         token_client.transfer(&treasury_address, &to, &amount);
         env.events()
             .publish((FEES_WITHDRAWN, to.clone()), amount);
+
+        let total_withdrawn = get_total_fees_withdrawn(&env) + amount;
+        env.storage()
+            .instance()
+            .set(&DataKey::TotalFeesWithdrawn, &total_withdrawn);
         Ok(())
     }
 
-    pub fn balance(env: Env, who: Address) -> Result<i128, PredictXError> {
+    /// Returns the contract's actual token balance.
+    pub fn balance(env: Env) -> Result<i128, PredictXError> {
         if !env.storage().instance().has(&DataKey::Admin) {
             return Err(PredictXError::NotInitialized);
         }
-        Ok(get_balance(&env, &who))
+
+        let token_address: Address = env
+            .storage()
+            .instance()
+            .get(&DataKey::TokenAddress)
+            .ok_or(PredictXError::NotInitialized)?;
+        let token_client = token::Client::new(&env, &token_address);
+        let treasury_address = env.current_contract_address();
+        Ok(token_client.balance(&treasury_address))
+    }
+
+    /// Returns lifetime fee statistics: total collected and total withdrawn.
+    /// Works before any deposit, returning zeros.
+    pub fn get_fee_stats(env: Env) -> (i128, i128) {
+        let total_collected = get_total_fees_collected(&env);
+        let total_withdrawn = get_total_fees_withdrawn(&env);
+        (total_collected, total_withdrawn)
     }
 
     /// Fund rewards for a poll. Only callable by the registered market.
@@ -308,6 +350,7 @@ mod test {
     use soroban_sdk::xdr::ToXdr;
     use soroban_sdk::Bytes;
     use soroban_sdk::testutils::Address as _;
+    use soroban_sdk::token;
 
     fn setup() -> (Env, Address, TreasuryClient<'static>, Address, Address) {
         let env = Env::default();
@@ -402,14 +445,21 @@ mod test {
             }
         }
     }
+    // ── Fee Stats Tests ──────────────────────────────────────────────────────
 
     #[test]
-    fn deposit_tracks_balance() {
-        let env = Env::default();
-        env.mock_all_auths();
+    fn get_fee_stats_returns_zeros_before_any_deposit() {
+        let (env, _, client, _, _) = setup();
+        let (collected, withdrawn) = client.get_fee_stats();
+        assert_eq!(collected, 0_i128);
+        assert_eq!(withdrawn, 0_i128);
+    }
 
-        let contract_id = env.register(Treasury, ());
-        let client = TreasuryClient::new(&env, &contract_id);
+    #[test]
+    fn deposit_fees_increments_total_collected() {
+        let (env, contract_id, client, admin, token_address) = setup();
+        let market = Address::generate(&env);
+        client.set_market(&admin, &market);
 
         let admin = Address::generate(&env);
         let token = Address::generate(&env);
@@ -423,14 +473,121 @@ mod test {
     }
 
         client.initialize(&admin);
+        let asset = token::StellarAssetClient::new(&env, &token_address);
+        asset.mint(&contract_id, &1000_i128);
 
-        let user = Address::generate(&env);
-        assert_eq!(client.deposit(&user, &10_i128), 10_i128);
-        assert_eq!(client.deposit(&user, &5_i128), 15_i128);
-        assert_eq!(client.balance(&user), 15_i128);
+        let result = client.deposit_fees(&market, &500_i128);
+        assert_eq!(result, 500_i128);
+
+        let (collected, withdrawn) = client.get_fee_stats();
+        assert_eq!(collected, 500_i128);
+        assert_eq!(withdrawn, 0_i128);
+
+        client.deposit_fees(&market, &300_i128);
+        let (collected, withdrawn) = client.get_fee_stats();
+        assert_eq!(collected, 800_i128);
+        assert_eq!(withdrawn, 0_i128);
     }
 
-    // ── deposit_fees access control tests ──────────────────────────────────
+    #[test]
+    fn withdraw_fees_increments_total_withdrawn() {
+        let (env, contract_id, client, admin, token_address) = setup();
+        let market = Address::generate(&env);
+        let recipient = Address::generate(&env);
+        client.set_market(&admin, &market);
+
+        let asset = token::StellarAssetClient::new(&env, &token_address);
+        asset.mint(&contract_id, &1000_i128);
+
+        client.deposit_fees(&market, &500_i128);
+        client.withdraw_fees(&admin, &recipient, &200_i128);
+
+        let (collected, withdrawn) = client.get_fee_stats();
+        assert_eq!(collected, 500_i128);
+        assert_eq!(withdrawn, 200_i128);
+
+        client.withdraw_fees(&admin, &recipient, &100_i128);
+        let (collected, withdrawn) = client.get_fee_stats();
+        assert_eq!(collected, 500_i128);
+        assert_eq!(withdrawn, 300_i128);
+    }
+
+    // ── Balance Tests ────────────────────────────────────────────────────────
+
+    #[test]
+    fn balance_returns_actual_token_balance() {
+        let (env, contract_id, client, admin, token_address) = setup();
+        let market = Address::generate(&env);
+        let recipient = Address::generate(&env);
+        client.set_market(&admin, &market);
+
+        let asset = token::StellarAssetClient::new(&env, &token_address);
+        let token_client = token::Client::new(&env, &token_address);
+
+        asset.mint(&contract_id, &1000_i128);
+        assert_eq!(client.balance(), Ok(1000_i128));
+
+        client.deposit_fees(&market, &500_i128);
+        asset.mint(&contract_id, &500_i128);
+        assert_eq!(client.balance(), Ok(1500_i128));
+
+        client.withdraw_fees(&admin, &recipient, &300_i128);
+        assert_eq!(client.balance(), Ok(1200_i128));
+    }
+
+    // ── Invariant Test ───────────────────────────────────────────────────────
+
+    #[test]
+    fn invariant_collected_minus_withdrawn_equals_balance() {
+        let (env, contract_id, client, admin, token_address) = setup();
+        let market = Address::generate(&env);
+        let recipient = Address::generate(&env);
+        client.set_market(&admin, &market);
+
+        let asset = token::StellarAssetClient::new(&env, &token_address);
+        let token_client = token::Client::new(&env, &token_address);
+
+        // Initial state: all zeros
+        let (collected, withdrawn) = client.get_fee_stats();
+        let balance = client.balance().unwrap();
+        assert_eq!(collected - withdrawn, balance);
+
+        // Deposit some fees and mint tokens
+        asset.mint(&contract_id, &2000_i128);
+        client.deposit_fees(&market, &500_i128);
+
+        let (collected, withdrawn) = client.get_fee_stats();
+        let balance = client.balance().unwrap();
+        assert_eq!(collected - withdrawn, balance);
+
+        // Deposit more fees and mint more tokens
+        client.deposit_fees(&market, &300_i128);
+        asset.mint(&contract_id, &300_i128);
+
+        let (collected, withdrawn) = client.get_fee_stats();
+        let balance = client.balance().unwrap();
+        assert_eq!(collected - withdrawn, balance);
+
+        // Withdraw some fees
+        client.withdraw_fees(&admin, &recipient, &400_i128);
+
+        let (collected, withdrawn) = client.get_fee_stats();
+        let balance = client.balance().unwrap();
+        assert_eq!(collected - withdrawn, balance);
+
+        // Withdraw more fees
+        client.withdraw_fees(&admin, &recipient, &200_i128);
+
+        let (collected, withdrawn) = client.get_fee_stats();
+        let balance = client.balance().unwrap();
+        assert_eq!(collected - withdrawn, balance);
+
+        // Final check: collected - withdrawn == actual token balance
+        assert_eq!(token_client.balance(&contract_id), balance);
+        assert_eq!(collected - withdrawn, token_client.balance(&contract_id));
+    }
+
+    // ── Existing Access Control Tests ────────────────────────────────────────
 
     #[test]
     fn deposit_fees_fails_for_unregistered_address() {
@@ -516,7 +673,9 @@ mod test {
         // The registered market can deposit fees
         let result = client.deposit_fees(&market, &500_i128);
         assert_eq!(result, 500_i128);
-        assert_eq!(client.balance(&market), 500_i128);
+
+        let (collected, _) = client.get_fee_stats();
+        assert_eq!(collected, 500_i128);
     }
 
     #[test]
@@ -613,7 +772,10 @@ mod test {
         let token_client = token::Client::new(&env, &token_address);
 
         // Stored per-address accounting must not substitute for held tokens.
-        client.deposit(&recipient, &100_i128);
+        let market = Address::generate(&env);
+        client.set_market(&admin, &market);
+        client.deposit_fees(&market, &100_i128);
+        
         let err = client
             .try_withdraw_fees(&admin, &recipient, &50_i128)
             .expect_err("recorded amounts cannot exceed the real token balance");
@@ -625,11 +787,15 @@ mod test {
     #[test]
     fn withdraw_fees_transfers_tokens_to_recipient() {
         let (env, contract_id, client, admin, token_address) = setup();
+        let market = Address::generate(&env);
         let recipient = Address::generate(&env);
+        client.set_market(&admin, &market);
+
         let asset = token::StellarAssetClient::new(&env, &token_address);
         let token_client = token::Client::new(&env, &token_address);
         asset.mint(&contract_id, &250_i128);
 
+        client.deposit_fees(&market, &250_i128);
         client.withdraw_fees(&admin, &recipient, &75_i128);
 
         assert_eq!(token_client.balance(&recipient), 75_i128);
@@ -776,4 +942,5 @@ mod test {
         let events = env.events().all();
         assert_eq!(events.len(), 0);
     }
+}
 }
