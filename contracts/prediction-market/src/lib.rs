@@ -1554,6 +1554,10 @@ impl PredictionMarket {
         matches::get_match_count(&env)
     }
 
+    pub fn list_matches(env: Env, start: u64, limit: u32) -> Vec<Match> {
+        matches::list_matches(&env, start, limit)
+    }
+
     // ── Payouts ───────────────────────────────────────────────────────────────
 
     /// Resolve a poll with a boolean outcome. Callable by the registered oracle or admin.
