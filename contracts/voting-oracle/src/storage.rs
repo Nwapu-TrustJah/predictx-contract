@@ -223,3 +223,19 @@ pub fn write_approval_count(env: &Env, poll_id: u64, count: u32) {
         .set(&DataKey::ApprovalCount(poll_id), &count);
 }
 
+// ── Dispute approval storage ──────────────────────────────────────────────────
+
+/// Admin approvals recorded for resolving `poll_id` to `outcome`.
+pub fn read_dispute_approvals(env: &Env, poll_id: u64, outcome: VoteChoice) -> u32 {
+    env.storage()
+        .persistent()
+        .get(&DataKey::DisputeApprovals(poll_id, outcome))
+        .unwrap_or(0)
+}
+
+/// Persist the approval count for resolving `poll_id` to `outcome`.
+pub fn write_dispute_approvals(env: &Env, poll_id: u64, outcome: VoteChoice, approvals: u32) {
+    env.storage()
+        .persistent()
+        .set(&DataKey::DisputeApprovals(poll_id, outcome), &approvals);
+}
