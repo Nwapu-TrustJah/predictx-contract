@@ -13,6 +13,9 @@ use predictx_shared::{Match, PredictXError};
 use soroban_sdk::{Address, Env, String, Symbol, Vec}; // ← uses prediction-market's local DataKey, not shared one
 use predictx_shared::{Match, PredictXError};
 use predictx_shared::DataKey;
+use crate::DataKey;
+use predictx_shared::{Match, PredictXError};
+use soroban_sdk::{Address, Env, String, Symbol, Vec}; // ← uses prediction-market's local DataKey, not shared one
 
 // ── Internal helper ───────────────────────────────────────────────────────────
 
@@ -1027,4 +1030,5 @@ mod tests {
         let zero_limit = client.list_matches(&1u64, &0u32);
         assert_eq!(zero_limit.len(), 0);
     }
+}
 }

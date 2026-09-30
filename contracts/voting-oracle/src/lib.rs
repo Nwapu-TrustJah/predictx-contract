@@ -191,6 +191,29 @@ pub(crate) fn read_poll_status_updated_at(env: &Env, poll_id: u64) -> u64 {
         .unwrap_or(0)
 }
 
+fn is_legal_status_transition(current: PollStatus, next: PollStatus) -> bool {
+    match current {
+        PollStatus::Active => matches!(
+            next,
+            PollStatus::Locked | PollStatus::Voting | PollStatus::Cancelled
+        ),
+        PollStatus::Locked => matches!(next, PollStatus::Voting | PollStatus::Cancelled),
+        PollStatus::Voting => matches!(
+            next,
+            PollStatus::AdminReview
+                | PollStatus::Disputed
+                | PollStatus::Resolved
+                | PollStatus::Cancelled
+        ),
+        PollStatus::AdminReview => matches!(
+            next,
+            PollStatus::Disputed | PollStatus::Resolved | PollStatus::Cancelled
+        ),
+        PollStatus::Disputed => matches!(next, PollStatus::Resolved | PollStatus::Cancelled),
+        PollStatus::Resolved | PollStatus::Cancelled => false,
+    }
+}
+
 #[contractimpl]
 impl VotingOracle {
     pub fn initialize(env: Env, admin: Address, token: Address) -> Result<(), PredictXError> {
@@ -394,6 +417,7 @@ impl VotingOracle {
         caller: Address,
         poll_id: u64,
         status: PollStatus,
+        outcome: Option<VoteChoice>,
     ) -> Result<(), PredictXError> {
         ensure_not_paused(&env)?;
         let admin = get_admin(&env)?;
@@ -402,6 +426,25 @@ impl VotingOracle {
         storage::require_admin(&env, &caller)?;
         storage::require_admin(&env, &caller)?;
         caller.require_auth();
+
+        let current_status = read_poll_status(&env, poll_id);
+        if !is_legal_status_transition(current_status, status) {
+            return Err(PredictXError::InvalidPollStatusTransition);
+        }
+
+        if status == PollStatus::Resolved {
+            let supplied_outcome = outcome.ok_or(PredictXError::OutcomeNotAvailable)?;
+            let recorded_outcome: VoteChoice = env
+                .storage()
+                .persistent()
+                .get(&DataKey::PollOutcome(poll_id))
+                .ok_or(PredictXError::OutcomeNotAvailable)?;
+            if supplied_outcome != recorded_outcome {
+                return Err(PredictXError::InvalidOutcome);
+            }
+        } else if outcome.is_some() {
+            return Err(PredictXError::InvalidOutcome);
+        }
 
         let stored = StoredPollStatus {
             status,
@@ -1058,6 +1101,172 @@ mod test {
         assert_eq!(err, Ok(PredictXError::PollNotFound));
         client.set_poll_status(&admin, &42_u64, &PollStatus::Resolved);
         assert_eq!(client.get_poll_status(&42_u64), PollStatus::Resolved);
+        let err = client
+            .try_set_poll_status(&42_u64, &PollStatus::Resolved, &None)
+            .expect_err("resolution without a recorded outcome must fail");
+        assert_eq!(err, Ok(PredictXError::OutcomeNotAvailable));
+        assert_eq!(client.get_poll_status(&42_u64), PollStatus::Active);
+    }
+
+    fn setup_with_contract_id() -> (Env, Address, Address, VotingOracleClient<'static>) {
+        let env = Env::default();
+        env.mock_all_auths();
+
+        let contract_id = env.register(VotingOracle, ());
+        let client = VotingOracleClient::new(&env, &contract_id);
+        let admin = Address::generate(&env);
+        client.initialize(&admin);
+
+        (env, admin, contract_id, client)
+    }
+
+    fn seed_status(
+        env: &Env,
+        contract_id: &Address,
+        poll_id: u64,
+        status: PollStatus,
+        updated_at: u64,
+        outcome: Option<VoteChoice>,
+    ) {
+        env.as_contract(contract_id, || {
+            env.storage().persistent().set(
+                &DataKey::PollStatus(poll_id),
+                &StoredPollStatus { status, updated_at },
+            );
+            if let Some(outcome) = outcome {
+                env.storage()
+                    .persistent()
+                    .set(&DataKey::PollOutcome(poll_id), &outcome);
+            }
+        });
+    }
+
+    #[test]
+    fn status_transition_graph_allows_each_legal_edge() {
+        let (env, _admin, contract_id, client) = setup_with_contract_id();
+        let legal_transitions = [
+            (PollStatus::Active, PollStatus::Locked),
+            (PollStatus::Active, PollStatus::Voting),
+            (PollStatus::Active, PollStatus::Cancelled),
+            (PollStatus::Locked, PollStatus::Voting),
+            (PollStatus::Locked, PollStatus::Cancelled),
+            (PollStatus::Voting, PollStatus::AdminReview),
+            (PollStatus::Voting, PollStatus::Disputed),
+            (PollStatus::Voting, PollStatus::Resolved),
+            (PollStatus::Voting, PollStatus::Cancelled),
+            (PollStatus::AdminReview, PollStatus::Disputed),
+            (PollStatus::AdminReview, PollStatus::Resolved),
+            (PollStatus::AdminReview, PollStatus::Cancelled),
+            (PollStatus::Disputed, PollStatus::Resolved),
+            (PollStatus::Disputed, PollStatus::Cancelled),
+        ];
+
+        for (index, (current, next)) in legal_transitions.iter().enumerate() {
+            let poll_id = index as u64 + 10;
+            let recorded_outcome = if *next == PollStatus::Resolved {
+                Some(VoteChoice::Yes)
+            } else {
+                None
+            };
+            seed_status(&env, &contract_id, poll_id, *current, 123, recorded_outcome);
+
+            client.set_poll_status(&poll_id, next, &recorded_outcome);
+
+            assert_eq!(client.get_poll_status(&poll_id), *next);
+            assert_eq!(
+                client.get_poll_status_updated_at(&poll_id),
+                env.ledger().timestamp()
+            );
+            if let Some(expected_outcome) = recorded_outcome {
+                assert_eq!(client.get_poll_outcome(&poll_id), expected_outcome);
+            }
+        }
+    }
+
+    #[test]
+    fn terminal_and_illegal_transitions_leave_storage_unchanged() {
+        let (env, _admin, contract_id, client) = setup_with_contract_id();
+        let all_statuses = [
+            PollStatus::Active,
+            PollStatus::Locked,
+            PollStatus::Voting,
+            PollStatus::AdminReview,
+            PollStatus::Disputed,
+            PollStatus::Resolved,
+            PollStatus::Cancelled,
+        ];
+
+        for (state_index, current) in [PollStatus::Resolved, PollStatus::Cancelled]
+            .iter()
+            .enumerate()
+        {
+            let poll_id = state_index as u64 + 30;
+            seed_status(
+                &env,
+                &contract_id,
+                poll_id,
+                *current,
+                456,
+                Some(VoteChoice::No),
+            );
+            for next in all_statuses {
+                let supplied_outcome = if next == PollStatus::Resolved {
+                    Some(VoteChoice::No)
+                } else {
+                    None
+                };
+                let err = client
+                    .try_set_poll_status(&poll_id, &next, &supplied_outcome)
+                    .expect_err("terminal statuses must not transition");
+                assert_eq!(err, Ok(PredictXError::InvalidPollStatusTransition));
+                assert_eq!(client.get_poll_status(&poll_id), *current);
+                assert_eq!(client.get_poll_status_updated_at(&poll_id), 456);
+                assert_eq!(client.get_poll_outcome(&poll_id), VoteChoice::No);
+            }
+        }
+
+        let poll_id = 40_u64;
+        seed_status(&env, &contract_id, poll_id, PollStatus::Voting, 789, None);
+        let err = client
+            .try_set_poll_status(&poll_id, &PollStatus::Active, &None)
+            .expect_err("backwards transition must fail");
+        assert_eq!(err, Ok(PredictXError::InvalidPollStatusTransition));
+        assert_eq!(client.get_poll_status(&poll_id), PollStatus::Voting);
+        assert_eq!(client.get_poll_status_updated_at(&poll_id), 789);
+    }
+
+    #[test]
+    fn resolving_requires_matching_recorded_outcome() {
+        let (env, _admin, contract_id, client) = setup_with_contract_id();
+        let poll_id = 1_u64;
+        seed_status(&env, &contract_id, poll_id, PollStatus::Voting, 123, None);
+
+        let missing = client
+            .try_set_poll_status(&poll_id, &PollStatus::Resolved, &None)
+            .expect_err("resolution requires an outcome");
+        assert_eq!(missing, Ok(PredictXError::OutcomeNotAvailable));
+        assert_eq!(client.get_poll_status(&poll_id), PollStatus::Voting);
+        assert_eq!(client.get_poll_status_updated_at(&poll_id), 123);
+
+        seed_status(
+            &env,
+            &contract_id,
+            poll_id,
+            PollStatus::Voting,
+            123,
+            Some(VoteChoice::Yes),
+        );
+        let mismatch = client
+            .try_set_poll_status(&poll_id, &PollStatus::Resolved, &Some(VoteChoice::No))
+            .expect_err("the supplied outcome must match the recorded outcome");
+        assert_eq!(mismatch, Ok(PredictXError::InvalidOutcome));
+        assert_eq!(client.get_poll_status(&poll_id), PollStatus::Voting);
+        assert_eq!(client.get_poll_status_updated_at(&poll_id), 123);
+        assert_eq!(client.get_poll_outcome(&poll_id), VoteChoice::Yes);
+
+        client.set_poll_status(&poll_id, &PollStatus::Resolved, &Some(VoteChoice::Yes));
+        assert_eq!(client.get_poll_status(&poll_id), PollStatus::Resolved);
+        assert_eq!(client.get_poll_outcome(&poll_id), VoteChoice::Yes);
     }
 
     #[test]
@@ -1074,6 +1283,7 @@ mod test {
         let (env, admin, client) = setup();
         let voter = Address::generate(&env);
         client.set_poll_status(&admin, &1_u64, &PollStatus::Voting);
+        client.set_poll_status(&1_u64, &PollStatus::Voting, &None);
 
         assert!(!client.has_voted(&1_u64, &voter));
         assert!(client.can_vote(&1_u64, &voter));
@@ -1093,6 +1303,10 @@ mod test {
         assert!(!client.can_vote(&2_u64, &voter));
 
         client.set_poll_status(&admin, &3_u64, &PollStatus::Voting);
+        client.set_poll_status(&2_u64, &PollStatus::Locked, &None);
+        assert!(!client.can_vote(&2_u64, &voter));
+
+        client.set_poll_status(&3_u64, &PollStatus::Voting, &None);
         env.ledger()
             .with_mut(|ledger| ledger.timestamp += VOTING_WINDOW_SECS);
         assert!(!client.can_vote(&3_u64, &voter));

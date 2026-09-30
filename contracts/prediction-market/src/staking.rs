@@ -59,6 +59,13 @@ fn record_stake_in_user_stats(env: &Env, staker: &Address, amount: i128) {
 use crate::{DataKey, PoolInfo, get_platform_stats, set_platform_stats, ensure_not_paused, token_utils, escrow};
 use crate::{PoolInfo, get_platform_stats, set_platform_stats, ensure_not_paused, token_utils};
 use predictx_shared::DataKey;
+use crate::{
+    ensure_not_paused, get_platform_stats, set_platform_stats, token_utils, DataKey, PoolInfo,
+};
+use predictx_shared::{
+    Poll, PollStatus, PredictXError, Stake, StakeSide, BPS_DENOMINATOR, MIN_STAKE_AMOUNT,
+};
+use soroban_sdk::{Address, Env, Symbol, Vec};
 
 // ── Stake placement ───────────────────────────────────────────────────────────
 

@@ -875,7 +875,8 @@ mod test {
         token, Address, Env, String, Vec,
     };
     use predictx_shared::{
-        Poll, PollCategory, PollStatus, PredictXError, Stake, StakeSide,
+        Poll, PollCategory, PollStatus, PredictXError, Stake, StakeSide, VoteChoice,
+        VOTING_WINDOW_SECS,
     };
     use crate::{DataKey, PredictionMarket, PredictionMarketClient};
 
@@ -1683,5 +1684,60 @@ mod test {
             expected_locked,
             "total_value_locked should equal initial staked minus paid out"
         );
+    #[test]
+    fn resolved_claim_cannot_be_followed_by_cancel_emergency_refund() {
+        let s = setup();
+        let poll_id = create_poll(&s, 1_500_000);
+        let winner = Address::generate(&s.env);
+        let loser = Address::generate(&s.env);
+        let stake_amount = 100_000_000_i128;
+
+        mint_tokens(&s, &winner, stake_amount);
+        mint_tokens(&s, &loser, stake_amount);
+        s.client
+            .stake(&winner, &poll_id, &stake_amount, &StakeSide::Yes);
+        s.client
+            .stake(&loser, &poll_id, &stake_amount, &StakeSide::No);
+
+        let oracle = crate::voting_oracle::Client::new(&s.env, &s.oracle_id);
+        oracle.set_poll_status(
+            &poll_id,
+            &crate::voting_oracle::PollStatus::Voting,
+            &None,
+        );
+        for _ in 0..24 {
+            oracle.cast_vote(&Address::generate(&s.env), &poll_id, &VoteChoice::Yes);
+        }
+        oracle.cast_vote(&Address::generate(&s.env), &poll_id, &VoteChoice::No);
+        s.env
+            .ledger()
+            .set_timestamp(1_000_000 + VOTING_WINDOW_SECS);
+        assert_eq!(oracle.auto_resolve(&poll_id), VoteChoice::Yes);
+
+        s.client.resolve_poll(&s.oracle_id, &poll_id, &true);
+        let payout = s.client.claim_winnings(&winner, &poll_id);
+        let balance_after_claim = token_balance(&s, &winner);
+        assert_eq!(balance_after_claim, payout);
+        assert_eq!(s.client.get_stake_info(&poll_id, &winner).claimed, true);
+
+        let cancel_error = s
+            .client
+            .try_cancel_poll(&s.admin, &poll_id)
+            .expect_err("resolved oracle polls cannot be cancelled");
+        assert_eq!(
+            cancel_error,
+            Ok(PredictXError::InvalidPollStatusTransition)
+        );
+        assert_eq!(oracle.get_poll_status(&poll_id), crate::voting_oracle::PollStatus::Resolved);
+
+        let withdraw_error = s
+            .client
+            .try_emergency_withdraw(&winner, &poll_id)
+            .expect_err("resolved polls cannot issue an emergency refund");
+        assert_eq!(
+            withdraw_error,
+            Ok(PredictXError::EmergencyWithdrawNotAllowed)
+        );
+        assert_eq!(token_balance(&s, &winner), balance_after_claim);
     }
 }

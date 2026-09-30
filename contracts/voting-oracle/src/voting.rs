@@ -637,6 +637,7 @@ pub fn initiate_dispute(
         // Register poll 1 as a known poll. `initiate_voting` (#80) will later
         // be the real production path for this transition.
         client.set_poll_status(&admin, &1_u64, &PollStatus::Voting);
+        client.set_poll_status(&1_u64, &PollStatus::Voting, &None);
 
     if !env
         .storage()
@@ -1290,10 +1291,13 @@ mod test {
         client.set_poll_status(&1_u64, &PollStatus::Active);
         let (env, admin, client) = setup();
         client.set_poll_status(&admin, &1_u64, &PollStatus::Active);
+    fn cast_vote_rejects_locked_poll() {
+        let (env, _admin, client) = setup();
+        client.set_poll_status(&2_u64, &PollStatus::Locked, &None);
 
         let err = client
-            .try_cast_vote(&voter(&env), &1_u64, &VoteChoice::Yes)
-            .expect_err("active poll must reject voting");
+            .try_cast_vote(&voter(&env), &2_u64, &VoteChoice::Yes)
+            .expect_err("locked poll must reject voting");
 
         assert_eq!(err, Ok(PredictXError::VotingNotOpen));
     }
@@ -1304,6 +1308,10 @@ mod test {
         client.set_poll_status(&1_u64, &PollStatus::Resolved);
         let (env, admin, client) = setup();
         client.set_poll_status(&admin, &1_u64, &PollStatus::Resolved);
+        let (env, _admin, client) = setup();
+        client.cast_vote(&voter(&env), &1_u64, &VoteChoice::Yes);
+        env.ledger().set_timestamp(1_000_000 + VOTING_WINDOW_SECS);
+        client.auto_resolve(&1_u64);
 
         let err = client
             .try_cast_vote(&voter(&env), &1_u64, &VoteChoice::Yes)
@@ -1682,6 +1690,7 @@ mod test {
 
         client.cast_vote(&v, &1_u64, &VoteChoice::Yes);
         client.set_poll_status(&admin, &2_u64, &PollStatus::Voting);
+        client.set_poll_status(&2_u64, &PollStatus::Voting, &None);
 
         let err = client
             .try_initiate_dispute(&unfunded_initiator, &1_u64, &evidence)

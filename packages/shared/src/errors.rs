@@ -119,6 +119,8 @@ pub enum PredictXError {
     /// The poll does not have enough escrowed funds to cover the requested outflow.
     /// Returned before any token movement so one poll cannot spend another poll's stake.
     InsufficientPollEscrow = 39,
+    /// The requested poll status transition is not permitted.
+    InvalidPollStatusTransition = 39,
 }
 
 /// Schema version for the error discriminant layout.

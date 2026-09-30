@@ -710,6 +710,9 @@ impl PredictionMarket {
             .instance()
             .set(&DataKey::TokenAddress, &token_address);
         env.storage().instance().set(&DataKey::MarketVotingOracle, &voting_oracle);
+        env.storage()
+            .instance()
+            .set(&DataKey::VotingOracle, &voting_oracle);
         Ok(())
     }
 
@@ -861,6 +864,7 @@ impl PredictionMarket {
                 .set(&DataKey::Poll(poll_id), &poll);
         }
 
+        client.set_poll_status(&poll_id, &voting_oracle::PollStatus::Cancelled, &None);
         env.events()
             .publish((Symbol::new(&env, "PollCancelled"),), poll_id);
         Ok(())
@@ -1855,13 +1859,15 @@ mod test {
         oracle_client.set_poll_status(&7_u64, &voting_oracle::PollStatus::Resolved);
         oracle_client.initialize(&admin);
         oracle_client.set_poll_status(&admin, &7_u64, &voting_oracle::PollStatus::Resolved);
+        oracle_client.initialize(&admin);
+        oracle_client.set_poll_status(&7_u64, &voting_oracle::PollStatus::Locked, &None);
         let contract_id = env.register(PredictionMarket, ());
         let client = PredictionMarketClient::new(&env, &contract_id);
         let tok = create_test_token(&env);
         let treasury = Address::generate(&env);
         client.initialize(&admin, &oracle_id, &tok, &treasury, &TEST_FEE_BPS);
         let status = client.oracle_poll_status(&7_u64);
-        assert_eq!(status, PollStatus::Resolved);
+        assert_eq!(status, PollStatus::Locked);
     }
 
     #[test]
@@ -1911,6 +1917,22 @@ mod test {
 
     #[test]
     fn cancel_poll_sets_cancelled_status_and_emits_event() {
+        client.initialize(&admin, &oracle_id, &tok, &treasury, &TEST_FEE_BPS);
+        client.cancel_poll(&admin, &1_u64);
+        assert_eq!(
+            oracle_client.get_poll_status(&1_u64),
+            voting_oracle::PollStatus::Cancelled
+        );
+    }
+
+    // Helper to set up a real-token environment for emergency withdrawal tests
+    fn setup_emergency_env() -> (
+        Env,
+        Address,
+        Address,
+        Address,
+        PredictionMarketClient<'static>,
+    ) {
         let env = Env::default();
         env.mock_all_auths();
         let admin = Address::generate(&env);
@@ -2073,6 +2095,7 @@ mod test {
         seed_active_poll(&env, &contract_id, 5, &admin);
         env.ledger().set_timestamp(100);
         oracle_client.set_poll_status(&admin, &5_u64, &voting_oracle::PollStatus::Disputed);
+        oracle_client.set_poll_status(&5_u64, &voting_oracle::PollStatus::Disputed, &None);
 
         let user = Address::generate(&env);
         let amount: i128 = 25;
@@ -2105,6 +2128,9 @@ mod test {
         seed_active_poll(&env, &contract_id, 2, &admin);
         env.ledger().set_timestamp(200);
         oracle_client.set_poll_status(&admin, &2_u64, &voting_oracle::PollStatus::Locked);
+        oracle_client.set_poll_status(&5_u64, &voting_oracle::PollStatus::Locked, &None);
+        oracle_client.set_poll_status(&5_u64, &voting_oracle::PollStatus::Voting, &None);
+        oracle_client.set_poll_status(&5_u64, &voting_oracle::PollStatus::Disputed, &None);
 
         let user = Address::generate(&env);
         let stake = Stake {
@@ -2142,6 +2168,9 @@ mod test {
         seed_active_poll(&env, &contract_id, 3, &admin);
         env.ledger().set_timestamp(300);
         oracle_client.set_poll_status(&admin, &3_u64, &voting_oracle::PollStatus::Disputed);
+        oracle_client.set_poll_status(&3_u64, &voting_oracle::PollStatus::Locked, &None);
+        oracle_client.set_poll_status(&3_u64, &voting_oracle::PollStatus::Voting, &None);
+        oracle_client.set_poll_status(&3_u64, &voting_oracle::PollStatus::Disputed, &None);
 
         let user = Address::generate(&env);
         let amount: i128 = 40;
@@ -2431,7 +2460,9 @@ mod test {
         let treasury = Address::generate(&env);
         client.initialize(&admin, &oracle, &tok, &treasury, &TEST_FEE_BPS);
         seed_active_poll(&env, &contract_id, 1, &admin);
-        let err = client.try_resolve_poll(&stranger, &1_u64, &true).expect_err("non-oracle");
+        let err = client
+            .try_resolve_poll(&stranger, &1_u64, &true)
+            .expect_err("non-oracle");
         assert_eq!(err, Ok(PredictXError::Unauthorized));
     }
 
@@ -2458,7 +2489,9 @@ mod test {
         let tok = Address::generate(&env);
         let treasury = Address::generate(&env);
         client.initialize(&admin, &oracle, &tok, &treasury, &TEST_FEE_BPS);
-        let err = client.try_resolve_poll(&oracle, &99_u64, &false).expect_err("missing");
+        let err = client
+            .try_resolve_poll(&oracle, &99_u64, &false)
+            .expect_err("missing");
         assert_eq!(err, Ok(PredictXError::PollNotFound));
     }
 
@@ -4342,4 +4375,10 @@ mod test {
     }
 
 }
+        client.resolve_poll(&oracle, &3_u64, &false);
+        let err = client
+            .try_resolve_poll(&oracle, &3_u64, &true)
+            .expect_err("already");
+        assert_eq!(err, Ok(PredictXError::PollAlreadyResolved));
+    }
 }
