@@ -13,6 +13,7 @@ use predictx_shared::{
     UserStats, BPS_DENOMINATOR, MAX_POLLS_PER_MATCH,
     DataKey, Match, PlatformStats, Poll, PollCategory, PollStatus, PredictXError, Stake, StakeSide,
     MAX_POLLS_PER_MATCH,
+    MAX_POLLS_PER_MATCH, MAX_QUESTION_LENGTH,
 };
 use soroban_sdk::{contract, contractimpl, contracttype, token, Address, Env, String, Symbol, Vec};
 
@@ -753,6 +754,15 @@ impl PredictionMarket {
             return Err(PredictXError::InvalidLockTime);
         }
 
+        let question_bytes = question.to_bytes();
+        let question_char_count = question_bytes
+            .iter()
+            .filter(|byte| byte & 0b1100_0000 != 0b1000_0000)
+            .count();
+        if question_char_count > MAX_QUESTION_LENGTH as usize {
+            return Err(PredictXError::PollQuestionTooLong);
+        }
+
         // Check max polls per match
         let mut match_polls: Vec<u64> = env
             .storage()
@@ -1161,6 +1171,56 @@ mod test {
     fn create_test_token(env: &Env) -> Address {
         let token_admin = Address::generate(env);
         env.register_stellar_asset_contract_v2(token_admin).address()
+    fn setup_poll_test() -> (Env, Address, PredictionMarketClient<'static>, u64) {
+        let env = Env::default();
+        env.mock_all_auths();
+        let contract_id = env.register(PredictionMarket, ());
+        let client = PredictionMarketClient::new(&env, &contract_id);
+        let admin = Address::generate(&env);
+        let oracle = Address::generate(&env);
+        let token = Address::generate(&env);
+        let treasury = Address::generate(&env);
+        client.initialize(&admin, &oracle, &token, &treasury, &TEST_FEE_BPS);
+        let match_id = client.create_match(
+            &admin,
+            &String::from_str(&env, "Home"),
+            &String::from_str(&env, "Away"),
+            &String::from_str(&env, "League"),
+            &String::from_str(&env, "Venue"),
+            &2_000_u64,
+        );
+        (env, admin, client, match_id)
+    }
+
+    #[test]
+    fn create_poll_accepts_256_ascii_characters() {
+        let (env, creator, client, match_id) = setup_poll_test();
+        let question = String::from_str(&env, &"a".repeat(MAX_QUESTION_LENGTH as usize));
+        assert_eq!(
+            client.create_poll(&creator, &match_id, &question, &PollCategory::Other, &1_500_u64),
+            1,
+        );
+    }
+
+    #[test]
+    fn create_poll_accepts_256_multibyte_characters() {
+        let (env, creator, client, match_id) = setup_poll_test();
+        let question = String::from_str(&env, &"é".repeat(MAX_QUESTION_LENGTH as usize));
+        assert_eq!(
+            client.create_poll(&creator, &match_id, &question, &PollCategory::Other, &1_500_u64),
+            1,
+        );
+    }
+
+    #[test]
+    fn create_poll_rejects_257_multibyte_characters() {
+        let (env, creator, client, match_id) = setup_poll_test();
+        let question = String::from_str(&env, &"é".repeat(MAX_QUESTION_LENGTH as usize + 1));
+        let error = client
+            .try_create_poll(&creator, &match_id, &question, &PollCategory::Other, &1_500_u64)
+            .unwrap_err()
+            .unwrap();
+        assert_eq!(error, PredictXError::PollQuestionTooLong);
     }
 
     #[test]

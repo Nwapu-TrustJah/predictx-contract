@@ -19,7 +19,7 @@ pub const ADMIN_REVIEW_THRESHOLD_BPS: u32 = 6_000;
 /// Number of admin signatures required for multi-sig actions.
 pub const MULTI_SIG_REQUIRED: u32 = 3;
 
-/// Maximum length (in characters) for a poll question.
+/// Maximum length (in Unicode scalar values) for a poll question.
 pub const MAX_QUESTION_LENGTH: u32 = 256;
 
 /// Maximum length (in bytes) for match string fields (home team, away team, league, venue).
