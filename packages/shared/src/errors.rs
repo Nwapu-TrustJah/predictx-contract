@@ -88,4 +88,6 @@ pub enum PredictXError {
     InvalidStateTransition = 39,
     /// Caller did not vote on this poll and cannot claim a voter reward.
     NotEligibleVoter = 36,
+    /// The dispute window has closed; the poll can no longer be disputed.
+    DisputeWindowClosed = 36,
 }

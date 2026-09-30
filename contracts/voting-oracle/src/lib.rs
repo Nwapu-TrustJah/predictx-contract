@@ -109,6 +109,8 @@ pub(crate) enum DataKey {
     /// `(poll_id, outcome)` → admin approvals recorded for resolving a
     /// disputed poll to `outcome`.
     DisputeApprovals(u64, VoteChoice),
+    /// `poll_id` → open dispute against the poll's resolution.
+    Dispute(u64),
 }
 
 fn get_admin(env: &Env) -> Result<Address, PredictXError> {
@@ -471,6 +473,7 @@ impl VotingOracle {
     /// A `Dispute` record is persisted and the poll status transitions to
     /// `Disputed`.
     /// Open a dispute against a settled poll, escrowing `dispute_fee`.
+    /// Open a dispute against a resolved poll within the dispute window.
     pub fn initiate_dispute(
         env: Env,
         initiator: Address,
@@ -655,6 +658,13 @@ impl VotingOracle {
     /// Number of admin approvals recorded for resolving `poll_id` to `outcome`.
     pub fn get_dispute_approvals(env: Env, poll_id: u64, outcome: VoteChoice) -> u32 {
         storage::read_dispute_approvals(&env, poll_id, outcome)
+    ) -> Result<(), PredictXError> {
+        voting::initiate_dispute(&env, initiator, poll_id, evidence_hash)
+    }
+
+    /// Return the dispute raised against `poll_id`, if any.
+    pub fn get_dispute(env: Env, poll_id: u64) -> Result<Dispute, PredictXError> {
+        storage::read_dispute(&env, poll_id).ok_or(PredictXError::PollNotFound)
     }
 }
 
