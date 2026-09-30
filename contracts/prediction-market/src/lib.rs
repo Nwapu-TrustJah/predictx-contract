@@ -2,6 +2,7 @@
 
 mod matches;
 mod payouts;
+mod polls;
 mod staking;
 mod payouts;
 pub(crate) mod token_utils;
@@ -148,6 +149,8 @@ pub enum DataKey {
     MatchPolls(u64),
     // ── poll & staking keys ───────────────────────────────────────────────────
     Poll(u64),
+    /// `status` → `Vec<u64>` poll IDs currently in that status bucket.
+    PollsByStatus(PollStatus),
     UserStakes(Address),
     HasStaked(u64, Address),
     /// `user` → `UserStats` — activity totals returned by the stats views. (Persistent)
@@ -603,6 +606,9 @@ impl PredictionMarket {
             .persistent()
             .set(&DataKey::Poll(poll_id), &poll);
         client.set_poll_status(&admin, &poll_id, &voting_oracle::PollStatus::Cancelled);
+        if env.storage().persistent().has(&DataKey::Poll(poll_id)) {
+            polls::transition_status(&env, poll_id, PollStatus::Cancelled)?;
+        }
         env.events().publish((Symbol::new(&env, "PollCancelled"),), poll_id);
         client.set_poll_status(
             &env.current_contract_address(),
@@ -827,6 +833,7 @@ impl PredictionMarket {
         env.storage()
             .persistent()
             .set(&DataKey::Poll(poll_id), &poll);
+        polls::add_to_index(&env, poll_id, PollStatus::Active);
 
         match_polls.push_back(poll_id);
         env.storage()
@@ -903,6 +910,15 @@ impl PredictionMarket {
         payouts::record_poll_resolution(&env, &mut poll, outcome)
         payouts::resolve_poll(&env, caller, poll_id, outcome)
         Ok(poll.status)
+        poll.outcome = Some(outcome);
+        poll.resolution_time = env.ledger().timestamp();
+
+        env.storage()
+            .persistent()
+            .set(&DataKey::Poll(poll_id), &poll);
+        polls::transition_status(&env, poll_id, PollStatus::Resolved)?;
+
+        Ok(())
     }
 
     /// Check whether a poll is currently open for staking, combining its lifecycle
@@ -922,6 +938,14 @@ impl PredictionMarket {
             .persistent()
             .get(&DataKey::Poll(poll_id))
             .ok_or(PredictXError::PollNotFound)
+    }
+
+    /// Page through all poll IDs currently in `status`.
+    ///
+    /// `start` is the zero-based offset into the bucket and `limit` caps the
+    /// number of results returned (clamped to the max page size).
+    pub fn get_polls_by_status(env: Env, status: PollStatus, start: u32, limit: u32) -> Vec<u64> {
+        polls::get_polls_by_status(&env, status, start, limit)
     }
 
     // ── Staking ───────────────────────────────────────────────────────────────
@@ -1128,6 +1152,9 @@ impl PredictionMarket {
     /// state machine allows resolving from, so an `Active` poll has to be
     /// locked and moved into voting first.
     pub fn resolve_poll(
+    /// Admin-only resolution entry point that records the outcome, updates the
+    /// status index, and emits the resolution fee.
+    pub fn admin_resolve_poll(
         env: Env,
         caller: Address,
         poll_id: u64,

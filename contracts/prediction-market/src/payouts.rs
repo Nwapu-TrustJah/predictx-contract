@@ -90,6 +90,7 @@ use crate::{DataKey, get_platform_stats, has_emergency_claimed, set_platform_sta
 use crate::{get_platform_stats, set_platform_stats, token_utils, DataKey};
 use predictx_shared::{Poll, PollStatus, PredictXError, Stake, StakeSide, BPS_DENOMINATOR};
 use soroban_sdk::{Address, Env, Symbol};
+use crate::{DataKey, get_platform_stats, set_platform_stats, polls, token_utils};
 
 /// Resolve a poll using the registered oracle and record its final outcome.
 ///
@@ -259,7 +260,6 @@ pub(crate) fn record_poll_resolution(
         return Err(PredictXError::PollNotLocked);
     }
 
-    poll.status = PollStatus::Resolved;
     poll.outcome = Some(outcome);
     poll.resolver = Some(admin.clone());
     poll.resolution_basis = Some(resolution_basis.clone());
@@ -267,6 +267,8 @@ pub(crate) fn record_poll_resolution(
     env.storage()
         .persistent()
         .set(&DataKey::Poll(poll.poll_id), poll);
+        .set(&DataKey::Poll(poll_id), &poll);
+    polls::transition_status(&env, poll_id, PollStatus::Resolved)?;
 
     let total_pool = poll.yes_pool + poll.no_pool;
     let fee = total_pool * token_utils::get_platform_fee_bps(env) as i128 / BPS_DENOMINATOR as i128;
@@ -447,6 +449,13 @@ pub fn claim_winnings(env: &Env, claimant: Address, poll_id: u64) -> Result<i128
             // No-contest: nothing was staked on the losing side, so there is no
             // pot to skim a platform fee from. Every winner is refunded their exact
             // stake rather than a fee-discounted share of a one-sided pool.
+        let losing_pool: i128 = if outcome_yes { poll.no_pool } else { poll.yes_pool };
+        if losing_pool <= 0 {
+            // ── One-sided pool: refund the winner at par, no fee ──────────────
+            //
+            // Nothing was staked on the losing side, so there is no opposing
+            // liquidity to share and no "winner's profit" to skim a fee from.
+            // Mirrors `calculate_winnings`.
             stake.amount
         } else {
             // Proportional share of total pool, after platform fee.
@@ -502,6 +511,7 @@ pub fn claim_winnings(env: &Env, claimant: Address, poll_id: u64) -> Result<i128
         gross.saturating_sub(payout)
     } else {
         0
+        }
         }
         }
     };
@@ -790,6 +800,8 @@ mod test {
         side: StakeSide,
         amount: i128,
     ) -> Address {
+    /// Create a user, fund them, place a stake, and return the user address.
+    fn stake_user(s: &TestSetup, poll_id: u64, side: StakeSide, amount: i128) -> Address {
         let user = Address::generate(&s.env);
         mint_tokens(s, &user, amount);
         s.client.stake(&user, &poll_id, &amount, &side);
@@ -1127,6 +1139,7 @@ mod test {
         resolve_via_state_machine(&s, poll_id, true);
         s.env.ledger().set_timestamp(2_000_001);
         s.client.resolve_poll(&s.admin, &poll_id, &true, &String::from_str(&s.env, "test"));
+        s.client.admin_resolve_poll(&s.admin, &poll_id, &true);
 
         let claimed = s.client.claim_winnings(&winner, &poll_id);
 
@@ -1146,6 +1159,7 @@ mod test {
         resolve_via_state_machine(&s, poll_id, false);
         s.env.ledger().set_timestamp(2_000_001);
         s.client.resolve_poll(&s.admin, &poll_id, &false, &String::from_str(&s.env, "test"));
+        s.client.admin_resolve_poll(&s.admin, &poll_id, &false);
 
         // The quote and the claim must agree, both fee-free.
         assert_eq!(s.client.calculate_winnings(&poll_id, &winner), 50_000_000);
