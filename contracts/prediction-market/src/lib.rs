@@ -592,6 +592,7 @@ impl PredictionMarket {
         env.storage()
             .persistent()
             .set(&DataKey::Poll(poll_id), &poll);
+        client.set_poll_status(&admin, &poll_id, &voting_oracle::PollStatus::Cancelled);
         env.events().publish((Symbol::new(&env, "PollCancelled"),), poll_id);
         client.set_poll_status(
             &env.current_contract_address(),

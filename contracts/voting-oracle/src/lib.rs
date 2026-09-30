@@ -295,6 +295,17 @@ impl VotingOracle {
             return Err(PredictXError::Unauthorized);
         }
 
+        // Keep the legacy singleton (`DataKey::Admin`) and the registry in
+        // agreement. If the address being removed is the singleton, migrate the
+        // singleton to a remaining registry admin in the same transaction
+        // rather than leaving a registry-evicted address with residual admin
+        // identity (`admin()` would otherwise report an address `is_admin()`
+        // denies). The `len() > 1` guard above guarantees `updated` is non-empty.
+        if get_admin(&env)? == admin {
+            let replacement = updated.get(0).ok_or(PredictXError::Unauthorized)?;
+            env.storage().instance().set(&DataKey::Admin, &replacement);
+        }
+
         storage::write_admins(&env, &updated);
         Ok(())
     }
@@ -365,6 +376,13 @@ impl VotingOracle {
     /// own cancellations here, and a contract call can never present the
     /// owner's signature. That means the market address must be registered
     /// with [`add_admin`] for the mirror to succeed.
+    /// Set the status of `poll_id` (opens, cancels, locks or resolves it).
+    ///
+    /// Authorized against the multi-admin `AdminList` registry — the same
+    /// authority `add_admin` / `remove_admin` use — rather than the legacy
+    /// `DataKey::Admin` singleton, which `remove_admin` can evict. That keeps a
+    /// single source of truth for who may drive a poll's lifecycle: every
+    /// registered admin can, and a registry-evicted address cannot.
     pub fn set_poll_status(
         env: Env,
         caller: Address,
@@ -376,6 +394,8 @@ impl VotingOracle {
         admin.require_auth();
         caller.require_auth();
         storage::require_admin(&env, &caller)?;
+        storage::require_admin(&env, &caller)?;
+        caller.require_auth();
 
         let stored = StoredPollStatus {
             status,
@@ -769,6 +789,7 @@ mod test {
     use soroban_sdk::testutils::{Address as _, Ledger};
     use soroban_sdk::testutils::{Address as _, Ledger as _};
     use soroban_sdk::testutils::{Address as _, Ledger as _, MockAuth, MockAuthInvoke};
+    use soroban_sdk::testutils::{Address as _, Ledger, MockAuth, MockAuthInvoke};
     use soroban_sdk::IntoVal;
 
     #[test]
@@ -1027,6 +1048,8 @@ mod test {
             .try_get_vote_tally(&7_u64)
             .expect_err("unknown poll should error");
         assert_eq!(err, Ok(PredictXError::PollNotFound));
+        client.set_poll_status(&admin, &42_u64, &PollStatus::Resolved);
+        assert_eq!(client.get_poll_status(&42_u64), PollStatus::Resolved);
     }
 
     #[test]
@@ -1332,5 +1355,59 @@ mod test {
             .cast_vote(&voter, &10_u64, &VoteChoice::Yes);
 
         assert!(client.has_voted(&10_u64, &voter));
+    fn registry_admin_can_set_poll_status_without_being_the_singleton() {
+        let (env, admin, client) = setup();
+        let contract = client.address.clone();
+
+        // A second registry admin that is NOT the singleton.
+        let second = Address::generate(&env);
+        client.add_admin(&admin, &second);
+        assert_ne!(second, admin);
+
+        // Only `second` authorizes this call — no blanket `mock_all_auths`.
+        env.mock_auths(&[MockAuth {
+            address: &second,
+            invoke: &MockAuthInvoke {
+                contract: &contract,
+                fn_name: "set_poll_status",
+                args: (second.clone(), 9_u64, PollStatus::Resolved).into_val(&env),
+                sub_invokes: &[],
+            },
+        }]);
+
+        client.set_poll_status(&second, &9_u64, &PollStatus::Resolved);
+        assert_eq!(client.get_poll_status(&9_u64), PollStatus::Resolved);
+    }
+
+    #[test]
+    fn removed_singleton_cannot_set_poll_status_and_views_agree() {
+        let (env, original, client) = setup();
+        let contract = client.address.clone();
+
+        let second = Address::generate(&env);
+        client.add_admin(&original, &second);
+
+        // `second` evicts the original singleton from the registry.
+        client.remove_admin(&second, &original);
+        assert!(!client.is_admin(&original));
+
+        // The singleton view must still name a registered admin — the two
+        // authorities can never disagree after a removal.
+        assert!(client.is_admin(&client.admin()));
+
+        env.mock_auths(&[MockAuth {
+            address: &original,
+            invoke: &MockAuthInvoke {
+                contract: &contract,
+                fn_name: "set_poll_status",
+                args: (original.clone(), 1_u64, PollStatus::Resolved).into_val(&env),
+                sub_invokes: &[],
+            },
+        }]);
+
+        let err = client
+            .try_set_poll_status(&original, &1_u64, &PollStatus::Resolved)
+            .expect_err("a registry-evicted address must not set poll status");
+        assert_eq!(err, Ok(PredictXError::Unauthorized));
     }
 }

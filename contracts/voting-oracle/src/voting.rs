@@ -771,6 +771,10 @@ fn require_disputed(env: &Env, poll_id: u64) -> Result<(), PredictXError> {
 
     voter_reward_share(&tally, voters.len())
 }
+    #[test]
+    fn cast_vote_rejects_active_poll() {
+        let (env, admin, client) = setup();
+        client.set_poll_status(&admin, &1_u64, &PollStatus::Active);
 
 /// Share of the reserved voter reward pool owed to a single eligible voter.
 ///
