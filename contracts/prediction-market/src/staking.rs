@@ -57,6 +57,8 @@ fn record_stake_in_user_stats(env: &Env, staker: &Address, amount: i128) {
         .set(&DataKey::UserStats(staker.clone()), &user_stats);
 }
 use crate::{DataKey, PoolInfo, get_platform_stats, set_platform_stats, ensure_not_paused, token_utils, escrow};
+use crate::{PoolInfo, get_platform_stats, set_platform_stats, ensure_not_paused, token_utils};
+use predictx_shared::DataKey;
 
 // ── Stake placement ───────────────────────────────────────────────────────────
 
@@ -1229,6 +1231,7 @@ mod test {
                 .instance()
                 .get(&DataKey::TreasuryAddress)
                 .unwrap()
+            s.env.storage().instance().get(&DataKey::MarketTreasuryAddress).unwrap()
         });
         assert_eq!(s.client.get_treasury_address(), treasury);
     }

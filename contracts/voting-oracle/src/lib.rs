@@ -18,6 +18,9 @@ use soroban_sdk::{contract, contractimpl, Address, Env, Vec};
 use storage::{get_admin, read_poll_status, read_poll_status_updated_at, DataKey, StoredPollStatus};
 use predictx_shared::DataKey;
 use predictx_shared::{PollStatus, PredictXError, VoteChoice, VoteTally, VOTING_WINDOW_SECS};
+use predictx_shared::{
+    DataKey, PollStatus, PredictXError, VoteChoice, VoteTally, VOTING_WINDOW_SECS,
+};
 use soroban_sdk::{contract, contractimpl, contracttype, Address, Env, Vec};
 mod dispute;
 mod storage;
@@ -175,7 +178,7 @@ pub(crate) fn read_poll_status(env: &Env, poll_id: u64) -> PollStatus {
     let stored: Option<StoredPollStatus> = env
         .storage()
         .persistent()
-        .get(&DataKey::PollStatus(poll_id));
+        .get(&DataKey::OraclePollStatus(poll_id));
 
     stored.map(|s| s.status).unwrap_or(PollStatus::Active)
 }
@@ -183,7 +186,7 @@ pub(crate) fn read_poll_status(env: &Env, poll_id: u64) -> PollStatus {
 pub(crate) fn read_poll_status_updated_at(env: &Env, poll_id: u64) -> u64 {
     env.storage()
         .persistent()
-        .get::<DataKey, StoredPollStatus>(&DataKey::PollStatus(poll_id))
+        .get::<DataKey, StoredPollStatus>(&DataKey::OraclePollStatus(poll_id))
         .map(|stored| stored.updated_at)
         .unwrap_or(0)
 }
@@ -449,6 +452,7 @@ impl VotingOracle {
         }
         .publish(&env);
 
+            .set(&DataKey::OraclePollStatus(poll_id), &stored);
         Ok(())
     }
 
@@ -470,7 +474,7 @@ impl VotingOracle {
         if !env
             .storage()
             .persistent()
-            .has(&DataKey::PollStatus(poll_id))
+            .has(&DataKey::OraclePollStatus(poll_id))
         {
             return false;
         }
@@ -487,7 +491,7 @@ impl VotingOracle {
         if !env
             .storage()
             .persistent()
-            .has(&DataKey::PollStatus(poll_id))
+            .has(&DataKey::OraclePollStatus(poll_id))
             || read_poll_status(&env, poll_id) != PollStatus::Voting
         {
             return false;
@@ -539,7 +543,7 @@ impl VotingOracle {
     pub fn get_poll_outcome(env: Env, poll_id: u64) -> Result<VoteChoice, PredictXError> {
         env.storage()
             .persistent()
-            .get(&DataKey::PollOutcome(poll_id))
+            .get(&DataKey::OraclePollOutcome(poll_id))
             .ok_or(PredictXError::PollNotFound)
     }
 
@@ -794,6 +798,7 @@ mod test {
     use soroban_sdk::testutils::{Address as _, Ledger as _, MockAuth, MockAuthInvoke};
     use soroban_sdk::testutils::{Address as _, Ledger, MockAuth, MockAuthInvoke};
     use soroban_sdk::IntoVal;
+    use soroban_sdk::testutils::{Address as _, Ledger as _};
 
     #[test]
     fn set_and_get_status() {

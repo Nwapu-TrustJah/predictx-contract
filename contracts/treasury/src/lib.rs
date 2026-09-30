@@ -23,6 +23,8 @@ use soroban_sdk::{contract, contractimpl, contracttype, symbol_short, token, Add
 /// or reordered. The golden XDR fixtures in the test module pin the exact
 /// encoding; a mismatch fails CI with an explicit schema-version message.
 pub const TREASURY_SCHEMA_VERSION: u32 = 1;
+use predictx_shared::{DataKey, PredictXError};
+use soroban_sdk::{contract, contractimpl, token, Address, Env};
 
 #[contract]
 pub struct Treasury;
@@ -60,7 +62,7 @@ fn get_token(env: &Env) -> Result<Address, PredictXError> {
 fn get_market(env: &Env) -> Result<Address, PredictXError> {
     env.storage()
         .instance()
-        .get(&DataKey::Market)
+        .get(&DataKey::TreasuryMarket)
         .ok_or(PredictXError::NotInitialized)
 }
 
@@ -80,6 +82,8 @@ fn get_total_fees_collected(env: &Env) -> i128 {
     env.storage()
         .instance()
         .get(&DataKey::TotalFeesCollected)
+        .persistent()
+        .get(&DataKey::TreasuryDepositorBalance(who.clone()))
         .unwrap_or(0_i128)
 }
 
@@ -146,7 +150,7 @@ impl Treasury {
             return Err(PredictXError::Unauthorized);
         }
         admin.require_auth();
-        env.storage().instance().set(&DataKey::Market, &market);
+        env.storage().instance().set(&DataKey::TreasuryMarket, &market);
         Ok(())
     }
 
@@ -187,6 +191,7 @@ impl Treasury {
             .set(&DataKey::Balance(from), &new_balance);
         env.events()
             .publish((FEES_DEPOSITED, from.clone()), amount);
+            .set(&DataKey::TreasuryDepositorBalance(from), &new_balance);
         Ok(new_balance)
     }
 
@@ -220,6 +225,7 @@ impl Treasury {
             .set(&DataKey::Balance(from), &new_balance);
         env.events()
             .publish((FEES_DEPOSITED, from.clone()), amount);
+            .set(&DataKey::TreasuryDepositorBalance(from), &new_balance);
         Ok(new_balance)
             .instance()
             .set(&DataKey::TotalFeesCollected, &total_collected);

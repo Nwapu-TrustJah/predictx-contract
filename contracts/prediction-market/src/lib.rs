@@ -20,6 +20,8 @@ use predictx_shared::{
     Match, ParamKey, ParamProposal, PlatformStats, Poll, PollCategory, PollStatus, PredictXError,
     Stake, StakeSide, MAX_POLLS_PER_MATCH, PARAM_TIMELOCK_DELAY,
     UserStats, MAX_POLLS_PER_MATCH,
+    DataKey, Match, PlatformStats, Poll, PollCategory, PollStatus, PredictXError, Stake,
+    StakeSide, MAX_POLLS_PER_MATCH,
 };
 use soroban_sdk::{contract, contractimpl, contracttype, token, Address, Env, String, Symbol, Vec};
 
@@ -229,6 +231,8 @@ fn get_oracle(env: &Env) -> Result<Address, PredictXError> {
     env.storage()
         .instance()
         .get(&DataKey::VotingOracle)
+fn get_oracle(env: &Env) -> Result<Address, PredictXError> {
+    env.storage().instance().get(&DataKey::MarketVotingOracle)
         .ok_or(PredictXError::NotInitialized)
 }
 
@@ -272,6 +276,7 @@ fn is_paused(env: &Env) -> bool {
         .instance()
         .get(&DataKey::Paused)
         .unwrap_or(false)
+    env.storage().instance().get(&DataKey::MarketPaused).unwrap_or(false)
 }
 
 pub(crate) fn ensure_not_paused(env: &Env) -> Result<(), PredictXError> {
@@ -535,6 +540,10 @@ impl PredictionMarket {
         env.storage()
             .instance()
             .set(&DataKey::PlatformFeeBps, &platform_fee_bps);
+        env.storage().instance().set(&DataKey::MarketVotingOracle, &voting_oracle);
+        env.storage().instance().set(&DataKey::TokenAddress, &token_address);
+        env.storage().instance().set(&DataKey::MarketTreasuryAddress, &treasury_address);
+        env.storage().instance().set(&DataKey::PlatformFeeBps, &platform_fee_bps);
         env.storage().instance().set(&DataKey::NextMatchId, &1u64);
         env.storage().instance().set(&DataKey::NextPollId, &1u64);
         env.storage().instance().set(&DataKey::Initialized, &true);
@@ -700,6 +709,7 @@ impl PredictionMarket {
         env.storage()
             .instance()
             .set(&DataKey::TokenAddress, &token_address);
+        env.storage().instance().set(&DataKey::MarketVotingOracle, &voting_oracle);
         Ok(())
     }
 
@@ -746,6 +756,8 @@ impl PredictionMarket {
         env.storage().instance().set(&DataKey::Paused, &true);
         env.events()
             .publish((Symbol::new(&env, "ContractPaused"),), true);
+        env.storage().instance().set(&DataKey::MarketPaused, &true);
+        env.events().publish((Symbol::new(&env, "ContractPaused"),), true);
         Ok(())
     }
 
@@ -760,6 +772,8 @@ impl PredictionMarket {
         env.storage().instance().set(&DataKey::Paused, &false);
         env.events()
             .publish((Symbol::new(&env, "ContractUnpaused"),), true);
+        env.storage().instance().set(&DataKey::MarketPaused, &false);
+        env.events().publish((Symbol::new(&env, "ContractUnpaused"),), true);
         Ok(())
     }
 

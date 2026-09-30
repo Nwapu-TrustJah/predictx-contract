@@ -2,17 +2,11 @@
 
 use predictx_shared::{Poll, PollCategory, PollStatus, PredictXError};
 use soroban_sdk::{contract, contractimpl, contracttype, Address, Env, String};
+use predictx_shared::{DataKey, Poll, PollCategory, PollStatus, PredictXError};
+use soroban_sdk::{contract, contractimpl, Address, Env, String};
 
 #[contract]
 pub struct PollFactory;
-
-#[contracttype]
-#[derive(Clone)]
-enum DataKey {
-    Admin,
-    NextPollId,
-    Poll(u64),
-}
 
 fn get_admin(env: &Env) -> Result<Address, PredictXError> {
     env.storage()

@@ -11,6 +11,8 @@ use crate::{DataKey, MatchStats};
 use crate::{DataKey, MatchUpdate};
 use predictx_shared::{Match, PredictXError};
 use soroban_sdk::{Address, Env, String, Symbol, Vec}; // ← uses prediction-market's local DataKey, not shared one
+use predictx_shared::{Match, PredictXError};
+use predictx_shared::DataKey;
 
 // ── Internal helper ───────────────────────────────────────────────────────────
 

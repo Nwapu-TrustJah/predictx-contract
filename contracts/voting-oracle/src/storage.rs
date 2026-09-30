@@ -128,7 +128,7 @@ pub fn write_tally(env: &Env, tally: &VoteTally) {
 pub fn read_voters(env: &Env, poll_id: u64) -> Vec<Address> {
     env.storage()
         .persistent()
-        .get(&DataKey::Voters(poll_id))
+        .get(&DataKey::OracleVoters(poll_id))
         .unwrap_or(Vec::new(env))
 }
 
@@ -136,7 +136,7 @@ pub fn read_voters(env: &Env, poll_id: u64) -> Vec<Address> {
 pub fn write_voters(env: &Env, poll_id: u64, voters: &Vec<Address>) {
     env.storage()
         .persistent()
-        .set(&DataKey::Voters(poll_id), voters);
+        .set(&DataKey::OracleVoters(poll_id), voters);
 }
 
 // ── Vote-dedup storage ────────────────────────────────────────────────────────
@@ -210,7 +210,7 @@ pub fn write_vote_choice(env: &Env, poll_id: u64, voter: &Address, choice: VoteC
 pub fn read_reward_pool(env: &Env, poll_id: u64) -> i128 {
     env.storage()
         .persistent()
-        .get(&DataKey::RewardPool(poll_id))
+        .get(&DataKey::VoterRewardPool(poll_id))
         .unwrap_or(0)
 }
 
@@ -218,7 +218,7 @@ pub fn read_reward_pool(env: &Env, poll_id: u64) -> i128 {
 pub fn write_reward_pool(env: &Env, poll_id: u64, amount: i128) {
     env.storage()
         .persistent()
-        .set(&DataKey::RewardPool(poll_id), &amount);
+        .set(&DataKey::VoterRewardPool(poll_id), &amount);
 }
 
 /// Whether `voter` has already claimed their reward on `poll_id`.
@@ -231,7 +231,7 @@ pub fn write_reward_pool(env: &Env, poll_id: u64, amount: i128) {
 pub fn has_claimed_reward(env: &Env, poll_id: u64, voter: &Address) -> bool {
     env.storage()
         .persistent()
-        .get(&DataKey::RewardClaimed(poll_id, voter.clone()))
+        .get(&DataKey::VoterRewardClaimed(poll_id, voter.clone()))
         .unwrap_or(false)
 }
 
@@ -244,7 +244,7 @@ pub fn has_claimed_reward(env: &Env, poll_id: u64, voter: &Address) -> bool {
 pub fn write_reward_claimed(env: &Env, poll_id: u64, voter: &Address) {
     env.storage()
         .persistent()
-        .set(&DataKey::RewardClaimed(poll_id, voter.clone()), &true);
+        .set(&DataKey::VoterRewardClaimed(poll_id, voter.clone()), &true);
 }
 // ── Admin approval storage ───────────────────────────────────────────────────
 
