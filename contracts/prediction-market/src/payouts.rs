@@ -102,6 +102,7 @@ pub fn get_claimable_amount(env: &Env, poll_id: u64, user: &Address) -> i128 {
 }
 
 // ── claim_winnings ────────────────────────────────────────────────────────────
+// ── Payout / claim engine ─────────────────────────────────────────────────────
 
 /// Claim winnings for a resolved poll.
 ///
@@ -114,6 +115,20 @@ pub fn get_claimable_amount(env: &Env, poll_id: u64, user: &Address) -> i128 {
 /// - Updates `PlatformStats.total_payouts`
 /// - Emits `WinningsClaimed(poll_id, user)` event
 pub fn claim_winnings_for_poll(
+/// ## Empty winning-pool path (issue #74)
+/// When a poll resolves Yes but *every* staker picked No (or vice versa) the
+/// winning pool is zero.  There is nobody eligible to collect winnings, so the
+/// entire pot would be stranded forever.  In this case we treat every staker —
+/// regardless of side — as eligible for a full, fee-free refund of their
+/// original stake.
+///
+/// **This is the one place `NotOnWinningSide` must NOT be returned.**
+/// Returning it here would lock funds in the contract with no recovery path.
+///
+/// ## One-sided path (no losing pool)
+/// When every staker is on the winning side there is no pot to skim a fee
+/// from, so winners are refunded at par.  This matches `calculate_winnings`.
+pub fn claim_winnings(
     env: &Env,
     user: Address,
     poll_id: u64,
@@ -168,6 +183,9 @@ pub fn claim_winnings_for_poll(
     } else {
         (poll.no_pool, poll.yes_pool)
     };
+    let winning_pool: i128 = if outcome_yes { poll.yes_pool } else { poll.no_pool };
+    let total_pool: i128 = poll.yes_pool + poll.no_pool;
+    let losing_pool: i128 = total_pool - winning_pool;
 
     let payout = if winning_pool == 0 {
         stake.amount
@@ -178,6 +196,43 @@ pub fn claim_winnings_for_poll(
         let net_losing_pool = losing_pool * fee_factor / bps;
         let share_of_losers = stake.amount * net_losing_pool / winning_pool;
         stake.amount + share_of_losers
+        // ── Normal winning-side claim ─────────────────────────────────────────
+
+        let staker_on_winning_side = match stake.side {
+            StakeSide::Yes => outcome_yes,
+            StakeSide::No => !outcome_yes,
+        };
+
+        if !staker_on_winning_side {
+            return Err(PredictXError::NotOnWinningSide);
+        }
+
+        if losing_pool <= 0 {
+            // No-contest: nothing to skim a fee from, refund at par.
+            // Must match calculate_winnings.
+            stake.amount
+        } else {
+            // Proportional share of total pool, after platform fee.
+            //
+            // payout = stake_amount * total_pool * (BPS_DENOMINATOR - fee_bps)
+            //          / (winning_pool * BPS_DENOMINATOR)
+            //
+            // Integer division rounds down; any dust remains in the contract.
+            let fee_bps = token_utils::get_platform_fee_bps(env);
+            let fee_factor = (BPS_DENOMINATOR - fee_bps) as i128;
+            let bps = BPS_DENOMINATOR as i128;
+
+            let gross = stake.amount * total_pool / winning_pool;
+            let net = gross * fee_factor / bps;
+            let fee = gross - net;
+
+            // Send platform fee to treasury
+            if fee > 0 {
+                token_utils::transfer_to_treasury(env, fee)?;
+            }
+
+            net
+        }
     };
 
     if payout == 0 {
@@ -350,6 +405,18 @@ mod test {
     //   net_losing_pool = 200 * 9500 / 10000 = 190
     //   share_of_losers = 100 * 190 / 300    =  63  (truncated)
     //   payout          = 100 + 63           = 163
+    /// Mint tokens to a fresh user and stake them through the real staking flow.
+    fn stake_user(s: &TestSetup, poll_id: u64, side: StakeSide, amount: i128) -> Address {
+        let user = Address::generate(&s.env);
+        mint_tokens(s, &user, amount);
+        s.client.stake(&user, &poll_id, &amount, &side);
+        user
+    }
+
+    // ── Tests: empty winning-pool path (issue #74) ────────────────────────────
+
+    /// A losing staker can recover their original stake when the winning pool
+    /// is empty (i.e. nobody staked on the winning side).
     #[test]
     fn view_output_equals_expected_claim_payout() {
         let s = setup();
@@ -520,6 +587,12 @@ mod test {
         // ── Read view BEFORE claiming ─────────────────────────────────────────
         let claimable = s.client.get_claimable_amount(&poll_id, &user);
         assert!(claimable > 0, "winner must have a positive claimable amount");
+    #[test]
+    fn one_sided_poll_refunds_the_winner_at_par() {
+        let s = setup();
+        let poll_id = create_poll(&s, 2_000_000);
+        let winner = stake_user(&s, poll_id, StakeSide::Yes, 100_000_000);
+        inject_resolved_poll(&s, poll_id, true, 100_000_000, 0);
 
         let balance_before = token_balance(&s, &user);
 
@@ -538,6 +611,12 @@ mod test {
             "get_claimable_amount ({claimable}) must equal tokens transferred ({})",
             balance_after - balance_before
         );
+    #[test]
+    fn one_sided_poll_no_side_also_refunds_at_par() {
+        let s = setup();
+        let poll_id = create_poll(&s, 2_000_000);
+        let winner = stake_user(&s, poll_id, StakeSide::No, 50_000_000);
+        inject_resolved_poll(&s, poll_id, false, 0, 50_000_000);
 
         // ── After claiming: view returns 0 ────────────────────────────────────
         assert_eq!(
