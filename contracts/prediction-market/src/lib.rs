@@ -101,6 +101,7 @@ pub enum DataKey {
     TreasuryAddress,
     PlatformFeeBps,
     Stake(u64, Address),
+    // Retained to recognize refunds claimed before the shared Stake.claimed ledger.
     EmergencyClaimed(u64, Address),
     /// Set once the platform fee for a poll has been sent to the treasury.
     FeePaid(u64),
@@ -209,7 +210,7 @@ fn load_stake(env: &Env, poll_id: u64, user: &Address) -> Option<Stake> {
     env.storage().persistent().get(&DataKey::Stake(poll_id, user.clone()))
 }
 
-fn has_emergency_claimed(env: &Env, poll_id: u64, user: &Address) -> bool {
+pub(crate) fn has_emergency_claimed(env: &Env, poll_id: u64, user: &Address) -> bool {
     env.storage().persistent()
         .get(&DataKey::EmergencyClaimed(poll_id, user.clone()))
         .unwrap_or(false)
@@ -447,6 +448,12 @@ impl PredictionMarket {
     }
 
     pub fn check_emergency_eligible(env: Env, poll_id: u64) -> bool {
+        let poll: Poll = match env.storage().persistent().get(&DataKey::Poll(poll_id)) {
+            Some(poll) => poll,
+            None => return false,
+        };
+        if poll.status == PollStatus::Resolved { return false; }
+
         let oracle_id = match get_oracle(&env) {
             Ok(id) => id,
             Err(_) => return false,
@@ -463,6 +470,12 @@ impl PredictionMarket {
     pub fn emergency_withdraw(env: Env, user: Address, poll_id: u64) -> Result<i128, PredictXError> {
         extend_instance_ttl(&env);
         user.require_auth();
+        let poll: Poll = env.storage().persistent()
+            .get(&DataKey::Poll(poll_id))
+            .ok_or(PredictXError::PollNotFound)?;
+        if poll.status == PollStatus::Resolved {
+            return Err(PredictXError::PollAlreadyResolved);
+        }
         if has_emergency_claimed(&env, poll_id, &user) {
             return Err(PredictXError::AlreadyClaimed);
         }
@@ -478,8 +491,12 @@ impl PredictionMarket {
             false
         };
         if !eligible { return Err(PredictXError::EmergencyWithdrawNotAllowed); }
-        let stake = load_stake(&env, poll_id, &user).ok_or(PredictXError::NotStaker)?;
-        set_emergency_claimed(&env, poll_id, &user);
+        let mut stake = load_stake(&env, poll_id, &user).ok_or(PredictXError::NotStaker)?;
+        if stake.claimed {
+            return Err(PredictXError::AlreadyClaimed);
+        }
+        stake.claimed = true;
+        env.storage().persistent().set(&DataKey::Stake(poll_id, user.clone()), &stake);
 
         // Transfer tokens back to user
         token_utils::transfer_from_contract(&env, &user, stake.amount)?;
@@ -986,6 +1003,8 @@ mod test {
         let user = Address::generate(&env);
         let amount: i128 = 50;
 
+        seed_active_poll(&env, &contract_id, 10, &admin);
+
         // Fund the contract so it can transfer back
         mint_to(&env, &token_addr, &contract_id, amount);
 
@@ -1006,12 +1025,13 @@ mod test {
 
     #[test]
     fn emergency_withdraw_after_dispute_timeout() {
-        let (env, _admin, oracle_id, contract_id, client) = setup_emergency_env();
+        let (env, admin, oracle_id, contract_id, client) = setup_emergency_env();
         let oracle_client = voting_oracle::Client::new(&env, &oracle_id);
         let token_addr: Address = env.as_contract(&contract_id, || {
             env.storage().instance().get(&DataKey::TokenAddress).unwrap()
         });
 
+        seed_active_poll(&env, &contract_id, 5, &admin);
         env.ledger().set_timestamp(100);
         oracle_client.set_poll_status(&5_u64, &voting_oracle::PollStatus::Disputed);
 
@@ -1031,9 +1051,10 @@ mod test {
 
     #[test]
     fn emergency_withdraw_rejected_before_timeout() {
-        let (env, _admin, oracle_id, contract_id, client) = setup_emergency_env();
+        let (env, admin, oracle_id, contract_id, client) = setup_emergency_env();
         let oracle_client = voting_oracle::Client::new(&env, &oracle_id);
 
+        seed_active_poll(&env, &contract_id, 2, &admin);
         env.ledger().set_timestamp(200);
         oracle_client.set_poll_status(&2_u64, &voting_oracle::PollStatus::Locked);
 
@@ -1050,12 +1071,13 @@ mod test {
 
     #[test]
     fn emergency_withdraw_prevents_double_withdrawal() {
-        let (env, _admin, oracle_id, contract_id, client) = setup_emergency_env();
+        let (env, admin, oracle_id, contract_id, client) = setup_emergency_env();
         let oracle_client = voting_oracle::Client::new(&env, &oracle_id);
         let token_addr: Address = env.as_contract(&contract_id, || {
             env.storage().instance().get(&DataKey::TokenAddress).unwrap()
         });
 
+        seed_active_poll(&env, &contract_id, 3, &admin);
         env.ledger().set_timestamp(300);
         oracle_client.set_poll_status(&3_u64, &voting_oracle::PollStatus::Disputed);
 
@@ -1081,6 +1103,113 @@ mod test {
             poll.status = status;
             env.storage().persistent().set(&DataKey::Poll(poll_id), &poll);
         });
+    #[test]
+    fn emergency_withdraw_rejects_resolved_poll_after_cancellation() {
+        let (env, admin, oracle_id, contract_id, client) = setup_emergency_env();
+        let user = Address::generate(&env);
+        let token_addr: Address = env.as_contract(&contract_id, || {
+            env.storage().instance().get(&DataKey::TokenAddress).unwrap()
+        });
+        seed_active_poll(&env, &contract_id, 20, &admin);
+        let stake = Stake {
+            user: user.clone(),
+            poll_id: 20,
+            amount: 40,
+            side: StakeSide::Yes,
+            claimed: false,
+            staked_at: env.ledger().timestamp(),
+        };
+        env.as_contract(&contract_id, || {
+            env.storage().persistent().set(&DataKey::Stake(20, user.clone()), &stake);
+        });
+        mint_to(&env, &token_addr, &contract_id, stake.amount);
+
+        client.resolve_poll(&oracle_id, &20_u64, &true);
+        client.cancel_poll(&admin, &20_u64);
+        assert!(!client.check_emergency_eligible(&20_u64));
+
+        let err = client.try_emergency_withdraw(&user, &20_u64).expect_err("resolved poll cannot be refunded");
+        assert_eq!(err, Ok(PredictXError::PollAlreadyResolved));
+    }
+
+    #[test]
+    fn emergency_withdraw_rejects_resolved_poll_after_locked_timeout() {
+        let (env, admin, oracle_id, contract_id, client) = setup_emergency_env();
+        let oracle_client = voting_oracle::Client::new(&env, &oracle_id);
+        let user = Address::generate(&env);
+        let token_addr: Address = env.as_contract(&contract_id, || {
+            env.storage().instance().get(&DataKey::TokenAddress).unwrap()
+        });
+
+        env.ledger().set_timestamp(100);
+        seed_active_poll(&env, &contract_id, 21, &admin);
+        oracle_client.set_poll_status(&21_u64, &voting_oracle::PollStatus::Locked);
+        let stake = Stake {
+            user: user.clone(),
+            poll_id: 21,
+            amount: 40,
+            side: StakeSide::Yes,
+            claimed: false,
+            staked_at: env.ledger().timestamp(),
+        };
+        env.as_contract(&contract_id, || {
+            env.storage().persistent().set(&DataKey::Stake(21, user.clone()), &stake);
+        });
+        mint_to(&env, &token_addr, &contract_id, stake.amount);
+
+        client.resolve_poll(&oracle_id, &21_u64, &true);
+        env.ledger().set_timestamp(100 + EMERGENCY_TIMEOUT_SECS);
+        assert_eq!(oracle_client.get_poll_status(&21_u64), voting_oracle::PollStatus::Locked);
+        assert!(env.ledger().timestamp() - oracle_client.get_poll_status_updated_at(&21_u64) >= EMERGENCY_TIMEOUT_SECS);
+        assert!(!client.check_emergency_eligible(&21_u64));
+
+        let err = client.try_emergency_withdraw(&user, &21_u64).expect_err("resolved poll cannot be refunded");
+        assert_eq!(err, Ok(PredictXError::PollAlreadyResolved));
+    }
+
+    #[test]
+    fn emergency_refund_and_winnings_share_claimed_marker() {
+        let (env, admin, oracle_id, contract_id, client) = setup_emergency_env();
+        let oracle_client = voting_oracle::Client::new(&env, &oracle_id);
+        let token_addr: Address = env.as_contract(&contract_id, || {
+            env.storage().instance().get(&DataKey::TokenAddress).unwrap()
+        });
+        let claim_first = Address::generate(&env);
+        let refund_first = Address::generate(&env);
+        let amount = 40;
+
+        seed_active_poll(&env, &contract_id, 22, &admin);
+        seed_active_poll(&env, &contract_id, 23, &admin);
+        for (poll_id, user) in [(22_u64, &claim_first), (23_u64, &refund_first)] {
+            let stake = Stake {
+                user: user.clone(),
+                poll_id,
+                amount,
+                side: StakeSide::Yes,
+                claimed: false,
+                staked_at: env.ledger().timestamp(),
+            };
+            env.as_contract(&contract_id, || {
+                env.storage().persistent().set(&DataKey::Stake(poll_id, user.clone()), &stake);
+            });
+        }
+        mint_to(&env, &token_addr, &contract_id, amount * 2);
+
+        client.resolve_poll(&oracle_id, &22_u64, &true);
+        client.cancel_poll(&admin, &22_u64);
+        client.claim_winnings(&claim_first, &22_u64);
+        let err = client.try_emergency_withdraw(&claim_first, &22_u64)
+            .expect_err("a winnings claim must prevent a refund");
+        assert_eq!(err, Ok(PredictXError::PollAlreadyResolved));
+
+        client.cancel_poll(&admin, &23_u64);
+        client.emergency_withdraw(&refund_first, &23_u64);
+        assert!(client.get_stake_info(&23_u64, &refund_first).claimed);
+        client.resolve_poll(&oracle_id, &23_u64, &true);
+        let err = client.try_claim_winnings(&refund_first, &23_u64)
+            .expect_err("a refund must prevent a winnings claim");
+        assert_eq!(err, Ok(PredictXError::AlreadyClaimed));
+        assert_eq!(oracle_client.get_poll_status(&23_u64), voting_oracle::PollStatus::Cancelled);
     }
 
     fn seed_active_poll(env: &Env, contract_id: &Address, poll_id: u64, creator: &Address) {

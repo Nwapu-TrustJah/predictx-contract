@@ -51,6 +51,7 @@ use predictx_shared::{
 };
 use crate::{DataKey, get_oracle, get_platform_stats, set_platform_stats, token_utils};
 use crate::{DataKey, get_platform_stats, set_platform_stats, token_utils, ensure_not_paused};
+use crate::{DataKey, get_platform_stats, has_emergency_claimed, set_platform_stats, token_utils};
 
 /// Resolve a poll using the registered oracle and record its final outcome.
 ///
@@ -216,7 +217,7 @@ pub fn claim_winnings(
         .get(&DataKey::Stake(poll_id, user.clone()))
         .ok_or(PredictXError::NotStaker)?;
 
-    if stake.claimed {
+    if stake.claimed || has_emergency_claimed(env, poll_id, &claimant) {
         return Err(PredictXError::AlreadyClaimed);
     }
 
