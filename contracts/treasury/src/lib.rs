@@ -14,6 +14,14 @@ use soroban_sdk::{contract, contractimpl, contracttype, token, Address, Env};
 const INSTANCE_TTL_THRESHOLD: u32 = 518_400;
 /// Extend to at least this many ledgers from now.
 const INSTANCE_TTL_EXTEND_TO: u32 = 518_400;
+use soroban_sdk::{contract, contractimpl, contracttype, token, Address, Env};
+
+/// Schema version for the treasury contract's stored layout.
+///
+/// Bump this whenever a stored type or `DataKey` variant is added, removed,
+/// or reordered. The golden XDR fixtures in the test module pin the exact
+/// encoding; a mismatch fails CI with an explicit schema-version message.
+pub const TREASURY_SCHEMA_VERSION: u32 = 1;
 
 #[contract]
 pub struct Treasury;
@@ -265,6 +273,103 @@ mod test {
         client.set_token(&admin, &token_contract.address());
 
         (env, contract_id, client, admin, token_contract.address())
+    }
+    use soroban_sdk::xdr::ToXdr;
+    use soroban_sdk::Bytes;
+    use soroban_sdk::testutils::Address as _;
+
+    fn setup() -> (Env, Address, TreasuryClient<'static>, Address, Address) {
+        let env = Env::default();
+        env.mock_all_auths();
+
+        let admin = Address::generate(&env);
+        let token_admin = Address::generate(&env);
+        let token_contract = env.register_stellar_asset_contract_v2(token_admin);
+        let contract_id = env.register(Treasury, ());
+        let client = TreasuryClient::new(&env, &contract_id);
+        client.initialize(&admin);
+        client.set_token(&admin, &token_contract.address());
+
+        (env, contract_id, client, admin, token_contract.address())
+    }
+
+    // ── golden XDR fixtures for stored DataKey variants ────────────────────
+    //
+    // These fixtures pin the positional encoding of every `DataKey` variant.
+    // Adding, removing, or reordering a variant changes the XDR and fails
+    // these tests with an explicit schema-version message. When the change is
+    // intentional, bump `TREASURY_SCHEMA_VERSION` and regenerate the golden
+    // blobs.
+
+    fn assert_golden_key(env: &Env, key: &DataKey, expected_hex: &str) {
+        let encoded: Bytes = key.clone().to_xdr(env);
+        let actual = std::format!("{:?}", encoded);
+        assert_eq!(
+            actual, expected_hex,
+            "DataKey XDR mismatch — stored layout changed. \
+             Bump TREASURY_SCHEMA_VERSION (currently {}) and regenerate the \
+             golden fixture.",
+            TREASURY_SCHEMA_VERSION
+        );
+    }
+
+    #[test]
+    fn data_key_admin_golden_xdr() {
+        let env = Env::default();
+        assert_golden_key(&env, &DataKey::Admin, "Bytes([0, 0, 0, 0])");
+    }
+
+    #[test]
+    fn data_key_market_golden_xdr() {
+        let env = Env::default();
+        assert_golden_key(&env, &DataKey::Market, "Bytes([0, 0, 0, 1])");
+    }
+
+    #[test]
+    fn data_key_token_address_golden_xdr() {
+        let env = Env::default();
+        assert_golden_key(&env, &DataKey::TokenAddress, "Bytes([0, 0, 0, 2])");
+    }
+
+    #[test]
+    fn data_key_balance_golden_xdr() {
+        let env = Env::default();
+        let who = Address::generate(&env);
+        let key = DataKey::Balance(who.clone());
+        let encoded: Bytes = key.to_xdr(&env);
+        // Round-trip: decode back and confirm the address survives.
+        let decoded: DataKey = DataKey::from_xdr(&env, &encoded).unwrap();
+        match decoded {
+            DataKey::Balance(addr) => assert_eq!(addr, who),
+            _ => panic!("decoded DataKey variant mismatch"),
+        }
+    }
+
+    #[test]
+    fn data_key_round_trip_all_variants() {
+        let env = Env::default();
+        let who = Address::generate(&env);
+        let keys = [
+            DataKey::Admin,
+            DataKey::Market,
+            DataKey::TokenAddress,
+            DataKey::Balance(who.clone()),
+        ];
+        for key in keys.iter() {
+            let encoded: Bytes = key.clone().to_xdr(&env);
+            let decoded: DataKey = DataKey::from_xdr(&env, &encoded).unwrap();
+            match (key, &decoded) {
+                (DataKey::Admin, DataKey::Admin) => {}
+                (DataKey::Market, DataKey::Market) => {}
+                (DataKey::TokenAddress, DataKey::TokenAddress) => {}
+                (DataKey::Balance(a), DataKey::Balance(b)) => assert_eq!(a, b),
+                _ => panic!(
+                    "DataKey round-trip mismatch — stored layout changed. \
+                     Bump TREASURY_SCHEMA_VERSION (currently {}).",
+                    TREASURY_SCHEMA_VERSION
+                ),
+            }
+        }
     }
 
     #[test]

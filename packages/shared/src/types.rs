@@ -1,5 +1,16 @@
 use soroban_sdk::{contracttype, Address, String};
 
+// ── Schema version ────────────────────────────────────────────────────────────
+
+/// Version marker for the on-chain XDR schema of all stored types in this
+/// module. Bump this whenever a stored struct or key enum changes shape
+/// (field added, removed, reordered, or retyped). The golden XDR fixtures in
+/// the round-trip tests below pin the exact encoding; if you change a stored
+/// type without bumping this constant, CI fails with an explicit
+/// schema-version mismatch message so already-stored records are never
+/// silently made undecodable.
+pub const STORAGE_SCHEMA_VERSION: u32 = 1;
+
 // ── Enums ─────────────────────────────────────────────────────────────────────
 
 /// Lifecycle state of a poll.

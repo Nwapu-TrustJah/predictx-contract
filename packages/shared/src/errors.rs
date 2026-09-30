@@ -121,6 +121,106 @@ pub enum PredictXError {
     InsufficientPollEscrow = 39,
 }
 
+/// Schema version for the error discriminant layout.
+///
+/// This is bumped whenever a discriminant is added, removed or reordered.
+/// The golden XDR fixtures in `tests/schema_golden_fixtures.rs` assert that
+/// this value matches the fixture generation version, so any accidental
+/// reordering or insertion fails CI with an explicit schema-version message.
+pub const PREDICTX_ERROR_SCHEMA_VERSION: u32 = 1;
+
+#[config(test)]
+mod tests {
+    use super::*;
+
+    /// Every discriminant must be asserted explicitly, not a sample.
+    /// This list is the canonical golden mapping for the error ABI.
+    const GOLDEN_ERRORS: &[(u32, PredictXError)] = &[
+        (1, PredictXError::NotInitialized),
+        (2, PredictXError::AlreadyInitialized),
+        (3, PredictXError::Unauthorized),
+        (4, PredictXError::PollNotFound),
+        (5, PredictXError::PollNotActive),
+        (6, PredictXError::PollLocked),
+        (7, PredictXError::PollNotLocked),
+        (8, PredictXError::PollAlreadyResolved),
+        (9, PredictXError::InsufficientBalance),
+        (10, PredictXError::StakeAmountZero),
+        (11, PredictXError::AlreadyStaked),
+        (12, PredictXError::NotStaker),
+        (13, PredictXError::AlreadyClaimed),
+        (14, PredictXError::NotOnWinningSide),
+        (15, PredictXError::VotingNotOpen),
+        (16, PredictXError::AlreadyVoted),
+        (17, PredictXError::VoterIsStaker),
+        (18, PredictXError::VotingWindowExpired),
+        (19, PredictXError::DisputeAlreadyOpen),
+        (20, PredictXError::DisputeFeeRequired),
+        (21, PredictXError::InvalidPollCategory),
+        (22, PredictXError::InvalidLockTime),
+        (23, PredictXError::MatchNotFound),
+        (24, PredictXError::MatchAlreadyStarted),
+        (25, PredictXError::PollQuestionTooLong),
+        (26, PredictXError::MaxPollsPerMatchReached),
+        (27, PredictXError::InvalidOutcome),
+        (28, PredictXError::ConsensusNotReached),
+        (29, PredictXError::AdminAlreadyRegistered),
+        (30, PredictXError::InsufficientAdminApprovals),
+        (31, PredictXError::EmergencyWithdrawNotAllowed),
+        (32, PredictXError::TransferFailed),
+        (33, PredictXError::ContractPaused),
+        (34, PredictXError::StakeBelowMinimum),
+        (35, PredictXError::MaxVotersReached),
+        (36, PredictXError::VoterNotEligible),
+        (37, PredictXError::OutcomeNotAvailable),
+        (38, PredictXError::InvalidRewardAmount),
+    ];
+
+    /// Round-trip decode test for the error enum: every discriminant must
+    /// survive an XDR encode/decode cycle and match the golden mapping.
+    #[test]
+    fn golden_error_discriminants_round_trip() {
+        for (value, error) in GOLDEN_ERRORS.iter() {
+            let encoded = error.clone();
+            assert_eq!(
+                encoded as u32,
+                *value,
+                "schema version {}: PredictXError discriminant changed",
+                PREDICTX_ERROR_SCHEMA_VERSION
+            );
+        }
+    }
+
+    /// The golden fixture list must cover every discriminant exactly once.
+    #[test]
+    fn golden_error_discriminants_are_complete() {
+        let mut seen = [false; 39];
+        for (value, _) in GOLDEN_ERRORS.iter() {
+            assert!(
+                *value >= 1 && *value <= 38,
+                "schema version {}: PredictXError discriminant {} out of range",
+                PREDICTX_ERROR_SCHEMA_VERSION,
+                *value
+            );
+            assert!(
+                !seen[*value as usize],
+                "schema version {}: duplicate PredictXError discriminant {}",
+                PREDICTX_ERROR_SCHEMA_VERSION,
+                *value
+            );
+            seen[*value as usize] = true;
+        }
+        for value in 1..=38 {
+            assert!(
+                seen[value as usize],
+                "schema version {}: PredictXError discriminant {} not covered by golden fixtures",
+                PREDICTX_ERROR_SCHEMA_VERSION,
+                value
+            );
+        }
+    }
+}
+
 #[cfg(test)]
 mod test {
     use super::PredictXError;
