@@ -167,6 +167,8 @@ pub enum DataKey {
     ParamProposal(ParamKey),
     /// `user` → `UserStats` per-user activity aggregates. (Persistent)
     UserStats(Address),
+    PollEscrow(u64),
+    PollOutflow(u64),
 }
 
 /// Pool state returned by `get_pool_info`.
@@ -229,6 +231,31 @@ fn require_initialized(env: &Env) -> Result<(), PredictXError> {
     }
 fn get_pauser(env: &Env) -> Option<Address> {
     env.storage().instance().get(&DataKey::Pauser)
+/// Returns the total amount escrowed for a poll (its own pool + fee liability).
+pub(crate) fn get_poll_escrow(env: &Env, poll_id: u64) -> i128 {
+    env.storage().persistent().get(&DataKey::PollEscrow(poll_id)).unwrap_or(0)
+}
+
+/// Returns the cumulative amount already paid out from a poll's escrow.
+pub(crate) fn get_poll_outflow(env: &Env, poll_id: u64) -> i128 {
+    env.storage().persistent().get(&DataKey::PollOutflow(poll_id)).unwrap_or(0)
+}
+
+/// Credits a poll's escrow (called when stakes are added).
+pub(crate) fn add_poll_escrow(env: &Env, poll_id: u64, amount: i128) {
+    let cur = get_poll_escrow(env, poll_id);
+    env.storage().persistent().set(&DataKey::PollEscrow(poll_id), &(cur + amount));
+}
+
+/// Debits a poll's escrow by recording outflow; fails if it would exceed escrow.
+pub(crate) fn record_poll_outflow(env: &Env, poll_id: u64, amount: i128) -> Result<(), PredictXError> {
+    let escrow = get_poll_escrow(env, poll_id);
+    let outflow = get_poll_outflow(env, poll_id);
+    if outflow + amount > escrow {
+        return Err(PredictXError::InsufficientEscrow);
+    }
+    env.storage().persistent().set(&DataKey::PollOutflow(poll_id), &(outflow + amount));
+    Ok(())
 }
 
 fn is_paused(env: &Env) -> bool {
@@ -917,6 +944,9 @@ impl PredictionMarket {
         let stake = load_stake(&env, poll_id, &user).ok_or(PredictXError::NotStaker)?;
         set_emergency_claimed(&env, poll_id, &user);
 
+        // Enforce per-poll escrow cap before moving any tokens.
+        record_poll_outflow(&env, poll_id, stake.amount)?;
+
         // Transfer tokens back to user
         token_utils::transfer_from_contract(&env, &user, stake.amount)?;
 
@@ -1033,6 +1063,41 @@ impl PredictionMarket {
             .publish((Symbol::new(&env, "PollCreated"), poll_id), ());
 
         Ok(poll_id)
+    }
+
+
+    /// Resolve a poll with a boolean outcome. Callable only by the registered oracle.
+    pub fn resolve_poll(
+        env: Env,
+        caller: Address,
+        poll_id: u64,
+        outcome: bool,
+    ) -> Result<(), PredictXError> {
+        caller.require_auth();
+        let oracle = get_oracle(&env)?;
+        if caller != oracle {
+            return Err(PredictXError::Unauthorized);
+        }
+
+        let mut poll: Poll = env
+            .storage()
+            .persistent()
+            .get(&DataKey::Poll(poll_id))
+            .ok_or(PredictXError::PollNotFound)?;
+
+        if poll.status == PollStatus::Resolved || poll.outcome.is_some() {
+            return Err(PredictXError::PollAlreadyResolved);
+        }
+
+        poll.outcome = Some(outcome);
+        poll.resolution_time = env.ledger().timestamp();
+        poll.status = PollStatus::Resolved;
+
+        env.storage()
+            .persistent()
+            .set(&DataKey::Poll(poll_id), &poll);
+
+        Ok(())
     }
 
     pub fn get_poll(env: Env, poll_id: u64) -> Result<Poll, PredictXError> {
@@ -1389,6 +1454,16 @@ impl PredictionMarket {
         token_utils::get_balance(&env)
     }
 
+    /// Per-poll escrow view: total escrowed for the poll.
+    pub fn get_poll_escrow(env: Env, poll_id: u64) -> i128 {
+        get_poll_escrow(&env, poll_id)
+    }
+
+    /// Per-poll outflow view: cumulative amount already paid out from the poll.
+    pub fn get_poll_outflow(env: Env, poll_id: u64) -> i128 {
+        get_poll_outflow(&env, poll_id)
+    }
+
     // ── Match management ──────────────────────────────────────────────────────
 
     pub fn create_match(
@@ -1490,6 +1565,13 @@ impl PredictionMarket {
         payouts::resolve_poll(&env, admin, poll_id, outcome)
         payouts::resolve_poll(&env, caller, poll_id, outcome)
         payouts::resolve_poll(&env, admin, poll_id, outcome, resolution_basis)
+    pub fn resolve_poll(
+        env: Env,
+        admin: Address,
+        poll_id: u64,
+        outcome: bool,
+    ) -> Result<(), PredictXError> {
+        payouts::resolve_poll(&env, admin, poll_id, outcome)
     }
 
     /// Claim winnings after a resolved poll.
@@ -1520,6 +1602,8 @@ impl PredictionMarket {
 
 
 
+        payouts::calculate_winnings(&env, poll_id, user)
+    }
 }
 
 #[cfg(test)]
@@ -1530,6 +1614,7 @@ mod test {
     use super::*;
     use predictx_shared::{PollCategory, StakeSide};
     use soroban_sdk::testutils::{Address as _, Ledger, MockAuth, MockAuthInvoke};
+    use soroban_sdk::testutils::{Address as _, Ledger};
     use soroban_sdk::token;
     use soroban_sdk::IntoVal;
 
@@ -2415,6 +2500,14 @@ mod test {
             question: String::from_str(env, "q"),
             category: PollCategory::TeamEvent,
             lock_time: 1_000,
+    fn seed_active_poll(env: &Env, contract_id: &Address, poll_id: u64, creator: &Address) {
+        let poll = Poll {
+            poll_id,
+            match_id: 1,
+            creator: creator.clone(),
+            question: String::from_str(env, "Will the home team win?"),
+            category: PollCategory::TeamEvent,
+            lock_time: env.ledger().timestamp() + 3600,
             yes_pool: 0,
             no_pool: 0,
             yes_count: 0,
@@ -2546,6 +2639,18 @@ mod test {
 
     #[test]
     fn poll_write_extends_ttl() {
+            status: PollStatus::Active,
+            outcome: None,
+            resolution_time: 0,
+            created_at: env.ledger().timestamp(),
+        };
+        env.as_contract(contract_id, || {
+            env.storage().persistent().set(&DataKey::Poll(poll_id), &poll);
+        });
+    }
+
+    #[test]
+    fn resolve_poll_rejects_non_oracle() {
         let env = Env::default();
         env.mock_all_auths();
         let contract_id = env.register(PredictionMarket, ());
@@ -2620,6 +2725,17 @@ mod test {
 
     #[test]
     fn initialize_rejects_non_token_address() {
+        let stranger = Address::generate(&env);
+        let tok = Address::generate(&env);
+        let treasury = Address::generate(&env);
+        client.initialize(&admin, &oracle, &tok, &treasury, &TEST_FEE_BPS);
+        seed_active_poll(&env, &contract_id, 1, &admin);
+        let err = client.try_resolve_poll(&stranger, &1_u64, &true).expect_err("non-oracle");
+        assert_eq!(err, Ok(PredictXError::Unauthorized));
+    }
+
+    #[test]
+    fn resolve_poll_rejects_unknown_poll() {
         let env = Env::default();
         env.mock_all_auths();
         let contract_id = env.register(PredictionMarket, ());
@@ -3101,6 +3217,15 @@ mod test {
     fn initialize_succeeds_with_valid_addresses() {
         let env = Env::default();
         env.mock_all_auths();
+        let err = client.try_resolve_poll(&oracle, &99_u64, &false).expect_err("missing");
+        assert_eq!(err, Ok(PredictXError::PollNotFound));
+    }
+
+    #[test]
+    fn resolve_poll_sets_outcome_and_resolution_time() {
+        let env = Env::default();
+        env.mock_all_auths();
+        env.ledger().set_timestamp(1_700_000_000);
         let contract_id = env.register(PredictionMarket, ());
         let client = PredictionMarketClient::new(&env, &contract_id);
         let admin = Address::generate(&env);
@@ -3702,6 +3827,29 @@ mod test {
         env.ledger().set_timestamp(2_000);
         let new_proposal = client.propose_param(&admin, &ParamKey::PlatformFeeBps, &400_u64);
         assert_eq!(new_proposal.value, 400_u64);
+        seed_active_poll(&env, &contract_id, 7, &admin);
+        client.resolve_poll(&oracle, &7_u64, &true);
+        let poll = client.get_poll(&7_u64);
+        assert_eq!(poll.outcome, Some(true));
+        assert_eq!(poll.resolution_time, 1_700_000_000);
+        assert_eq!(poll.status, PollStatus::Resolved);
+    }
+
+    #[test]
+    fn resolve_poll_rejects_already_resolved() {
+        let env = Env::default();
+        env.mock_all_auths();
+        let contract_id = env.register(PredictionMarket, ());
+        let client = PredictionMarketClient::new(&env, &contract_id);
+        let admin = Address::generate(&env);
+        let oracle = Address::generate(&env);
+        let tok = Address::generate(&env);
+        let treasury = Address::generate(&env);
+        client.initialize(&admin, &oracle, &tok, &treasury, &TEST_FEE_BPS);
+        seed_active_poll(&env, &contract_id, 3, &admin);
+        client.resolve_poll(&oracle, &3_u64, &false);
+        let err = client.try_resolve_poll(&oracle, &3_u64, &true).expect_err("already");
+        assert_eq!(err, Ok(PredictXError::PollAlreadyResolved));
     }
 
 }

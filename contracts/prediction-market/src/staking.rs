@@ -56,6 +56,7 @@ fn record_stake_in_user_stats(env: &Env, staker: &Address, amount: i128) {
         .persistent()
         .set(&DataKey::UserStats(staker.clone()), &user_stats);
 }
+use crate::{DataKey, PoolInfo, get_platform_stats, set_platform_stats, ensure_not_paused, token_utils, escrow};
 
 // ── Stake placement ───────────────────────────────────────────────────────────
 
@@ -186,6 +187,8 @@ pub fn stake(
 
     // Update per-user stats (issue #149)
     record_stake_in_user_stats(env, &staker, amount);
+    // Track per-poll escrow liability
+    escrow::add_liability(env, poll_id, amount);
 
     // Emit event
     env.events().publish(
@@ -302,6 +305,11 @@ pub fn calculate_potential_winnings(
     let winnings = amount * total_pool_after * fee_factor / (pool_on_side_after * bps);
 
     Ok(winnings)
+}
+
+/// Return the per-poll escrow liability tracked by the contract.
+pub fn get_poll_escrow(env: &Env, poll_id: u64) -> i128 {
+    escrow::get_liability(env, poll_id)
 }
 
 /// Return pool state for a poll.
